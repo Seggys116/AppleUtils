@@ -178,31 +178,64 @@ impl Artifacts {
     }
 
     pub fn validate_firmware(&self) -> Result<(), OpsError> {
-        let Some(requirements) = &self.firmware_requirements else { return Ok(()); };
-        if requirements.installer_data_partitions.iter().any(|partition| !partition.eq_ignore_ascii_case("EFI")) {
-            return Err(err("package requests installer data outside the EFI partition"));
+        let Some(requirements) = &self.firmware_requirements else {
+            return Ok(());
+        };
+        if requirements
+            .installer_data_partitions
+            .iter()
+            .any(|partition| !partition.eq_ignore_ascii_case("EFI"))
+        {
+            return Err(err(
+                "package requests installer data outside the EFI partition",
+            ));
         }
         if !requirements.installer_data_partitions.is_empty() && self.installer_data.is_none() {
             return Err(err("Asahi package requires verified installer data"));
         }
-        let required = requirements.supported_fw.is_some() || !requirements.firmware_partitions.is_empty();
+        let required =
+            requirements.supported_fw.is_some() || !requirements.firmware_partitions.is_empty();
         let Some(firmware) = &self.firmware else {
-            return if required { Err(err("Asahi package requires a verified Apple OS firmware identity")) } else { Ok(()) };
+            return if required {
+                Err(err(
+                    "Asahi package requires a verified Apple OS firmware identity",
+                ))
+            } else {
+                Ok(())
+            };
         };
-        crate::asahi_firmware::bind_restore_identity(firmware.selection.clone(), firmware.restore.clone())
-            .map_err(err)?;
-        if requirements.supported_fw.as_ref().is_some_and(|versions|
-            !versions.contains(&firmware.restore.product_version))
+        crate::asahi_firmware::bind_restore_identity(
+            firmware.selection.clone(),
+            firmware.restore.clone(),
+        )
+        .map_err(err)?;
+        if requirements
+            .supported_fw
+            .as_ref()
+            .is_some_and(|versions| !versions.contains(&firmware.restore.product_version))
         {
-            return Err(err("selected Apple OS firmware is not supported by the Asahi package"));
+            return Err(err(
+                "selected Apple OS firmware is not supported by the Asahi package",
+            ));
         }
-        if requirements.firmware_partitions.iter().any(|partition| !partition.eq_ignore_ascii_case("EFI")) {
-            return Err(err("package requests firmware placement outside the EFI partition"));
+        if requirements
+            .firmware_partitions
+            .iter()
+            .any(|partition| !partition.eq_ignore_ascii_case("EFI"))
+        {
+            return Err(err(
+                "package requests firmware placement outside the EFI partition",
+            ));
         }
         if !requirements.firmware_partitions.is_empty()
-            && !self.efi_files.iter().any(|(name, bytes)| name.starts_with("vendorfw/") && !bytes.is_empty())
+            && !self
+                .efi_files
+                .iter()
+                .any(|(name, bytes)| name.starts_with("vendorfw/") && !bytes.is_empty())
         {
-            return Err(err("Asahi package requires vendor firmware in the EFI partition"));
+            return Err(err(
+                "Asahi package requires vendor firmware in the EFI partition",
+            ));
         }
         Ok(())
     }
@@ -210,9 +243,15 @@ impl Artifacts {
     fn validate_disk_firmware(&self) -> Result<(), OpsError> {
         self.validate_firmware()?;
         if let Some(firmware) = &self.firmware
-            && self.installer_data.as_ref().is_none_or(|data|
-                !data.matches_firmware(firmware) || data.preboot_files().is_empty() || data.system_files().is_empty()) {
-            return Err(err("selected Apple OS firmware requires its on-disk restore bundle"));
+            && self.installer_data.as_ref().is_none_or(|data| {
+                !data.matches_firmware(firmware)
+                    || data.preboot_files().is_empty()
+                    || data.system_files().is_empty()
+            })
+        {
+            return Err(err(
+                "selected Apple OS firmware requires its on-disk restore bundle",
+            ));
         }
         Ok(())
     }
@@ -342,10 +381,18 @@ fn resolve_from_entry(os: &OsEntry) -> Result<ResolvedLatest, OpsError> {
         root_image,
         kernel_image,
         supported_fw: os.supported_fw.clone(),
-        firmware_partitions: os.partitions.iter().filter(|partition| partition.copy_firmware)
-            .map(|partition| partition.name.clone()).collect(),
-        installer_data_partitions: os.partitions.iter().filter(|partition| partition.copy_installer_data)
-            .map(|partition| partition.name.clone()).collect(),
+        firmware_partitions: os
+            .partitions
+            .iter()
+            .filter(|partition| partition.copy_firmware)
+            .map(|partition| partition.name.clone())
+            .collect(),
+        installer_data_partitions: os
+            .partitions
+            .iter()
+            .filter(|partition| partition.copy_installer_data)
+            .map(|partition| partition.name.clone())
+            .collect(),
     })
 }
 
@@ -1319,11 +1366,16 @@ fn read_range(img: &mut dyn ImageIo, offset: u64, len: usize) -> Result<Vec<u8>,
     Ok(buf)
 }
 
-fn efi_payloads(artifacts: &Artifacts, next_object: &str, actual_vgid: Option<&str>) -> Result<Vec<(String, Vec<u8>)>, OpsError> {
+fn efi_payloads(
+    artifacts: &Artifacts,
+    next_object: &str,
+    actual_vgid: Option<&str>,
+) -> Result<Vec<(String, Vec<u8>)>, OpsError> {
     artifacts.validate_disk_firmware()?;
     let mut files = artifacts.efi_files.clone();
     if let Some(template) = &artifacts.installer_data {
-        let vgid = actual_vgid.ok_or_else(|| err("installer data requires actual APFS volume group"))?;
+        let vgid =
+            actual_vgid.ok_or_else(|| err("installer data requires actual APFS volume group"))?;
         for (relative, bytes) in template.files_for_vgid(vgid).map_err(err)? {
             let name = format!("asahi/{relative}");
             files.retain(|(existing, _)| !existing.eq_ignore_ascii_case(&name));
@@ -1350,11 +1402,19 @@ fn efi_payloads(artifacts: &Artifacts, next_object: &str, actual_vgid: Option<&s
 
 fn container_boot_vgid(container: &[u8]) -> Result<String, OpsError> {
     let mut source = crate::apfs_verify::SliceBlocks::new(container, APFS_BLOCK);
-    let mut mounted = ApfsContainer::mount(&mut source, APFS_BLOCK, container.len() as u64 / u64::from(APFS_BLOCK)).map_err(|e| err(e.to_string()))?;
+    let mut mounted = ApfsContainer::mount(
+        &mut source,
+        APFS_BLOCK,
+        container.len() as u64 / u64::from(APFS_BLOCK),
+    )
+    .map_err(|e| err(e.to_string()))?;
     let volumes = mounted.volumes().map_err(|e| err(e.to_string()))?;
     let candidates = collect_picker_vgids(&mut mounted, &volumes);
-    let preboot = mounted.open_volume_chosen(&VolumeChoice::Role(APFS_VOL_ROLE_PREBOOT)).map_err(|e| err(e.to_string()))?;
-    let blessed = extract_volume_path(&mut mounted, &preboot, "/boot-volume").and_then(|bytes| String::from_utf8(bytes).ok());
+    let preboot = mounted
+        .open_volume_chosen(&VolumeChoice::Role(APFS_VOL_ROLE_PREBOOT))
+        .map_err(|e| err(e.to_string()))?;
+    let blessed = extract_volume_path(&mut mounted, &preboot, "/boot-volume")
+        .and_then(|bytes| String::from_utf8(bytes).ok());
     resolve_boot_volume(blessed.as_deref(), None, &candidates)
 }
 
@@ -1377,11 +1437,25 @@ fn compose_disk(
     let efi_bytes = layout.efi_sectors * u64::from(SECTOR);
 
     let apfs = crate::apfs_write::create_with_preboot_files(
-        stub_bytes, os_name, &stage1,
-        artifacts.installer_data.as_ref().map(|data| data.system_version_bytes()),
-        artifacts.installer_data.as_ref().map(|data| data.preboot_files()).unwrap_or(&[]),
-        artifacts.installer_data.as_ref().map(|data| data.system_files()).unwrap_or(&[]),
-    ).map_err(err)?;
+        stub_bytes,
+        os_name,
+        &stage1,
+        artifacts
+            .installer_data
+            .as_ref()
+            .map(|data| data.system_version_bytes()),
+        artifacts
+            .installer_data
+            .as_ref()
+            .map(|data| data.preboot_files())
+            .unwrap_or(&[]),
+        artifacts
+            .installer_data
+            .as_ref()
+            .map(|data| data.system_files())
+            .unwrap_or(&[]),
+    )
+    .map_err(err)?;
     let actual_vgid = container_boot_vgid(&apfs)?;
     let fat = crate::fat32::create_efi(
         efi_bytes,
@@ -1734,13 +1808,30 @@ fn update_disc_contents(path: &Path, artifacts: &Artifacts) -> Result<DiscReport
         usize::try_from(apfs_end - apfs_start).map_err(|_| err("APFS partition too large"))?,
     )?;
     let actual_vgid = container_boot_vgid(&container)?;
-    let fat = crate::fat32::update_efi(&original_fat, &efi_payloads(artifacts, next_object, Some(&actual_vgid))?).map_err(err)?;
+    let fat = crate::fat32::update_efi(
+        &original_fat,
+        &efi_payloads(artifacts, next_object, Some(&actual_vgid))?,
+    )
+    .map_err(err)?;
     let updated = crate::apfs_update::update_with_preboot_files(
-        &container, &stage1,
-        artifacts.installer_data.as_ref().map(|data| data.system_version_bytes()),
-        artifacts.installer_data.as_ref().map(|data| data.preboot_files()).unwrap_or(&[]),
-        artifacts.installer_data.as_ref().map(|data| data.system_files()).unwrap_or(&[]),
-    ).map_err(err)?;
+        &container,
+        &stage1,
+        artifacts
+            .installer_data
+            .as_ref()
+            .map(|data| data.system_version_bytes()),
+        artifacts
+            .installer_data
+            .as_ref()
+            .map(|data| data.preboot_files())
+            .unwrap_or(&[]),
+        artifacts
+            .installer_data
+            .as_ref()
+            .map(|data| data.system_files())
+            .unwrap_or(&[]),
+    )
+    .map_err(err)?;
     if updated.len() != container.len() {
         return Err(err("APFS update changed container size"));
     }
@@ -1970,76 +2061,179 @@ pub fn load_custom_boot_object(
         })
 }
 
-pub(crate) fn validate_installed_restore_bundle(path: &Path, bound: &crate::asahi_firmware::BoundFirmware) -> Result<bool, OpsError> {
+pub(crate) fn validate_installed_restore_bundle(
+    path: &Path,
+    bound: &crate::asahi_firmware::BoundFirmware,
+) -> Result<bool, OpsError> {
     let mut img = open_image(path)?;
     let head = read_range(&mut *img, 0, 64 * 1024)?;
     let gpt = detect_gpt(&head)?;
-    let apfs = gpt.partitions.iter().find(|p| p.is_apple_apfs()).ok_or_else(|| err("no Apple_APFS partition"))?;
+    let apfs = gpt
+        .partitions
+        .iter()
+        .find(|p| p.is_apple_apfs())
+        .ok_or_else(|| err("no Apple_APFS partition"))?;
     let (start, end) = apfs.byte_range(gpt.block_size);
     let (mut source, block_size, block_count) = partition_blocks(&mut *img, start, end)?;
-    let mut mounted = ApfsContainer::mount(&mut source, block_size, block_count).map_err(|e| err(e.to_string()))?;
+    let mut mounted = ApfsContainer::mount(&mut source, block_size, block_count)
+        .map_err(|e| err(e.to_string()))?;
     let volumes = mounted.volumes().map_err(|e| err(e.to_string()))?;
     let candidates = collect_picker_vgids(&mut mounted, &volumes);
-    let preboot = mounted.open_volume_chosen(&VolumeChoice::Role(APFS_VOL_ROLE_PREBOOT)).map_err(|e| err(e.to_string()))?;
-    let blessed = extract_volume_path(&mut mounted, &preboot, "/boot-volume").and_then(|bytes| String::from_utf8(bytes).ok());
+    let preboot = mounted
+        .open_volume_chosen(&VolumeChoice::Role(APFS_VOL_ROLE_PREBOOT))
+        .map_err(|e| err(e.to_string()))?;
+    let blessed = extract_volume_path(&mut mounted, &preboot, "/boot-volume")
+        .and_then(|bytes| String::from_utf8(bytes).ok());
     let selected = resolve_boot_volume(blessed.as_deref(), None, &candidates)?;
-    let systems: Vec<_> = volumes.iter().filter(|v| v.role == APFS_VOL_ROLE_SYSTEM && apfs_uuid(&v.volume_group_id).eq_ignore_ascii_case(&selected)).collect();
-    let [system] = systems.as_slice() else { return Err(err("selected restore has no unique System volume")); };
-    let system = mounted.open_volume_chosen(&VolumeChoice::Index(system.index)).map_err(|e| err(e.to_string()))?;
-    let bootcaches = extract_volume_path(&mut mounted, &system, "/usr/standalone/bootcaches.plist").ok_or_else(|| err("selected System lacks bootcaches metadata"))?;
+    let systems: Vec<_> = volumes
+        .iter()
+        .filter(|v| {
+            v.role == APFS_VOL_ROLE_SYSTEM
+                && apfs_uuid(&v.volume_group_id).eq_ignore_ascii_case(&selected)
+        })
+        .collect();
+    let [system] = systems.as_slice() else {
+        return Err(err("selected restore has no unique System volume"));
+    };
+    let system = mounted
+        .open_volume_chosen(&VolumeChoice::Index(system.index))
+        .map_err(|e| err(e.to_string()))?;
+    let bootcaches = extract_volume_path(&mut mounted, &system, "/usr/standalone/bootcaches.plist")
+        .ok_or_else(|| err("selected System lacks bootcaches metadata"))?;
     let bundle = crate::asahi_installer_data::restore_bundle_path(&bootcaches).map_err(err)?;
     let prefix = format!("/{selected}/{bundle}");
-    let manifest = extract_volume_path(&mut mounted, &preboot, &format!("{prefix}/BuildManifest.plist")).ok_or_else(|| err("selected Preboot restore manifest is missing"))?;
-    let manifest = plist::Value::from_reader(std::io::Cursor::new(manifest)).map_err(|e| err(e.to_string()))?;
-    let manifest = manifest.as_dictionary().ok_or_else(|| err("restore manifest is not a dictionary"))?;
-    for (key, expected) in [("ProductVersion", &bound.restore.product_version), ("ProductBuildVersion", &bound.restore.product_build)] {
+    let manifest = extract_volume_path(
+        &mut mounted,
+        &preboot,
+        &format!("{prefix}/BuildManifest.plist"),
+    )
+    .ok_or_else(|| err("selected Preboot restore manifest is missing"))?;
+    let manifest = plist::Value::from_reader(std::io::Cursor::new(manifest))
+        .map_err(|e| err(e.to_string()))?;
+    let manifest = manifest
+        .as_dictionary()
+        .ok_or_else(|| err("restore manifest is not a dictionary"))?;
+    for (key, expected) in [
+        ("ProductVersion", &bound.restore.product_version),
+        ("ProductBuildVersion", &bound.restore.product_build),
+    ] {
         if manifest.get(key).and_then(plist::Value::as_string) != Some(expected.as_str()) {
-            return Err(err(format!("Preboot {key} differs from installed firmware binding")));
+            return Err(err(format!(
+                "Preboot {key} differs from installed firmware binding"
+            )));
         }
     }
-    for (volume, path) in [(&system, "/System/Library/CoreServices/SystemVersion.plist".to_owned()), (&preboot, format!("{prefix}/SystemVersion.plist"))] {
-        let bytes = extract_volume_path(&mut mounted, volume, &path).ok_or_else(|| err(format!("selected restore metadata is missing: {path}")))?;
-        let value = plist::Value::from_reader(std::io::Cursor::new(bytes)).map_err(|e| err(e.to_string()))?;
-        let values = value.as_dictionary().ok_or_else(|| err("selected SystemVersion is not a dictionary"))?;
-        for (key, expected) in [("ProductVersion", &bound.restore.product_version), ("ProductBuildVersion", &bound.restore.product_build)] {
+    for (volume, path) in [
+        (
+            &system,
+            "/System/Library/CoreServices/SystemVersion.plist".to_owned(),
+        ),
+        (&preboot, format!("{prefix}/SystemVersion.plist")),
+    ] {
+        let bytes = extract_volume_path(&mut mounted, volume, &path)
+            .ok_or_else(|| err(format!("selected restore metadata is missing: {path}")))?;
+        let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
+            .map_err(|e| err(e.to_string()))?;
+        let values = value
+            .as_dictionary()
+            .ok_or_else(|| err("selected SystemVersion is not a dictionary"))?;
+        for (key, expected) in [
+            ("ProductVersion", &bound.restore.product_version),
+            ("ProductBuildVersion", &bound.restore.product_build),
+        ] {
             if values.get(key).and_then(plist::Value::as_string) != Some(expected.as_str()) {
-                return Err(err(format!("{path} {key} differs from installed firmware binding")));
+                return Err(err(format!(
+                    "{path} {key} differs from installed firmware binding"
+                )));
             }
         }
     }
-    let (_, identity) = crate::asahi_firmware_archive::select_identity(manifest, &bound.selection).map_err(err)?;
-    let components = identity.get("Manifest").and_then(plist::Value::as_dictionary).ok_or_else(|| err("restore identity lacks component manifest"))?;
+    let (_, identity) =
+        crate::asahi_firmware_archive::select_identity(manifest, &bound.selection).map_err(err)?;
+    let components = identity
+        .get("Manifest")
+        .and_then(plist::Value::as_dictionary)
+        .ok_or_else(|| err("restore identity lacks component manifest"))?;
     let temporary = tempfile::NamedTempFile::new()?;
     for (key, entry) in components {
-        if !crate::asahi_firmware_archive::preboot_component(key) { continue; }
-        let entry = entry.as_dictionary().ok_or_else(|| err("invalid restore component"))?;
-        let relative = entry.get("Info").and_then(plist::Value::as_dictionary).and_then(|v| v.get("Path")).and_then(plist::Value::as_string).ok_or_else(|| err("restore component lacks path"))?;
+        if !crate::asahi_firmware_archive::preboot_component(key) {
+            continue;
+        }
+        let entry = entry
+            .as_dictionary()
+            .ok_or_else(|| err("invalid restore component"))?;
+        let relative = entry
+            .get("Info")
+            .and_then(plist::Value::as_dictionary)
+            .and_then(|v| v.get("Path"))
+            .and_then(plist::Value::as_string)
+            .ok_or_else(|| err("restore component lacks path"))?;
         crate::asahi_installer_data::relative_path(relative).map_err(err)?;
-        let bytes = extract_volume_path(&mut mounted, &preboot, &format!("{prefix}/{relative}")).ok_or_else(|| err(format!("selected Preboot component {key} is missing: {relative}")))?;
-        if bytes.is_empty() { return Err(err(format!("selected Preboot component {key} is empty"))); }
+        let bytes = extract_volume_path(&mut mounted, &preboot, &format!("{prefix}/{relative}"))
+            .ok_or_else(|| {
+                err(format!(
+                    "selected Preboot component {key} is missing: {relative}"
+                ))
+            })?;
+        if bytes.is_empty() {
+            return Err(err(format!("selected Preboot component {key} is empty")));
+        }
         std::fs::write(temporary.path(), bytes)?;
         crate::asahi_firmware_archive::verify_digest(temporary.path(), entry).map_err(err)?;
     }
     let mut machine_provenance_verified = components.contains_key("SEP");
-    if let Some(source) = extract_volume_path(&mut mounted, &preboot, &format!("{prefix}/SourceBuildManifest.plist")) {
-        let digest: String = crate::crypto::sha256(&source).iter().map(|v| format!("{v:02x}")).collect();
-        if digest != bound.restore.manifest_digest { return Err(err("source BuildManifest digest differs from firmware binding")); }
-        let source = plist::Value::from_reader(std::io::Cursor::new(source)).map_err(|e| err(e.to_string()))?;
-        let source = source.as_dictionary().ok_or_else(|| err("source manifest is not a dictionary"))?;
-        for key in ["ProductVersion", "ProductBuildVersion"] {
-            if source.get(key) != manifest.get(key) { return Err(err("source manifest package differs from selected OS")); }
+    if let Some(source) = extract_volume_path(
+        &mut mounted,
+        &preboot,
+        &format!("{prefix}/SourceBuildManifest.plist"),
+    ) {
+        let digest: String = crate::crypto::sha256(&source)
+            .iter()
+            .map(|v| format!("{v:02x}"))
+            .collect();
+        if digest != bound.restore.manifest_digest {
+            return Err(err(
+                "source BuildManifest digest differs from firmware binding",
+            ));
         }
-        let (_, source_identity) = crate::asahi_firmware_archive::select_identity(source, &bound.selection).map_err(err)?;
-        if source_identity != identity { return Err(err("source manifest OS identity differs from selected restore")); }
+        let source = plist::Value::from_reader(std::io::Cursor::new(source))
+            .map_err(|e| err(e.to_string()))?;
+        let source = source
+            .as_dictionary()
+            .ok_or_else(|| err("source manifest is not a dictionary"))?;
+        for key in ["ProductVersion", "ProductBuildVersion"] {
+            if source.get(key) != manifest.get(key) {
+                return Err(err("source manifest package differs from selected OS"));
+            }
+        }
+        let (_, source_identity) =
+            crate::asahi_firmware_archive::select_identity(source, &bound.selection)
+                .map_err(err)?;
+        if source_identity != identity {
+            return Err(err(
+                "source manifest OS identity differs from selected restore",
+            ));
+        }
         machine_provenance_verified = true;
-        for (relative, entry) in crate::asahi_firmware_archive::machine_sep_candidates(source, &identity).map_err(err)? {
-            let bytes = extract_volume_path(&mut mounted, &preboot, &format!("{prefix}/{relative}")).ok_or_else(|| err("machine SEP source payload is missing"))?;
+        for (relative, entry) in
+            crate::asahi_firmware_archive::machine_sep_candidates(source, &identity).map_err(err)?
+        {
+            let bytes =
+                extract_volume_path(&mut mounted, &preboot, &format!("{prefix}/{relative}"))
+                    .ok_or_else(|| err("machine SEP source payload is missing"))?;
             std::fs::write(temporary.path(), bytes)?;
             crate::asahi_firmware_archive::verify_digest(temporary.path(), &entry).map_err(err)?;
         }
     }
-    let restored_bootcaches = extract_volume_path(&mut mounted, &preboot, &format!("{prefix}/usr/standalone/bootcaches.plist")).ok_or_else(|| err("restore bundle lacks bootcaches metadata"))?;
-    if restored_bootcaches != bootcaches { return Err(err("System and Preboot bootcaches metadata differ")); }
+    let restored_bootcaches = extract_volume_path(
+        &mut mounted,
+        &preboot,
+        &format!("{prefix}/usr/standalone/bootcaches.plist"),
+    )
+    .ok_or_else(|| err("restore bundle lacks bootcaches metadata"))?;
+    if restored_bootcaches != bootcaches {
+        return Err(err("System and Preboot bootcaches metadata differ"));
+    }
     Ok(machine_provenance_verified)
 }
 
@@ -2077,8 +2271,13 @@ pub fn inspect_created(path: &Path) -> Result<Inspected, OpsError> {
         if let Ok(snaps) = mounted.snapshots(&vol) {
             snapshot_count = snapshot_count.max(snaps.len());
         }
-        if let Some(bytes) = extract_volume_path(&mut mounted, &vol, "/usr/standalone/bootcaches.plist") {
-            restore_paths.insert(apfs_uuid(&summary.volume_group_id).to_ascii_lowercase(), crate::asahi_installer_data::restore_bundle_path(&bytes).map_err(err)?);
+        if let Some(bytes) =
+            extract_volume_path(&mut mounted, &vol, "/usr/standalone/bootcaches.plist")
+        {
+            restore_paths.insert(
+                apfs_uuid(&summary.volume_group_id).to_ascii_lowercase(),
+                crate::asahi_installer_data::restore_bundle_path(&bytes).map_err(err)?,
+            );
         }
         let plist = extract_volume_path(
             &mut mounted,
@@ -2140,7 +2339,13 @@ pub fn inspect_created(path: &Path) -> Result<Inspected, OpsError> {
             if extract_volume_path(
                 &mut mounted,
                 &preboot,
-                &format!("/{vgid}/{}/SystemVersion.plist", restore_paths.get(&vgid.to_ascii_lowercase()).map(String::as_str).unwrap_or("restore")),
+                &format!(
+                    "/{vgid}/{}/SystemVersion.plist",
+                    restore_paths
+                        .get(&vgid.to_ascii_lowercase())
+                        .map(String::as_str)
+                        .unwrap_or("restore")
+                ),
             )
             .is_some_and(|bytes| !bytes.is_empty())
             {
@@ -2447,8 +2652,10 @@ pub fn fetch_url_to_file_with_progress(
     let dest_s = dest
         .to_str()
         .ok_or_else(|| err("destination path is not valid UTF-8"))?;
-    let validator = cache_key.strip_prefix(&format!("download:{url}:"))
-        .map(|etag| format!("If-Match: {etag}")).unwrap_or_default();
+    let validator = cache_key
+        .strip_prefix(&format!("download:{url}:"))
+        .map(|etag| format!("If-Match: {etag}"))
+        .unwrap_or_default();
     let mut child = std::process::Command::new("curl")
         .args([
             "-fL",
@@ -2584,7 +2791,10 @@ pub fn load_artifacts_from_package_file_reporting(
     extract_package_from_path_parts(package, &resolved, workdir, include_root, on_progress)
 }
 
-fn extract_package_artifacts(package: &[u8], resolved: &ResolvedLatest) -> Result<Artifacts, OpsError> {
+fn extract_package_artifacts(
+    package: &[u8],
+    resolved: &ResolvedLatest,
+) -> Result<Artifacts, OpsError> {
     let mut artifacts = extract_package_artifacts_unbound(package, resolved)?;
     artifacts.firmware_requirements = Some(FirmwareRequirements::from(resolved));
     Ok(artifacts)
@@ -2628,10 +2838,19 @@ pub fn extract_package_from_path(
 }
 
 fn extract_package_from_path_parts(
-    package: &Path, resolved: &ResolvedLatest, workdir: &Path, include_root: bool,
+    package: &Path,
+    resolved: &ResolvedLatest,
+    workdir: &Path,
+    include_root: bool,
     on_progress: impl FnMut(f64),
 ) -> Result<Artifacts, OpsError> {
-    let mut artifacts = extract_package_from_path_parts_unbound(package, resolved, workdir, include_root, on_progress)?;
+    let mut artifacts = extract_package_from_path_parts_unbound(
+        package,
+        resolved,
+        workdir,
+        include_root,
+        on_progress,
+    )?;
     artifacts.firmware_requirements = Some(FirmwareRequirements::from(resolved));
     Ok(artifacts)
 }
@@ -2688,9 +2907,16 @@ fn extract_package_from_path_parts_unbound(
     };
     let root_path = if include_root {
         let root_dest = workdir.join("root.img");
-        zip_extract_cached_progress(&package_digest, package, &members, &resolved.root_image, &root_dest, |n| {
-            report(n);
-        })?;
+        zip_extract_cached_progress(
+            &package_digest,
+            package,
+            &members,
+            &resolved.root_image,
+            &root_dest,
+            |n| {
+                report(n);
+            },
+        )?;
         Some(root_dest)
     } else {
         None
@@ -2701,9 +2927,16 @@ fn extract_package_from_path_parts_unbound(
         .unwrap_or_default();
     let boot_dest = workdir.join("boot.img");
     let (kernel, boot_path) = if zip_find(&members, &resolved.kernel_image).is_some() {
-        zip_extract_cached_progress(&package_digest, package, &members, &resolved.kernel_image, &boot_dest, |n| {
-            report(n);
-        })?;
+        zip_extract_cached_progress(
+            &package_digest,
+            package,
+            &members,
+            &resolved.kernel_image,
+            &boot_dest,
+            |n| {
+                report(n);
+            },
+        )?;
         let boot_len = std::fs::metadata(&boot_dest)?.len();
         if boot_len > SMALL {
             (Vec::new(), Some(boot_dest))
@@ -2924,7 +3157,10 @@ fn zip_find<'a>(members: &'a [ZipMember], name: &str) -> Option<&'a ZipMember> {
     members.iter().find(|m| zip_name_matches(&m.name, name))
 }
 
-pub(crate) fn zip_open_payload(package: &Path, member: &ZipMember) -> Result<(File, u16, u64), OpsError> {
+pub(crate) fn zip_open_payload(
+    package: &Path,
+    member: &ZipMember,
+) -> Result<(File, u16, u64), OpsError> {
     let mut file = File::open(package)?;
     file.seek(SeekFrom::Start(member.local_off))?;
     let mut hdr = [0u8; 30];
@@ -2949,17 +3185,21 @@ fn zip_extract_cached_progress(
     let member = zip_find(members, name).ok_or_else(|| err(format!("zip has no {name}")))?;
     let cache = crate::asahi_cache::root();
     let key = format!("package:{package_digest}:{name}");
-    if cache.as_ref().is_some_and(|root| crate::asahi_cache::restore(root, &key, dest)) {
-        if std::fs::metadata(dest)?.len() == member.uncomp {
-            on_bytes(member.uncomp);
-            return Ok(());
-        }
+    if cache
+        .as_ref()
+        .is_some_and(|root| crate::asahi_cache::restore(root, &key, dest))
+        && std::fs::metadata(dest)?.len() == member.uncomp
+    {
+        on_bytes(member.uncomp);
+        return Ok(());
     }
     zip_extract_named_progress(package, members, name, dest, on_bytes)?;
     if std::fs::metadata(dest)?.len() != member.uncomp {
         return Err(err(format!("ZIP length mismatch for {name}")));
     }
-    if let Some(root) = cache { let _ = crate::asahi_cache::store(&root, &key, dest); }
+    if let Some(root) = cache {
+        let _ = crate::asahi_cache::store(&root, &key, dest);
+    }
     Ok(())
 }
 
@@ -3284,13 +3524,16 @@ mod tests {
 
     #[test]
     fn required_firmware_survives_resolution_and_refuses_unbound_disk_write() {
-        let data = parse_installer_data(r#"{"os_list":[{
+        let data = parse_installer_data(
+            r#"{"os_list":[{
             "name":"Test OS","package":"https://example.test/os.zip",
             "supported_fw":["13.5"],"partitions":[{
                 "name":"EFI","type":"EFI","copy_firmware":true,
                 "copy_installer_data":true,"source":"esp"
             }]
-        }]}"#).unwrap();
+        }]}"#,
+        )
+        .unwrap();
         let resolved = resolve_latest(&data).unwrap();
         let requirements = FirmwareRequirements::from(&resolved);
         assert_eq!(requirements.supported_fw, Some(vec!["13.5".into()]));
@@ -3301,12 +3544,39 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("existing.qcow2");
         std::fs::write(&path, b"preserve existing disk").unwrap();
-        let result = create_qcow2_disc(&path, &payloads, min_disc_bytes(), "m1n1/boot.bin", "Test OS");
-        assert!(result.unwrap_err().to_string().contains("verified installer data"));
+        let result = create_qcow2_disc(
+            &path,
+            &payloads,
+            min_disc_bytes(),
+            "m1n1/boot.bin",
+            "Test OS",
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("verified installer data")
+        );
         assert_eq!(std::fs::read(&path).unwrap(), b"preserve existing disk");
-        payloads.firmware_requirements.as_mut().unwrap().installer_data_partitions.clear();
-        let result = create_qcow2_disc(&path, &payloads, min_disc_bytes(), "m1n1/boot.bin", "Test OS");
-        assert!(result.unwrap_err().to_string().contains("verified Apple OS firmware identity"));
+        payloads
+            .firmware_requirements
+            .as_mut()
+            .unwrap()
+            .installer_data_partitions
+            .clear();
+        let result = create_qcow2_disc(
+            &path,
+            &payloads,
+            min_disc_bytes(),
+            "m1n1/boot.bin",
+            "Test OS",
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("verified Apple OS firmware identity")
+        );
         assert_eq!(std::fs::read(path).unwrap(), b"preserve existing disk");
     }
 
@@ -3379,13 +3649,16 @@ mod tests {
 
     #[test]
     fn resolution_preserves_declared_firmware_requirements() {
-        let data = parse_installer_data(r#"{"os_list":[{
+        let data = parse_installer_data(
+            r#"{"os_list":[{
             "name":"Test OS","package":"https://example.test/os.zip",
             "supported_fw":["13.5"],"partitions":[
                 {"name":"EFI","copy_firmware":true,"copy_installer_data":true},
                 {"name":"Root","image":"root.img"}
             ]
-        }]}"#).unwrap();
+        }]}"#,
+        )
+        .unwrap();
         let resolved = resolve_latest(&data).unwrap();
         assert_eq!(resolved.supported_fw, Some(vec!["13.5".into()]));
         assert_eq!(resolved.firmware_partitions, vec!["EFI"]);

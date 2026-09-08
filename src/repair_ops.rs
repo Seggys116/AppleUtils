@@ -1080,7 +1080,9 @@ pub fn sweep(path: &Path) -> Result<SweepReport, String> {
     let zero = read_block(&mut opened, 0)?;
 
     let mut findings = Vec::new();
-    if let Some(finding) = asahi_firmware_verify::inspect(path) { findings.push(finding); }
+    if let Some(finding) = asahi_firmware_verify::inspect(path) {
+        findings.push(finding);
+    }
     let structural = apfs_verify::verify_container(&mut DiscBlocks {
         disc: opened.disc.as_mut(),
         container_offset: opened.container_offset,

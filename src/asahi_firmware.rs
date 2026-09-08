@@ -1,4 +1,3 @@
-
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version(Vec<u64>);
 
@@ -176,6 +175,25 @@ pub fn validate_repair(installed: &BoundFirmware, candidate: &BoundFirmware) -> 
     Ok(())
 }
 
+pub fn validate_supported_version(
+    version: &str,
+    supported: Option<&[String]>,
+) -> Result<(), String> {
+    if let Some(versions) = supported
+        && !versions.iter().any(|v| v == version)
+    {
+        let allowed = if versions.is_empty() {
+            "none".into()
+        } else {
+            versions.join(", ")
+        };
+        return Err(format!(
+            "Selected IPSW: macOS {version}. Supported firmware versions: {allowed}. Select a matching IPSW."
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,14 +277,4 @@ mod tests {
         let other = bind_restore_identity(selected, changed).unwrap();
         assert!(validate_repair(&bound, &other).is_err());
     }
-}
-
-pub fn validate_supported_version(version: &str, supported: Option<&[String]>) -> Result<(), String> {
-    if let Some(versions) = supported {
-        if !versions.iter().any(|v| v == version) {
-            let allowed = if versions.is_empty() { "none".into() } else { versions.join(", ") };
-            return Err(format!("Selected IPSW: macOS {version}. Supported firmware versions: {allowed}. Select a matching IPSW."));
-        }
-    }
-    Ok(())
 }

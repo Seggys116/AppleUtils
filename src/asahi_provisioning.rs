@@ -115,7 +115,10 @@ pub fn prepare_firmware(
         requirements.supported_fw.clone()
     };
     let archive_info = crate::asahi_firmware_archive::inspect_restore_archive(inputs.ipsw)?;
-    crate::asahi_firmware::validate_supported_version(&archive_info.product_version, supported.as_deref())?;
+    crate::asahi_firmware::validate_supported_version(
+        &archive_info.product_version,
+        supported.as_deref(),
+    )?;
     let selected_version = [archive_info.product_version];
     let selection = select_firmware(
         &policy.catalog,
@@ -193,9 +196,14 @@ impl PreparedFirmware {
             requires_als_calibration,
         })?;
         let backup = crate::asahi_installer_data::build_raw_firmware_backup(
-            self.fud_directory.path(), recovery_root, target_calibration,
+            self.fud_directory.path(),
+            recovery_root,
+            target_calibration,
         )?;
-        let installer_data = Some(crate::asahi_installer_data::build_installer_data_template(&self.restore, backup.path())?);
+        let installer_data = Some(crate::asahi_installer_data::build_installer_data_template(
+            &self.restore,
+            backup.path(),
+        )?);
         let files = vendor
             .files
             .iter()
@@ -387,15 +395,28 @@ pub struct RecoveryImageFiles {
 
 impl RecoveryImageFiles {
     pub fn extract(image: &Path) -> Result<Self, String> {
-        let paths = vec!["/usr/share/firmware".into(), "/usr/sbin/appleh13camerad".into()];
+        let paths = vec![
+            "/usr/share/firmware".into(),
+            "/usr/sbin/appleh13camerad".into(),
+        ];
         let cache = crate::asahi_cache::root();
-        let directory = crate::asahi_recovery_cache::extract(cache.as_deref(), image, &paths, || {
-            crate::explorer_image::extract_paths_with_link_metadata(image, &paths).map_err(|e| e.to_string())
-        }).map_err(|e| format!("Failed to extract recovery firmware from IPSW BaseSystem {}: {e}", image.display()))?;
+        let directory =
+            crate::asahi_recovery_cache::extract(cache.as_deref(), image, &paths, || {
+                crate::explorer_image::extract_paths_with_link_metadata(image, &paths)
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(|e| {
+                format!(
+                    "Failed to extract recovery firmware from IPSW BaseSystem {}: {e}",
+                    image.display()
+                )
+            })?;
         Ok(Self { directory })
     }
 
-    pub fn root(&self) -> &Path { self.directory.path() }
+    pub fn root(&self) -> &Path {
+        self.directory.path()
+    }
 }
 
 #[cfg(test)]
@@ -408,33 +429,68 @@ mod restore_integration_tests {
         let installer = std::path::PathBuf::from(std::env::var("ASAHI_INSTALLER_ARCHIVE").unwrap());
         let ipsw = std::path::PathBuf::from(std::env::var("ASAHI_RESTORE_ARCHIVE").unwrap());
         let requirements: FirmwareRequirements = serde_json::from_slice(
-            &std::fs::read(std::env::var("ASAHI_FIRMWARE_REQUIREMENTS").unwrap()).unwrap()
-        ).unwrap();
+            &std::fs::read(std::env::var("ASAHI_FIRMWARE_REQUIREMENTS").unwrap()).unwrap(),
+        )
+        .unwrap();
         let board = std::env::var("ASAHI_TARGET_BOARD").unwrap();
         let chip = std::env::var("ASAHI_TARGET_CHIP").unwrap();
         let chip_id = u32::from_str_radix(chip.trim_start_matches("0x"), 16).unwrap();
-        let requires_als: bool = std::env::var("ASAHI_REQUIRES_ALS").unwrap().parse().unwrap();
-        let calibration = std::env::var_os("ASAHI_TARGET_CALIBRATION").map(std::path::PathBuf::from);
+        let requires_als: bool = std::env::var("ASAHI_REQUIRES_ALS")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let calibration =
+            std::env::var_os("ASAHI_TARGET_CALIBRATION").map(std::path::PathBuf::from);
         let workdir = tempfile::tempdir().unwrap();
         let inputs = ProvisioningInputs {
-            board: &board, chip_id, expert: false, installer_archive: &installer,
-            installer_source_uri: "https://alx.sh/installer", ipsw: &ipsw,
-            workdir: workdir.path(), repair_identity: None,
+            board: &board,
+            chip_id,
+            expert: false,
+            installer_archive: &installer,
+            installer_source_uri: "https://alx.sh/installer",
+            ipsw: &ipsw,
+            workdir: workdir.path(),
+            repair_identity: None,
         };
         let prepared = prepare_firmware(&inputs, &requirements).unwrap();
-        eprintln!("selected restore {} {}", prepared.restore.bound.restore.product_version,
-            prepared.restore.bound.restore.product_build);
+        eprintln!(
+            "selected restore {} {}",
+            prepared.restore.bound.restore.product_version,
+            prepared.restore.bound.restore.product_build
+        );
         let mount = RecoveryImageFiles::extract(prepared.recovery_image().unwrap()).unwrap();
         let mut artifacts = Artifacts::memory(Vec::new(), Vec::new(), Vec::new());
         artifacts.firmware_requirements = Some(requirements);
-        let provisioned = prepared.provision_artifacts(&mut artifacts, mount.root(),
-            calibration.as_deref(), requires_als).unwrap();
+        let provisioned = prepared
+            .provision_artifacts(
+                &mut artifacts,
+                mount.root(),
+                calibration.as_deref(),
+                requires_als,
+            )
+            .unwrap();
         artifacts.validate_firmware().unwrap();
-        for name in ["vendorfw/firmware.tar", "vendorfw/firmware.cpio", "vendorfw/manifest.txt"] {
-            assert!(artifacts.efi_files.iter().any(|(path, bytes)| path == name && !bytes.is_empty()),
-                "missing {name}");
+        for name in [
+            "vendorfw/firmware.tar",
+            "vendorfw/firmware.cpio",
+            "vendorfw/manifest.txt",
+        ] {
+            assert!(
+                artifacts
+                    .efi_files
+                    .iter()
+                    .any(|(path, bytes)| path == name && !bytes.is_empty()),
+                "missing {name}"
+            );
         }
-        assert!(!artifacts.installer_data.as_ref().unwrap().preboot_files().is_empty());
+        assert!(
+            !artifacts
+                .installer_data
+                .as_ref()
+                .unwrap()
+                .preboot_files()
+                .is_empty()
+        );
         assert!(provisioned.prepared.restore.directory.path().is_dir());
     }
 }

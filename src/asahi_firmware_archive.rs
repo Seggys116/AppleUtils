@@ -49,7 +49,9 @@ fn requested_keys(
             continue;
         }
         let entry = value.as_dictionary().ok_or("malformed component")?;
-        let info = entry.get("Info").and_then(Value::as_dictionary)
+        let info = entry
+            .get("Info")
+            .and_then(Value::as_dictionary)
             .ok_or_else(|| format!("missing component Info for {key}"))?;
         safe_path(string(info, "Path")?)?;
         selected.insert(key.clone());
@@ -58,28 +60,72 @@ fn requested_keys(
 }
 
 pub(crate) fn preboot_component(key: &str) -> bool {
-    !matches!(key, "BaseSystem" | "OS" | "Ap,SystemVolumeCanonicalMetadata" | "RestoreRamDisk" | "RestoreTrustCache")
-        && !key.starts_with("Cryptex")
+    !matches!(
+        key,
+        "BaseSystem"
+            | "OS"
+            | "Ap,SystemVolumeCanonicalMetadata"
+            | "RestoreRamDisk"
+            | "RestoreTrustCache"
+    ) && !key.starts_with("Cryptex")
 }
 
-pub(crate) fn machine_sep_candidates(manifest: &Dictionary, selected: &Dictionary) -> Result<Vec<(String, Dictionary)>, String> {
+pub(crate) fn machine_sep_candidates(
+    manifest: &Dictionary,
+    selected: &Dictionary,
+) -> Result<Vec<(String, Dictionary)>, String> {
     let board = integer(selected.get("ApBoardID")).ok_or("selected identity lacks board ID")?;
     let chip = integer(selected.get("ApChipID")).ok_or("selected identity lacks chip ID")?;
-    let device = selected.get("Info").and_then(Value::as_dictionary).and_then(|v| v.get("DeviceClass")).and_then(Value::as_string).ok_or("selected identity lacks device class")?;
+    let device = selected
+        .get("Info")
+        .and_then(Value::as_dictionary)
+        .and_then(|v| v.get("DeviceClass"))
+        .and_then(Value::as_string)
+        .ok_or("selected identity lacks device class")?;
     let mut candidates: Vec<(String, Dictionary)> = Vec::new();
-    for identity in manifest.get("BuildIdentities").and_then(Value::as_array).ok_or("missing BuildIdentities")? {
+    for identity in manifest
+        .get("BuildIdentities")
+        .and_then(Value::as_array)
+        .ok_or("missing BuildIdentities")?
+    {
         let identity = identity.as_dictionary().ok_or("malformed BuildIdentity")?;
-        if integer(identity.get("ApBoardID")) != Some(board) || integer(identity.get("ApChipID")) != Some(chip)
-            || identity.get("Info").and_then(Value::as_dictionary).and_then(|v| v.get("DeviceClass")).and_then(Value::as_string) != Some(device) { continue; }
-        let Some(entry) = identity.get("Manifest").and_then(Value::as_dictionary).and_then(|v| v.get("SEP")) else { continue; };
-        let entry = entry.as_dictionary().ok_or("malformed machine SEP component")?;
-        let path = entry.get("Info").and_then(Value::as_dictionary).and_then(|v| v.get("Path")).and_then(Value::as_string).ok_or("machine SEP lacks path")?;
+        if integer(identity.get("ApBoardID")) != Some(board)
+            || integer(identity.get("ApChipID")) != Some(chip)
+            || identity
+                .get("Info")
+                .and_then(Value::as_dictionary)
+                .and_then(|v| v.get("DeviceClass"))
+                .and_then(Value::as_string)
+                != Some(device)
+        {
+            continue;
+        }
+        let Some(entry) = identity
+            .get("Manifest")
+            .and_then(Value::as_dictionary)
+            .and_then(|v| v.get("SEP"))
+        else {
+            continue;
+        };
+        let entry = entry
+            .as_dictionary()
+            .ok_or("malformed machine SEP component")?;
+        let path = entry
+            .get("Info")
+            .and_then(Value::as_dictionary)
+            .and_then(|v| v.get("Path"))
+            .and_then(Value::as_string)
+            .ok_or("machine SEP lacks path")?;
         safe_path(path)?;
-        let digest = entry.get("Digest").and_then(Value::as_data).filter(|v| matches!(v.len(), 32 | 48)).ok_or("machine SEP lacks supported digest")?;
-        if let Some((_, old)) = candidates.first() {
-            if old.get("Digest").and_then(Value::as_data) != Some(digest) {
-                return Err("conflicting machine SEP candidates for selected target".into());
-            }
+        let digest = entry
+            .get("Digest")
+            .and_then(Value::as_data)
+            .filter(|v| matches!(v.len(), 32 | 48))
+            .ok_or("machine SEP lacks supported digest")?;
+        if let Some((_, old)) = candidates.first()
+            && old.get("Digest").and_then(Value::as_data) != Some(digest)
+        {
+            return Err("conflicting machine SEP candidates for selected target".into());
         }
         candidates.push((path.into(), entry.clone()));
     }
@@ -325,7 +371,9 @@ pub fn extract_firmware(
             std::fs::create_dir_all(target.parent().ok_or("missing target parent")?)
                 .map_err(|e| e.to_string())?;
             let cache_key = format!("ipsw:{archive_digest}:{name}");
-            restored = cache.as_ref().is_some_and(|root| crate::asahi_cache::restore(root, &cache_key, &target));
+            restored = cache
+                .as_ref()
+                .is_some_and(|root| crate::asahi_cache::restore(root, &cache_key, &target));
             if !restored {
                 let mut output = File::options()
                     .write(true)
@@ -361,7 +409,11 @@ pub fn extract_firmware(
         .map_err(|e| e.to_string())?;
     let mut metadata_paths = BTreeMap::new();
     if include_metadata {
-        for name in ["SystemVersion.plist", "RestoreVersion.plist", "usr/standalone/bootcaches.plist"] {
+        for name in [
+            "SystemVersion.plist",
+            "RestoreVersion.plist",
+            "usr/standalone/bootcaches.plist",
+        ] {
             let data = read_metadata_member(archive, name)?;
             let value =
                 Value::from_reader(std::io::Cursor::new(&data)).map_err(|e| e.to_string())?;
@@ -376,7 +428,8 @@ pub fn extract_firmware(
                 return Err("SystemVersion differs from selected restore identity".into());
             }
             let path = directory.path().join(name);
-            std::fs::create_dir_all(path.parent().ok_or("missing metadata parent")?).map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(path.parent().ok_or("missing metadata parent")?)
+                .map_err(|e| e.to_string())?;
             std::fs::write(&path, data).map_err(|e| e.to_string())?;
             metadata_paths.insert(name.to_owned(), path);
         }
@@ -386,17 +439,32 @@ pub fn extract_firmware(
         for (name, entry) in machine_sep_candidates(manifest, &identity)? {
             let source = member(&members, &name)?;
             let target = directory.path().join(safe_path(&name)?);
-            std::fs::create_dir_all(target.parent().ok_or("missing SEP parent")?).map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(target.parent().ok_or("missing SEP parent")?)
+                .map_err(|e| e.to_string())?;
             let cache_key = format!("ipsw:{archive_digest}:{name}");
-            if !cache.as_ref().is_some_and(|root| crate::asahi_cache::restore(root, &cache_key, &target)) {
+            if !cache
+                .as_ref()
+                .is_some_and(|root| crate::asahi_cache::restore(root, &cache_key, &target))
+            {
                 let mut output = File::create(&target).map_err(|e| e.to_string())?;
-                let n = std::io::copy(&mut reader(archive, source)?.take(source.uncomp.checked_add(1).ok_or("ZIP size overflow")?), &mut output).map_err(|e| e.to_string())?;
-                if n != source.uncomp { return Err("machine SEP ZIP length mismatch".into()); }
+                let n = std::io::copy(
+                    &mut reader(archive, source)?
+                        .take(source.uncomp.checked_add(1).ok_or("ZIP size overflow")?),
+                    &mut output,
+                )
+                .map_err(|e| e.to_string())?;
+                if n != source.uncomp {
+                    return Err("machine SEP ZIP length mismatch".into());
+                }
                 output.flush().map_err(|e| e.to_string())?;
             }
             verify_digest(&target, &entry)?;
-            if let Some(root) = &cache { let _ = crate::asahi_cache::store(root, &cache_key, &target); }
-            if !catalog.values().any(|path| path == &name) { preboot_supplemental.insert(name, target); }
+            if let Some(root) = &cache {
+                let _ = crate::asahi_cache::store(root, &cache_key, &target);
+            }
+            if !catalog.values().any(|path| path == &name) {
+                preboot_supplemental.insert(name, target);
+            }
         }
         let original = directory.path().join("SourceBuildManifest.plist");
         std::fs::write(&original, &bytes).map_err(|e| e.to_string())?;
@@ -404,32 +472,62 @@ pub fn extract_firmware(
     }
 
     if include_metadata {
-        let variant = identity.get("Info").and_then(Value::as_dictionary)
-            .and_then(|info| info.get("Variant")).and_then(Value::as_string)
+        let variant = identity
+            .get("Info")
+            .and_then(Value::as_dictionary)
+            .and_then(|info| info.get("Variant"))
+            .and_then(Value::as_string)
             .ok_or("selected identity lacks variant")?;
         let manifest_prefix = format!("Firmware/Manifests/restore/{variant}/");
         for source in &members {
-            if source.name.ends_with('/') { continue; }
-            let relative = if let Some(path) = source.name.strip_prefix("BootabilityBundle/Restore/Bootability/") {
+            if source.name.ends_with('/') {
+                continue;
+            }
+            let relative = if let Some(path) = source
+                .name
+                .strip_prefix("BootabilityBundle/Restore/Bootability/")
+            {
                 Some(format!("Bootability/{path}"))
-            } else if source.name == "BootabilityBundle/Restore/Firmware/Bootability.dmg.trustcache" {
+            } else if source.name == "BootabilityBundle/Restore/Firmware/Bootability.dmg.trustcache"
+            {
                 Some("Bootability/Bootability.trustcache".into())
             } else {
-                source.name.strip_prefix(&manifest_prefix).map(str::to_owned)
+                source
+                    .name
+                    .strip_prefix(&manifest_prefix)
+                    .map(str::to_owned)
             };
-            let Some(relative) = relative else { continue; };
+            let Some(relative) = relative else {
+                continue;
+            };
             safe_path(&relative)?;
             let target = directory.path().join(safe_path(&source.name)?);
-            std::fs::create_dir_all(target.parent().ok_or("missing supplemental parent")?).map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(target.parent().ok_or("missing supplemental parent")?)
+                .map_err(|e| e.to_string())?;
             let cache_key = format!("ipsw:{archive_digest}:{}", source.name);
-            if !cache.as_ref().is_some_and(|root| crate::asahi_cache::restore(root, &cache_key, &target)) {
+            if !cache
+                .as_ref()
+                .is_some_and(|root| crate::asahi_cache::restore(root, &cache_key, &target))
+            {
                 let mut output = File::create(&target).map_err(|e| e.to_string())?;
-                let n = std::io::copy(&mut reader(archive, source)?.take(source.uncomp.checked_add(1).ok_or("ZIP size overflow")?), &mut output).map_err(|e| e.to_string())?;
-                if n != source.uncomp { return Err(format!("ZIP length mismatch for {}", source.name)); }
+                let n = std::io::copy(
+                    &mut reader(archive, source)?
+                        .take(source.uncomp.checked_add(1).ok_or("ZIP size overflow")?),
+                    &mut output,
+                )
+                .map_err(|e| e.to_string())?;
+                if n != source.uncomp {
+                    return Err(format!("ZIP length mismatch for {}", source.name));
+                }
                 output.flush().map_err(|e| e.to_string())?;
-                if let Some(root) = &cache { let _ = crate::asahi_cache::store(root, &cache_key, &target); }
+                if let Some(root) = &cache {
+                    let _ = crate::asahi_cache::store(root, &cache_key, &target);
+                }
             }
-            if preboot_supplemental.insert(relative.clone(), target).is_some() {
+            if preboot_supplemental
+                .insert(relative.clone(), target)
+                .is_some()
+            {
                 return Err(format!("duplicate Preboot supplemental path {relative}"));
             }
         }
@@ -485,27 +583,75 @@ mod tests {
         let identity = |path: Option<&str>, digest: u8, board: u64| {
             let mut components = Dictionary::new();
             if let Some(path) = path {
-                components.insert("SEP".to_owned(), Value::Dictionary([
-                    ("Digest".to_owned(), Value::Data(vec![digest;48])),
-                    ("Info".to_owned(), Value::Dictionary([("Path".to_owned(), Value::String(path.into()))].into_iter().collect()))
-                ].into_iter().collect()));
+                components.insert(
+                    "SEP".to_owned(),
+                    Value::Dictionary(
+                        [
+                            ("Digest".to_owned(), Value::Data(vec![digest; 48])),
+                            (
+                                "Info".to_owned(),
+                                Value::Dictionary(
+                                    [("Path".to_owned(), Value::String(path.into()))]
+                                        .into_iter()
+                                        .collect(),
+                                ),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                );
             }
             [
                 ("ApBoardID".to_owned(), Value::Integer(board.into())),
                 ("ApChipID".to_owned(), Value::Integer(0x8103u64.into())),
-                ("Info".to_owned(), Value::Dictionary([("DeviceClass".to_owned(), Value::String("j274ap".into()))].into_iter().collect())),
-                ("Manifest".to_owned(), Value::Dictionary(components))
-            ].into_iter().collect::<Dictionary>()
+                (
+                    "Info".to_owned(),
+                    Value::Dictionary(
+                        [("DeviceClass".to_owned(), Value::String("j274ap".into()))]
+                            .into_iter()
+                            .collect(),
+                    ),
+                ),
+                ("Manifest".to_owned(), Value::Dictionary(components)),
+            ]
+            .into_iter()
+            .collect::<Dictionary>()
         };
         let os = identity(None, 0, 1);
         let mut source = Dictionary::new();
-        source.insert("BuildIdentities".to_owned(), Value::Array(vec![Value::Dictionary(os.clone()), Value::Dictionary(identity(Some("Firmware/all_flash/sep.im4p"), 7, 1)), Value::Dictionary(identity(Some("Firmware/all_flash/alias.im4p"), 7, 1)), Value::Dictionary(identity(Some("Firmware/all_flash/other.im4p"), 9, 2))]));
+        source.insert(
+            "BuildIdentities".to_owned(),
+            Value::Array(vec![
+                Value::Dictionary(os.clone()),
+                Value::Dictionary(identity(Some("Firmware/all_flash/sep.im4p"), 7, 1)),
+                Value::Dictionary(identity(Some("Firmware/all_flash/alias.im4p"), 7, 1)),
+                Value::Dictionary(identity(Some("Firmware/all_flash/other.im4p"), 9, 2)),
+            ]),
+        );
         let candidates = machine_sep_candidates(&source, &os).unwrap();
         assert_eq!(candidates.len(), 2);
         assert!(os["Manifest"].as_dictionary().unwrap().get("SEP").is_none());
-        source.get_mut("BuildIdentities").unwrap().as_array_mut().unwrap().push(Value::Dictionary(identity(Some("Firmware/all_flash/conflict.im4p"), 8, 1)));
-        assert!(machine_sep_candidates(&source, &os).unwrap_err().contains("conflicting"));
-        assert!(machine_sep_candidates(&source, &identity(None,0,3)).unwrap().is_empty());
+        source
+            .get_mut("BuildIdentities")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(Value::Dictionary(identity(
+                Some("Firmware/all_flash/conflict.im4p"),
+                8,
+                1,
+            )));
+        assert!(
+            machine_sep_candidates(&source, &os)
+                .unwrap_err()
+                .contains("conflicting")
+        );
+        assert!(
+            machine_sep_candidates(&source, &identity(None, 0, 3))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -582,25 +728,149 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let archive = root.path().join("source.ipsw");
         let mut components = Dictionary::new();
-        for (key, path) in [("iBoot","iboot"),("DeviceTree","adt"),("KernelCache","kernelcache.test"),("BaseSystem","base")] {
-            components.insert(key.into(), Value::Dictionary([("Info".to_owned(),Value::Dictionary([("Path".to_owned(),Value::String(path.into()))].into_iter().collect()))].into_iter().collect()));
+        for (key, path) in [
+            ("iBoot", "iboot"),
+            ("DeviceTree", "adt"),
+            ("KernelCache", "kernelcache.test"),
+            ("BaseSystem", "base"),
+        ] {
+            components.insert(
+                key.into(),
+                Value::Dictionary(
+                    [(
+                        "Info".to_owned(),
+                        Value::Dictionary(
+                            [("Path".to_owned(), Value::String(path.into()))]
+                                .into_iter()
+                                .collect(),
+                        ),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            );
         }
-        let os: Dictionary = [("ApBoardID".to_owned(),Value::Integer(1u64.into())),("ApChipID".to_owned(),Value::Integer(123u64.into())),("Info".to_owned(),Value::Dictionary([("DeviceClass".to_owned(),Value::String("testap".into())),("Variant".to_owned(),Value::String("macOS Customer".into())),("RestoreBehavior".to_owned(),Value::String("Erase".into()))].into_iter().collect())),("Manifest".to_owned(),Value::Dictionary(components))].into_iter().collect();
+        let os: Dictionary = [
+            ("ApBoardID".to_owned(), Value::Integer(1u64.into())),
+            ("ApChipID".to_owned(), Value::Integer(123u64.into())),
+            (
+                "Info".to_owned(),
+                Value::Dictionary(
+                    [
+                        ("DeviceClass".to_owned(), Value::String("testap".into())),
+                        ("Variant".to_owned(), Value::String("macOS Customer".into())),
+                        ("RestoreBehavior".to_owned(), Value::String("Erase".into())),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            ),
+            ("Manifest".to_owned(), Value::Dictionary(components)),
+        ]
+        .into_iter()
+        .collect();
         let mut machine = os.clone();
-        machine.get_mut("Info").unwrap().as_dictionary_mut().unwrap().insert("Variant".into(),Value::String("Research".into()));
-        machine.insert("Manifest".into(),Value::Dictionary([("SEP".to_owned(),Value::Dictionary([("Digest".to_owned(),Value::Data(crate::crypto::sha384(b"sep-original").to_vec())),("Info".to_owned(),Value::Dictionary([("Path".to_owned(),Value::String("Firmware/all_flash/sep.im4p".into()))].into_iter().collect()))].into_iter().collect()))].into_iter().collect()));
-        let manifest=Value::Dictionary([("ProductVersion".to_owned(),Value::String("1.2".into())),("ProductBuildVersion".to_owned(),Value::String("test-build".into())),("BuildIdentities".to_owned(),Value::Array(vec![Value::Dictionary(os.clone()),Value::Dictionary(machine)]))].into_iter().collect());
-        let mut xml=Vec::new(); manifest.to_writer_xml(&mut xml).unwrap();
+        machine
+            .get_mut("Info")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap()
+            .insert("Variant".into(), Value::String("Research".into()));
+        machine.insert(
+            "Manifest".into(),
+            Value::Dictionary(
+                [(
+                    "SEP".to_owned(),
+                    Value::Dictionary(
+                        [
+                            (
+                                "Digest".to_owned(),
+                                Value::Data(crate::crypto::sha384(b"sep-original").to_vec()),
+                            ),
+                            (
+                                "Info".to_owned(),
+                                Value::Dictionary(
+                                    [(
+                                        "Path".to_owned(),
+                                        Value::String("Firmware/all_flash/sep.im4p".into()),
+                                    )]
+                                    .into_iter()
+                                    .collect(),
+                                ),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        );
+        let manifest = Value::Dictionary(
+            [
+                ("ProductVersion".to_owned(), Value::String("1.2".into())),
+                (
+                    "ProductBuildVersion".to_owned(),
+                    Value::String("test-build".into()),
+                ),
+                (
+                    "BuildIdentities".to_owned(),
+                    Value::Array(vec![
+                        Value::Dictionary(os.clone()),
+                        Value::Dictionary(machine),
+                    ]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let mut xml = Vec::new();
+        manifest.to_writer_xml(&mut xml).unwrap();
         let version=br#"<plist version="1.0"><dict><key>ProductVersion</key><string>1.2</string><key>ProductBuildVersion</key><string>test-build</string></dict></plist>"#;
         let bootcaches=br#"<plist version="1.0"><dict><key>bless2</key><dict><key>RestoreBundlePath</key><string>./Restore</string></dict></dict></plist>"#;
         for payload in [b"sep-original".as_slice(), b"corrupt".as_slice()] {
-            std::fs::write(&archive,stored_zip(&[("BuildManifest.plist",&xml),("SystemVersion.plist",version),("RestoreVersion.plist",version),("usr/standalone/bootcaches.plist",bootcaches),("iboot",b"iboot"),("adt",b"adt"),("kernelcache.test",b"kernel"),("base",b"base"),("Firmware/all_flash/sep.im4p",payload),("BootabilityBundle/Restore/Firmware/Bootability.dmg.trustcache",b"trust")])).unwrap();
-            let result=extract_firmware(&archive,selection(),root.path(),ComponentSelection::BootAndVendorInputs);
-            if payload==b"corrupt" { assert!(result.err().unwrap().contains("digest mismatch")); continue; }
-            let extracted=result.unwrap();
-            assert_eq!(extracted.identity,os);
-            assert_eq!(std::fs::read(&extracted.preboot_supplemental["SourceBuildManifest.plist"]).unwrap(),xml);
-            assert_eq!(std::fs::read(&extracted.preboot_supplemental["Firmware/all_flash/sep.im4p"]).unwrap(),payload);
+            std::fs::write(
+                &archive,
+                stored_zip(&[
+                    ("BuildManifest.plist", &xml),
+                    ("SystemVersion.plist", version),
+                    ("RestoreVersion.plist", version),
+                    ("usr/standalone/bootcaches.plist", bootcaches),
+                    ("iboot", b"iboot"),
+                    ("adt", b"adt"),
+                    ("kernelcache.test", b"kernel"),
+                    ("base", b"base"),
+                    ("Firmware/all_flash/sep.im4p", payload),
+                    (
+                        "BootabilityBundle/Restore/Firmware/Bootability.dmg.trustcache",
+                        b"trust",
+                    ),
+                ]),
+            )
+            .unwrap();
+            let result = extract_firmware(
+                &archive,
+                selection(),
+                root.path(),
+                ComponentSelection::BootAndVendorInputs,
+            );
+            if payload == b"corrupt" {
+                assert!(result.err().unwrap().contains("digest mismatch"));
+                continue;
+            }
+            let extracted = result.unwrap();
+            assert_eq!(extracted.identity, os);
+            assert_eq!(
+                std::fs::read(&extracted.preboot_supplemental["SourceBuildManifest.plist"])
+                    .unwrap(),
+                xml
+            );
+            assert_eq!(
+                std::fs::read(&extracted.preboot_supplemental["Firmware/all_flash/sep.im4p"])
+                    .unwrap(),
+                payload
+            );
         }
     }
 
@@ -708,22 +978,35 @@ mod tests {
         let ipsw = dir.path().join("input.ipsw");
         std::fs::write(&ipsw, stored_zip(&[("BuildManifest.plist", manifest)])).unwrap();
         let supported = vec!["13.5".to_string()];
-        let error = validate_archive_for_package(&ipsw, Some(&supported), Some(("j274ap", 0x8103))).unwrap_err();
+        let error = validate_archive_for_package(&ipsw, Some(&supported), Some(("j274ap", 0x8103)))
+            .unwrap_err();
         assert!(error.contains("26.5.1") && error.contains("13.5"));
         let requirements = crate::asahi_ops::FirmwareRequirements {
-            supported_fw: Some(supported), firmware_partitions: vec!["EFI".into()], installer_data_partitions: vec![],
+            supported_fw: Some(supported),
+            firmware_partitions: vec!["EFI".into()],
+            installer_data_partitions: vec![],
         };
         let workdir = dir.path().join("must-not-create");
         let inputs = crate::asahi_firmware_download::FirmwareArchiveInputs {
-            board: "j274ap", chip_id: 0x8103, expert: false, workdir: &workdir,
-            requirements: &requirements, installer_archive: None, installer_source_uri: None,
-            ipsw: Some(&ipsw), repair_identity: None,
+            board: "j274ap",
+            chip_id: 0x8103,
+            expert: false,
+            workdir: &workdir,
+            requirements: &requirements,
+            installer_archive: None,
+            installer_source_uri: None,
+            ipsw: Some(&ipsw),
+            repair_identity: None,
         };
-        let result = crate::asahi_firmware_download::resolve_firmware_archives(&inputs,
-            |_, _| panic!("download progress must not start for an incompatible IPSW"));
+        let result = crate::asahi_firmware_download::resolve_firmware_archives(&inputs, |_, _| {
+            panic!("download progress must not start for an incompatible IPSW")
+        });
         assert!(result.err().unwrap().contains("26.5.1"));
         assert!(!workdir.exists());
-        assert!(validate_archive_for_package(&ipsw, Some(&["26.5.1".into()]), Some(("j274ap", 0x8103))).is_ok());
+        assert!(
+            validate_archive_for_package(&ipsw, Some(&["26.5.1".into()]), Some(("j274ap", 0x8103)))
+                .is_ok()
+        );
         assert!(validate_archive_for_package(&ipsw, None, Some(("wrongap", 0x8103))).is_err());
     }
 
@@ -785,19 +1068,29 @@ pub fn inspect_restore_archive(archive: &Path) -> Result<RestoreArchiveInfo, Str
     let members = zip_list_file(archive).map_err(|e| e.to_string())?;
     let bytes = read_manifest_bytes(archive, &members)?;
     let value = Value::from_reader(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
-    inspect_manifest(value.as_dictionary().ok_or("BuildManifest is not a dictionary")?)
+    inspect_manifest(
+        value
+            .as_dictionary()
+            .ok_or("BuildManifest is not a dictionary")?,
+    )
 }
 
 fn inspect_manifest(manifest: &Dictionary) -> Result<RestoreArchiveInfo, String> {
     let mut identities = Vec::new();
     let mut seen = BTreeSet::new();
-    for value in manifest.get("BuildIdentities").and_then(Value::as_array)
-        .ok_or("missing BuildIdentities")? {
+    for value in manifest
+        .get("BuildIdentities")
+        .and_then(Value::as_array)
+        .ok_or("missing BuildIdentities")?
+    {
         let identity = value.as_dictionary().ok_or("malformed BuildIdentity")?;
-        let info = identity.get("Info").and_then(Value::as_dictionary)
+        let info = identity
+            .get("Info")
+            .and_then(Value::as_dictionary)
             .ok_or("missing BuildIdentity Info")?;
         if info.get("Variant").and_then(Value::as_string) != Some("macOS Customer")
-            || info.get("RestoreBehavior").and_then(Value::as_string) != Some("Erase") {
+            || info.get("RestoreBehavior").and_then(Value::as_string) != Some("Erase")
+        {
             continue;
         }
         let board = string(info, "DeviceClass")?.to_owned();
@@ -808,7 +1101,9 @@ fn inspect_manifest(manifest: &Dictionary) -> Result<RestoreArchiveInfo, String>
         }
         identities.push(RestoreTarget { board, chip_id });
     }
-    if identities.is_empty() { return Err("IPSW contains no macOS customer erase identities".into()); }
+    if identities.is_empty() {
+        return Err("IPSW contains no macOS customer erase identities".into());
+    }
     Ok(RestoreArchiveInfo {
         product_version: string(manifest, "ProductVersion")?.into(),
         product_build: string(manifest, "ProductBuildVersion")?.into(),
@@ -816,16 +1111,23 @@ fn inspect_manifest(manifest: &Dictionary) -> Result<RestoreArchiveInfo, String>
     })
 }
 
-
 pub fn validate_archive_for_package(
-    archive: &Path, supported: Option<&[String]>, target: Option<(&str, u32)>,
+    archive: &Path,
+    supported: Option<&[String]>,
+    target: Option<(&str, u32)>,
 ) -> Result<RestoreArchiveInfo, String> {
     let info = inspect_restore_archive(archive)?;
     crate::asahi_firmware::validate_supported_version(&info.product_version, supported)?;
-    if let Some((board, chip_id)) = target {
-        if !info.identities.iter().any(|identity| identity.board == board && identity.chip_id == chip_id) {
-            return Err(format!("IPSW macOS {} has no restore identity for {board} (chip {chip_id:#x}). Select an IPSW containing that target.", info.product_version));
-        }
+    if let Some((board, chip_id)) = target
+        && !info
+            .identities
+            .iter()
+            .any(|identity| identity.board == board && identity.chip_id == chip_id)
+    {
+        return Err(format!(
+            "IPSW macOS {} has no restore identity for {board} (chip {chip_id:#x}). Select an IPSW containing that target.",
+            info.product_version
+        ));
     }
     Ok(info)
 }

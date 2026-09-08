@@ -457,23 +457,22 @@ fn extract_paths_at_container(
     while let Some((source, destination_path, mut ancestry, through_link)) = pending.pop() {
         if let Some(previous) =
             output_names.insert(destination_path.to_lowercase(), destination_path.clone())
+            && previous != destination_path
         {
-            if previous != destination_path {
-                return Err(ExplorerError::Format(
-                    "case-colliding extraction paths".into(),
-                ));
-            }
+            return Err(ExplorerError::Format(
+                "case-colliding extraction paths".into(),
+            ));
         }
         let facts = match apfs.stat(&volume, &source) {
             Ok(facts) => facts,
-            Err(ApfsReadError::ComponentNotFound { .. }) if preserve_links && through_link => continue,
+            Err(ApfsReadError::ComponentNotFound { .. }) if preserve_links && through_link => {
+                continue;
+            }
             Err(error) => return Err(error.into()),
         };
         let destination = output.path().join(&destination_path[1..]);
-        if facts.is_directory() || facts.is_symlink() {
-            if !ancestry.insert(facts.file_id) {
-                return Err(ExplorerError::Apfs("cyclic extraction topology".into()));
-            }
+        if (facts.is_directory() || facts.is_symlink()) && !ancestry.insert(facts.file_id) {
+            return Err(ExplorerError::Apfs("cyclic extraction topology".into()));
         }
         if facts.is_directory() {
             std::fs::create_dir_all(&destination)?;

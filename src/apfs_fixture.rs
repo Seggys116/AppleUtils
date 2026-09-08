@@ -723,19 +723,49 @@ mod tests {
         value.extend_from_slice(&(data.len() as u16).to_le_bytes());
         value.extend_from_slice(&data);
         let mut records = vec![
-            (inode_key(ROOT_INO), inode_val(1, ROOT_INO, S_IFDIR | 0o755, 1, None)),
+            (
+                inode_key(ROOT_INO),
+                inode_val(1, ROOT_INO, S_IFDIR | 0o755, 1, None),
+            ),
             (drec_key(ROOT_INO, FIXTURE_DIR), drec_val(DOCS_INO, DT_DIR)),
-            (drec_key(ROOT_INO, FIXTURE_SYMLINK), drec_val(LINK_INO, DT_LNK)),
-            (inode_key(DOCS_INO), inode_val(ROOT_INO, DOCS_INO, S_IFDIR | 0o755, 2, None)),
-            (drec_key(DOCS_INO, FIXTURE_SYMLINK), drec_val(LINK_INO, DT_LNK)),
+            (
+                drec_key(ROOT_INO, FIXTURE_SYMLINK),
+                drec_val(LINK_INO, DT_LNK),
+            ),
+            (
+                inode_key(DOCS_INO),
+                inode_val(ROOT_INO, DOCS_INO, S_IFDIR | 0o755, 2, None),
+            ),
+            (
+                drec_key(DOCS_INO, FIXTURE_SYMLINK),
+                drec_val(LINK_INO, DT_LNK),
+            ),
             (drec_key(DOCS_INO, FIXTURE_FILE), drec_val(FILE_INO, DT_REG)),
-            (inode_key(FILE_INO), inode_val(DOCS_INO, FILE_INO, S_IFREG | 0o644, 1, Some(FIXTURE_FILE_BYTES.len() as u64))),
-            (extent_key(FILE_INO, 0), extent_val(u64::from(APFS_BLOCK), FILE_DATA_BLK)),
-            (inode_key(LINK_INO), inode_val(ROOT_INO, LINK_INO, S_IFLNK | 0o777, 1, None)),
+            (
+                inode_key(FILE_INO),
+                inode_val(
+                    DOCS_INO,
+                    FILE_INO,
+                    S_IFREG | 0o644,
+                    1,
+                    Some(FIXTURE_FILE_BYTES.len() as u64),
+                ),
+            ),
+            (
+                extent_key(FILE_INO, 0),
+                extent_val(u64::from(APFS_BLOCK), FILE_DATA_BLK),
+            ),
+            (
+                inode_key(LINK_INO),
+                inode_val(ROOT_INO, LINK_INO, S_IFLNK | 0o777, 1, None),
+            ),
             (key, value),
         ];
         if streamed {
-            records.push((extent_key(stream_id, 0), extent_val(u64::from(APFS_BLOCK), LINK_DATA_BLK)));
+            records.push((
+                extent_key(stream_id, 0),
+                extent_val(u64::from(APFS_BLOCK), LINK_DATA_BLK),
+            ));
             let at = (LINK_DATA_BLK * u64::from(APFS_BLOCK)) as usize;
             image[at..at + target.len()].copy_from_slice(target);
         }
@@ -755,7 +785,10 @@ mod tests {
         let vol = apfs.open_volume_chosen(&VolumeChoice::Index(0)).unwrap();
         let path = format!("/{FIXTURE_SYMLINK}");
         assert_eq!(apfs.stat(&vol, &path).unwrap().stream_size, None);
-        assert_eq!(apfs.read_symlink(&vol, &path).unwrap(), std::str::from_utf8(&target[..target.len() - 1]).unwrap());
+        assert_eq!(
+            apfs.read_symlink(&vol, &path).unwrap(),
+            std::str::from_utf8(&target[..target.len() - 1]).unwrap()
+        );
     }
 
     #[test]
@@ -773,15 +806,24 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let image = temp.path().join("dangling.img");
         let target = "/docs/missing.txcb";
-        std::fs::write(&image, wrap_gpt(&symlink_xattr_fixture(false, target.as_bytes()))).unwrap();
+        std::fs::write(
+            &image,
+            wrap_gpt(&symlink_xattr_fixture(false, target.as_bytes())),
+        )
+        .unwrap();
         let paths = vec!["/docs".to_string()];
-        let output = crate::explorer_image::extract_paths_with_link_metadata(&image, &paths).unwrap();
+        let output =
+            crate::explorer_image::extract_paths_with_link_metadata(&image, &paths).unwrap();
         let links: std::collections::BTreeMap<String, String> = serde_json::from_slice(
             &std::fs::read(output.path().join(".appleutils-symlinks.json")).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(links.get("/docs/link").map(String::as_str), Some(target));
         assert!(!output.path().join("docs/link").exists());
-        assert_eq!(std::fs::read(output.path().join("docs/readme.txt")).unwrap(), FIXTURE_FILE_BYTES);
+        assert_eq!(
+            std::fs::read(output.path().join("docs/readme.txt")).unwrap(),
+            FIXTURE_FILE_BYTES
+        );
         assert!(crate::explorer_image::extract_paths_from_unique_volume(&image, &paths).is_err());
     }
 
@@ -789,15 +831,29 @@ mod tests {
     fn symlink_metadata_preserves_relative_target_and_materializes_its_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let image = temp.path().join("linked.img");
-        std::fs::write(&image, wrap_gpt(&symlink_xattr_fixture(false, b"readme.txt"))).unwrap();
+        std::fs::write(
+            &image,
+            wrap_gpt(&symlink_xattr_fixture(false, b"readme.txt")),
+        )
+        .unwrap();
         let paths = vec!["/docs".to_string()];
-        let output = crate::explorer_image::extract_paths_with_link_metadata(&image, &paths).unwrap();
+        let output =
+            crate::explorer_image::extract_paths_with_link_metadata(&image, &paths).unwrap();
         let links: std::collections::BTreeMap<String, String> = serde_json::from_slice(
             &std::fs::read(output.path().join(".appleutils-symlinks.json")).unwrap(),
-        ).unwrap();
-        assert_eq!(links.get("/docs/link").map(String::as_str), Some("readme.txt"));
+        )
+        .unwrap();
+        assert_eq!(
+            links.get("/docs/link").map(String::as_str),
+            Some("readme.txt")
+        );
         let link = output.path().join("docs/link");
-        assert!(!std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(
+            !std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(std::fs::read(link).unwrap(), FIXTURE_FILE_BYTES);
     }
 

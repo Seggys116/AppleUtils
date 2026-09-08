@@ -1,4 +1,3 @@
-
 use crate::asahi_firmware::{
     CatalogProvenance, FirmwareCatalogEntry, Prerequisites, TargetConstraints,
 };
@@ -194,14 +193,16 @@ IPSW('2.5','2','iBoot-7','8,0',True,['fixture'],'https://example.test/b')]
         let unsafe_source = String::from_utf8(SOURCE.to_vec())
             .unwrap()
             .replace("'2.1'", "str(2)");
-        assert!(read_installer_firmware_policy(
-            unsafe_source.as_bytes(),
-            "fixture",
-            91,
-            false,
-            provenance()
-        )
-        .is_err());
+        assert!(
+            read_installer_firmware_policy(
+                unsafe_source.as_bytes(),
+                "fixture",
+                91,
+                false,
+                provenance()
+            )
+            .is_err()
+        );
     }
 }
 
@@ -212,14 +213,29 @@ mod real_catalog_tests {
     #[ignore = "requires ASAHI_INSTALLER_MAIN pointing to official installer source"]
     fn reads_official_installer_catalog() {
         let bytes = std::fs::read(std::env::var("ASAHI_INSTALLER_MAIN").unwrap()).unwrap();
-        let digest = crate::crypto::sha256(&bytes).iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let digest = crate::crypto::sha256(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         let provenance = CatalogProvenance {
-            source_uri: "https://github.com/AsahiLinux/asahi-installer".into(), revision: digest,
+            source_uri: "https://github.com/AsahiLinux/asahi-installer".into(),
+            revision: digest,
         };
-        let policy = read_installer_firmware_policy(&bytes, "j274ap", 0x8103, false, provenance).unwrap();
-        let supported = vec!["12.3".into(), "12.3.1".into(), "13.5".into(), "14.8.3".into()];
-        let selected = crate::asahi_firmware::select_firmware(&policy.catalog, Some(&supported),
-            &policy.target, &policy.provenance).unwrap();
+        let policy =
+            read_installer_firmware_policy(&bytes, "j274ap", 0x8103, false, provenance).unwrap();
+        let supported = vec![
+            "12.3".into(),
+            "12.3.1".into(),
+            "13.5".into(),
+            "14.8.3".into(),
+        ];
+        let selected = crate::asahi_firmware::select_firmware(
+            &policy.catalog,
+            Some(&supported),
+            &policy.target,
+            &policy.provenance,
+        )
+        .unwrap();
         assert_eq!(selected.entry.version, "13.5");
     }
 }

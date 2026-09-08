@@ -1,24 +1,38 @@
-use std::path::Path;
+use super::{CheckStatus, Finding};
 use crate::asahi_firmware::{BoundFirmware, Version, bind_restore_identity};
-use super::{Finding, CheckStatus};
+use std::path::Path;
 
 pub(super) fn inspect(path: &Path) -> Option<Finding> {
     let object = crate::asahi_ops::load_custom_boot_object(path, None).ok()?;
-    if !recognizes(&object) { return None; }
+    if !recognizes(&object) {
+        return None;
+    }
     let result = (|| {
-        let files = crate::asahi_ops::read_efi_files(path, &[
-            "asahi/firmware.json", "vendorfw/firmware.tar", "vendorfw/firmware.cpio", "vendorfw/manifest.txt",
-        ]).map_err(|error| error.to_string())?;
+        let files = crate::asahi_ops::read_efi_files(
+            path,
+            &[
+                "asahi/firmware.json",
+                "vendorfw/firmware.tar",
+                "vendorfw/firmware.cpio",
+                "vendorfw/manifest.txt",
+            ],
+        )
+        .map_err(|error| error.to_string())?;
         validate(&files)?;
         let bound: BoundFirmware = serde_json::from_slice(&files[0]).map_err(|e| e.to_string())?;
-        let provenance = crate::asahi_ops::validate_installed_restore_bundle(path, &bound).map_err(|e| e.to_string())?;
+        let provenance = crate::asahi_ops::validate_installed_restore_bundle(path, &bound)
+            .map_err(|e| e.to_string())?;
         require_machine_provenance(provenance)
     })();
     Some(finding(result))
 }
 
 fn require_machine_provenance(verified: bool) -> Result<(), String> {
-    if verified { Ok(()) } else { Err("Machine firmware provenance is unavailable: the selected OS manifest has no SEP and SourceBuildManifest.plist is missing; completeness cannot be verified".into()) }
+    if verified {
+        Ok(())
+    } else {
+        Err("Machine firmware provenance is unavailable: the selected OS manifest has no SEP and SourceBuildManifest.plist is missing; completeness cannot be verified".into())
+    }
 }
 
 fn finding(result: Result<(), String>) -> Finding {
@@ -35,35 +49,69 @@ fn finding(result: Result<(), String>) -> Finding {
 }
 
 fn recognizes(object: &[u8]) -> bool {
-    [b"##m1n1_ver##".as_slice(), b"chosen.asahi,efi-system-partition=", b"chainload="]
-        .iter().all(|marker| object.windows(marker.len()).any(|part| part == *marker))
+    [
+        b"##m1n1_ver##".as_slice(),
+        b"chosen.asahi,efi-system-partition=",
+        b"chainload=",
+    ]
+    .iter()
+    .all(|marker| object.windows(marker.len()).any(|part| part == *marker))
 }
 
 fn validate(files: &[Vec<u8>]) -> Result<(), String> {
-    if files.len() != 4 { return Err("firmware contract files are missing".into()); }
-    let bound: BoundFirmware = serde_json::from_slice(&files[0]).map_err(|e| format!("invalid firmware binding: {e}"))?;
+    if files.len() != 4 {
+        return Err("firmware contract files are missing".into());
+    }
+    let bound: BoundFirmware =
+        serde_json::from_slice(&files[0]).map_err(|e| format!("invalid firmware binding: {e}"))?;
     bind_restore_identity(bound.selection.clone(), bound.restore.clone())?;
-    for version in [&bound.selection.entry.version, &bound.selection.entry.min_macos,
-        &bound.selection.entry.min_iboot, &bound.selection.entry.min_sfr] {
+    for version in [
+        &bound.selection.entry.version,
+        &bound.selection.entry.min_macos,
+        &bound.selection.entry.min_iboot,
+        &bound.selection.entry.min_sfr,
+    ] {
         Version::parse(version)?;
     }
-    if bound.selection.board.trim().is_empty() || bound.selection.provenance.source_uri.trim().is_empty()
+    if bound.selection.board.trim().is_empty()
+        || bound.selection.provenance.source_uri.trim().is_empty()
         || bound.selection.provenance.revision.trim().is_empty()
         || bound.selection.entry.restore_url.trim().is_empty()
-        || bound.selection.entry.devices.as_ref().is_some_and(|devices| !devices.contains(&bound.selection.board))
-    { return Err("firmware selection has invalid target or provenance".into()); }
-    for digest in [&bound.restore.manifest_digest, &bound.restore.archive_digest] {
+        || bound
+            .selection
+            .entry
+            .devices
+            .as_ref()
+            .is_some_and(|devices| !devices.contains(&bound.selection.board))
+    {
+        return Err("firmware selection has invalid target or provenance".into());
+    }
+    for digest in [
+        &bound.restore.manifest_digest,
+        &bound.restore.archive_digest,
+    ] {
         if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err("firmware identity has malformed SHA256 digest".into());
         }
     }
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-    for (name, bytes) in ["firmware.tar", "firmware.cpio", "manifest.txt"].iter().zip(&files[1..]) {
+    for (name, bytes) in ["firmware.tar", "firmware.cpio", "manifest.txt"]
+        .iter()
+        .zip(&files[1..])
+    {
         std::fs::write(dir.path().join(name), bytes).map_err(|e| e.to_string())?;
     }
-    let output = std::process::Command::new("python3").args(["-I", "-c", VERIFY])
-        .arg(dir.path()).output().map_err(|e| format!("cannot verify firmware archives: {e}"))?;
-    if !output.status.success() { return Err(format!("firmware archive verification failed: {}", String::from_utf8_lossy(&output.stderr).trim())); }
+    let output = std::process::Command::new("python3")
+        .args(["-I", "-c", VERIFY])
+        .arg(dir.path())
+        .output()
+        .map_err(|e| format!("cannot verify firmware archives: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "firmware archive verification failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
     Ok(())
 }
 
@@ -144,14 +192,19 @@ mod tests {
         assert!(result.detail.contains("completeness cannot be verified"));
         assert!(result.detail.contains("Regenerate"));
         assert!(!result.repairable);
-        assert!(matches!(finding(require_machine_provenance(true)).status, CheckStatus::Pass));
+        assert!(matches!(
+            finding(require_machine_provenance(true)).status,
+            CheckStatus::Pass
+        ));
     }
 
     #[test]
     fn only_asahi_stage_one_is_recognized() {
         assert!(!recognizes(b"ordinary APFS content"));
         assert!(!recognizes(b"##m1n1_ver##stage2"));
-        assert!(recognizes(b"##m1n1_ver##chosen.asahi,efi-system-partition=x\nchainload=x"));
+        assert!(recognizes(
+            b"##m1n1_ver##chosen.asahi,efi-system-partition=x\nchainload=x"
+        ));
     }
     #[test]
     fn archive_verifier_detects_content_corruption_and_missing_members() {
@@ -172,13 +225,31 @@ def add(name,body,ino):
 add('vendorfw/apple/test.bin',payload,1);add('vendorfw/.vendorfw.manifest',manifest,2);add('TRAILER!!!',b'',3)
 (root/'firmware.cpio').write_bytes(cpio)
 "#;
-        assert!(std::process::Command::new("python3").args(["-I","-c",setup]).arg(dir.path()).status().unwrap().success());
-        let verify = || std::process::Command::new("python3").args(["-I","-c",VERIFY]).arg(dir.path()).output().unwrap().status.success();
+        assert!(
+            std::process::Command::new("python3")
+                .args(["-I", "-c", setup])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let verify = || {
+            std::process::Command::new("python3")
+                .args(["-I", "-c", VERIFY])
+                .arg(dir.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
         assert!(verify());
         let cpio_path = dir.path().join("firmware.cpio");
         let original = std::fs::read(&cpio_path).unwrap();
         let mut corrupt = original.clone();
-        let position = corrupt.windows(6).position(|bytes| bytes == b"actual").unwrap();
+        let position = corrupt
+            .windows(6)
+            .position(|bytes| bytes == b"actual")
+            .unwrap();
         corrupt[position] ^= 1;
         std::fs::write(&cpio_path, corrupt).unwrap();
         assert!(!verify());
@@ -190,6 +261,6 @@ add('vendorfw/apple/test.bin',payload,1);add('vendorfw/.vendorfw.manifest',manif
     #[test]
     fn missing_or_malformed_contract_is_rejected() {
         assert!(validate(&[]).is_err());
-        assert!(validate(&[b"{}".to_vec(),vec![],vec![],vec![]]).is_err());
+        assert!(validate(&[b"{}".to_vec(), vec![], vec![], vec![]]).is_err());
     }
 }

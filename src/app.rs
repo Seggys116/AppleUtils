@@ -181,7 +181,10 @@ enum AsahiJobEvent {
         fraction: Option<f64>,
     },
     Catalog(Result<(String, Vec<crate::asahi_ops::Flavor>), String>),
-    RestoreInspected(std::path::PathBuf, Result<crate::asahi_firmware_archive::RestoreArchiveInfo, String>),
+    RestoreInspected(
+        std::path::PathBuf,
+        Result<crate::asahi_firmware_archive::RestoreArchiveInfo, String>,
+    ),
     Finished(Result<String, String>),
 }
 
@@ -529,7 +532,10 @@ impl App {
             Screen::Repair => self.repair_step == RepairStep::Path,
             Screen::Asahi => matches!(
                 self.asahi_step,
-                AsahiStep::WaitFile | AsahiStep::WaitKernel | AsahiStep::WaitM1n1 | AsahiStep::WaitIpsw
+                AsahiStep::WaitFile
+                    | AsahiStep::WaitKernel
+                    | AsahiStep::WaitM1n1
+                    | AsahiStep::WaitIpsw
             ),
             _ => false,
         }
@@ -590,7 +596,10 @@ impl App {
             Screen::Repair => self.repair_step == RepairStep::Path,
             Screen::Asahi => matches!(
                 self.asahi_step,
-                AsahiStep::WaitFile | AsahiStep::WaitKernel | AsahiStep::WaitM1n1 | AsahiStep::WaitIpsw
+                AsahiStep::WaitFile
+                    | AsahiStep::WaitKernel
+                    | AsahiStep::WaitM1n1
+                    | AsahiStep::WaitIpsw
             ),
             Screen::Recovery => self.recovery.model.step() == RecoveryStep::PickFile,
             _ => false,
@@ -2435,7 +2444,9 @@ impl App {
                 }
             }
             AsahiStep::WaitIpsw => {
-                if self.file_picker_edit_key(key) { return false; }
+                if self.file_picker_edit_key(key) {
+                    return false;
+                }
                 match key.code {
                     KeyCode::Char('q') => true,
                     KeyCode::Esc => {
@@ -2453,33 +2464,41 @@ impl App {
                     _ => false,
                 }
             }
-            AsahiStep::RestoreTarget => match key.code {
-                KeyCode::Char('q') => true,
-                KeyCode::Esc => {
-                    self.asahi_selected_target = None;
-                    self.enter_file_picker();
-                    self.asahi_step = AsahiStep::WaitIpsw;
-                    false
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.asahi_restore_cursor = self.asahi_restore_cursor.saturating_sub(1);
-                    false
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if self.asahi_restore_info.as_ref().is_some_and(|info|
-                        self.asahi_restore_cursor + 1 < info.identities.len()) {
-                        self.asahi_restore_cursor += 1;
+            AsahiStep::RestoreTarget => {
+                match key.code {
+                    KeyCode::Char('q') => true,
+                    KeyCode::Esc => {
+                        self.asahi_selected_target = None;
+                        self.enter_file_picker();
+                        self.asahi_step = AsahiStep::WaitIpsw;
+                        false
                     }
-                    false
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.asahi_restore_cursor = self.asahi_restore_cursor.saturating_sub(1);
+                        false
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if self.asahi_restore_info.as_ref().is_some_and(|info| {
+                            self.asahi_restore_cursor + 1 < info.identities.len()
+                        }) {
+                            self.asahi_restore_cursor += 1;
+                        }
+                        false
+                    }
+                    KeyCode::Enter => {
+                        self.asahi_selected_target = self
+                            .asahi_restore_info
+                            .as_ref()
+                            .and_then(|info| info.identities.get(self.asahi_restore_cursor))
+                            .cloned();
+                        if self.asahi_selected_target.is_some() {
+                            self.run_asahi_work();
+                        }
+                        false
+                    }
+                    _ => false,
                 }
-                KeyCode::Enter => {
-                    self.asahi_selected_target = self.asahi_restore_info.as_ref()
-                        .and_then(|info| info.identities.get(self.asahi_restore_cursor)).cloned();
-                    if self.asahi_selected_target.is_some() { self.run_asahi_work(); }
-                    false
-                }
-                _ => false,
-            },
+            }
             AsahiStep::InspectIpsw => matches!(key.code, KeyCode::Char('q')),
             AsahiStep::Work => match key.code {
                 KeyCode::Char('q') => true,
@@ -2720,13 +2739,24 @@ impl App {
     }
 
     pub fn asahi_ipsw_hint(&self) -> String {
-        let versions = self.asahi_injected_metadata.as_deref()
+        let versions = self
+            .asahi_injected_metadata
+            .as_deref()
             .and_then(|json| crate::asahi_ops::parse_installer_data(json).ok())
             .and_then(|data| crate::asahi_ops::resolve_os(&data, &self.asahi_os_query).ok())
             .and_then(|resolved| resolved.supported_fw);
         match versions {
-            Some(versions) => format!("Select a local IPSW. Package-supported macOS firmware: {}. Target-specific compatibility is checked after selection.", if versions.is_empty() { "none".into() } else { versions.join(", ") }),
-            None => "Select a local IPSW compatible with the selected Asahi release and target.".into(),
+            Some(versions) => format!(
+                "Select a local IPSW. Package-supported macOS firmware: {}. Target-specific compatibility is checked after selection.",
+                if versions.is_empty() {
+                    "none".into()
+                } else {
+                    versions.join(", ")
+                }
+            ),
+            None => {
+                "Select a local IPSW compatible with the selected Asahi release and target.".into()
+            }
         }
     }
 
@@ -2753,9 +2783,18 @@ impl App {
         info: crate::asahi_firmware_archive::RestoreArchiveInfo,
     ) {
         if let Some(json) = self.asahi_injected_metadata.as_deref() {
-            let result = crate::asahi_ops::parse_installer_data(json).map_err(|e| e.to_string())
-                .and_then(|data| crate::asahi_ops::resolve_os(&data, &self.asahi_os_query).map_err(|e| e.to_string()))
-                .and_then(|resolved| crate::asahi_firmware::validate_supported_version(&info.product_version, resolved.supported_fw.as_deref()));
+            let result = crate::asahi_ops::parse_installer_data(json)
+                .map_err(|e| e.to_string())
+                .and_then(|data| {
+                    crate::asahi_ops::resolve_os(&data, &self.asahi_os_query)
+                        .map_err(|e| e.to_string())
+                })
+                .and_then(|resolved| {
+                    crate::asahi_firmware::validate_supported_version(
+                        &info.product_version,
+                        resolved.supported_fw.as_deref(),
+                    )
+                });
             if let Err(error) = result {
                 self.asahi_ipsw = None;
                 self.asahi_restore_info = None;
@@ -2778,8 +2817,10 @@ impl App {
     }
 
     fn run_asahi_work(&mut self) {
-        if self.asahi_source == AsahiSource::Latest && self.asahi_injected_artifacts.is_none()
-            && self.asahi_selected_target.is_none() {
+        if self.asahi_source == AsahiSource::Latest
+            && self.asahi_injected_artifacts.is_none()
+            && self.asahi_selected_target.is_none()
+        {
             self.asahi_error = None;
             self.enter_file_picker();
             self.asahi_step = AsahiStep::WaitIpsw;
@@ -3055,21 +3096,36 @@ fn execute_asahi_work(
         };
         let data = parse_installer_data(&json).map_err(|e| e.to_string())?;
         let resolved = resolve_os(&data, &plan.os_query).map_err(|e| e.to_string())?;
-        if resolved.supported_fw.is_some() || !resolved.firmware_partitions.is_empty()
-            || !resolved.installer_data_partitions.is_empty() {
-            let ipsw = plan.ipsw.as_deref().ok_or("select a local IPSW before setup")?;
-            let target = plan.restore_target.as_ref().ok_or("select an IPSW target before setup")?;
+        if resolved.supported_fw.is_some()
+            || !resolved.firmware_partitions.is_empty()
+            || !resolved.installer_data_partitions.is_empty()
+        {
+            let ipsw = plan
+                .ipsw
+                .as_deref()
+                .ok_or("select a local IPSW before setup")?;
+            let target = plan
+                .restore_target
+                .as_ref()
+                .ok_or("select an IPSW target before setup")?;
             crate::asahi_firmware_archive::validate_archive_for_package(
-                ipsw, resolved.supported_fw.as_deref(), Some((&target.board, target.chip_id)),
+                ipsw,
+                resolved.supported_fw.as_deref(),
+                Some((&target.board, target.chip_id)),
             )?;
             let requirements = asahi_ops::FirmwareRequirements::from(&resolved);
             let work = tempfile::tempdir().map_err(|e| e.to_string())?;
             let archives = crate::asahi_firmware_download::resolve_firmware_archives(
                 &crate::asahi_firmware_download::FirmwareArchiveInputs {
-                    board: &target.board, chip_id: target.chip_id, expert: false,
-                    workdir: work.path(), requirements: &requirements,
-                    installer_archive: None, installer_source_uri: None,
-                    ipsw: Some(ipsw), repair_identity: None,
+                    board: &target.board,
+                    chip_id: target.chip_id,
+                    expert: false,
+                    workdir: work.path(),
+                    requirements: &requirements,
+                    installer_archive: None,
+                    installer_source_uri: None,
+                    ipsw: Some(ipsw),
+                    repair_identity: None,
                 },
                 |url, fraction| progress(&format!("fetching installer {url}"), fraction),
             )?;
@@ -3085,7 +3141,14 @@ fn execute_asahi_work(
         let package = work.join("package.zip");
         progress("downloading package", Some(0.0));
         asahi_ops::fetch_url_to_file_with_progress(&resolved.package_url, &package, |fraction| {
-            progress(if fraction.is_none() { "checking package cache" } else { "downloading package" }, fraction);
+            progress(
+                if fraction.is_none() {
+                    "checking package cache"
+                } else {
+                    "downloading package"
+                },
+                fraction,
+            );
         })
         .map_err(|e| e.to_string())?;
         progress("extracting package", Some(0.0));
@@ -3121,21 +3184,33 @@ fn execute_asahi_work(
             || !requirements.firmware_partitions.is_empty()
             || !requirements.installer_data_partitions.is_empty();
         if required {
-            let target = plan.restore_target.as_ref().ok_or("select an IPSW target before setup")?;
-            let (archives, work) = preflight_archives.take().ok_or("firmware compatibility was not checked before package download")?;
+            let target = plan
+                .restore_target
+                .as_ref()
+                .ok_or("select an IPSW target before setup")?;
+            let (archives, work) = preflight_archives
+                .take()
+                .ok_or("firmware compatibility was not checked before package download")?;
             progress("checking selected IPSW and extracting firmware", None);
             let prepared = crate::asahi_provisioning::prepare_firmware(
                 &crate::asahi_provisioning::ProvisioningInputs {
-                    board: &target.board, chip_id: target.chip_id, expert: false,
+                    board: &target.board,
+                    chip_id: target.chip_id,
+                    expert: false,
                     installer_archive: &archives.installer_archive,
                     installer_source_uri: &archives.installer_source_uri,
-                    ipsw: &archives.ipsw, workdir: work.path(), repair_identity: None,
-                }, &requirements,
+                    ipsw: &archives.ipsw,
+                    workdir: work.path(),
+                    repair_identity: None,
+                },
+                &requirements,
             )?;
             progress("extracting recovery firmware", None);
-            let recovery = crate::asahi_provisioning::RecoveryImageFiles::extract(prepared.recovery_image()?)?;
+            let recovery =
+                crate::asahi_provisioning::RecoveryImageFiles::extract(prepared.recovery_image()?)?;
             progress("packaging firmware from selected IPSW", None);
-            let provisioned = prepared.provision_artifacts(&mut artifacts, recovery.root(), None, false)?;
+            let provisioned =
+                prepared.provision_artifacts(&mut artifacts, recovery.root(), None, false)?;
             provisioned_firmware = Some((provisioned, work));
         }
     }
@@ -3158,29 +3233,31 @@ fn execute_asahi_work(
         .map(|r| r.next_object)
         .unwrap_or(next_object);
 
-    let result = (|| -> Result<String, String> { match plan.action {
-        AsahiAction::Update => {
-            progress("replacing kernel and m1n1", Some(0.0));
-            let path = PathBuf::from(&plan.confirmed);
-            let report = update_disc(&path, &artifacts).map_err(|e| e.to_string())?;
-            progress("replacing kernel and m1n1", Some(1.0));
-            Ok(format!("Updated {}", report.path))
+    let result = (|| -> Result<String, String> {
+        match plan.action {
+            AsahiAction::Update => {
+                progress("replacing kernel and m1n1", Some(0.0));
+                let path = PathBuf::from(&plan.confirmed);
+                let report = update_disc(&path, &artifacts).map_err(|e| e.to_string())?;
+                progress("replacing kernel and m1n1", Some(1.0));
+                Ok(format!("Updated {}", report.path))
+            }
+            AsahiAction::Install => {
+                progress("writing disc", Some(0.0));
+                let report = asahi_ops::create_qcow2_disc_with_progress(
+                    &plan.dest,
+                    &artifacts,
+                    plan.size_bytes,
+                    &next_object,
+                    &plan.os_name,
+                    |fraction| progress("writing disc", Some(fraction)),
+                )
+                .map_err(|e| e.to_string())?;
+                progress("writing disc", Some(1.0));
+                Ok(format!("Installed {}", report.path))
+            }
         }
-        AsahiAction::Install => {
-            progress("writing disc", Some(0.0));
-            let report = asahi_ops::create_qcow2_disc_with_progress(
-                &plan.dest,
-                &artifacts,
-                plan.size_bytes,
-                &next_object,
-                &plan.os_name,
-                |fraction| progress("writing disc", Some(fraction)),
-            )
-            .map_err(|e| e.to_string())?;
-            progress("writing disc", Some(1.0));
-            Ok(format!("Installed {}", report.path))
-        }
-    } })();
+    })();
     drop(provisioned_firmware);
     result
 }
@@ -3269,14 +3346,25 @@ mod tests {
         assert!(first.contains("checking IPSW"));
         app.tick += 7;
         assert_ne!(first, picker_text(&mut app));
-        tx.send(AsahiJobEvent::RestoreInspected("selected.ipsw".into(), Ok(RestoreArchiveInfo {
-            product_version: "13.5".into(), product_build: "Test".into(),
-            identities: vec![RestoreTarget { board: "j274ap".into(), chip_id: 0x8103 }],
-        }))).unwrap();
+        tx.send(AsahiJobEvent::RestoreInspected(
+            "selected.ipsw".into(),
+            Ok(RestoreArchiveInfo {
+                product_version: "13.5".into(),
+                product_build: "Test".into(),
+                identities: vec![RestoreTarget {
+                    board: "j274ap".into(),
+                    chip_id: 0x8103,
+                }],
+            }),
+        ))
+        .unwrap();
         app.prepare();
         assert_eq!(app.asahi_step, AsahiStep::RestoreTarget);
         assert!(app.asahi_job_rx.is_none());
-        assert_eq!(app.asahi_ipsw.as_deref(), Some(std::path::Path::new("selected.ipsw")));
+        assert_eq!(
+            app.asahi_ipsw.as_deref(),
+            Some(std::path::Path::new("selected.ipsw"))
+        );
     }
 
     #[test]
@@ -3296,7 +3384,10 @@ mod tests {
         drop(tx);
         app.prepare();
         assert_eq!(app.asahi_step, AsahiStep::WaitIpsw);
-        assert_eq!(app.asahi_error.as_deref(), Some("IPSW inspection worker stopped"));
+        assert_eq!(
+            app.asahi_error.as_deref(),
+            Some("IPSW inspection worker stopped")
+        );
     }
 
     #[test]
@@ -3308,10 +3399,17 @@ mod tests {
         app.asahi_injected_metadata = Some(r#"{"os_list":[{"name":"Test OS","package":"https://example.test/os.zip","supported_fw":["12.3","13.5"]}]}"#.into());
         let hint = picker_text(&mut app);
         assert!(hint.contains("12.3") && hint.contains("13.5"));
-        app.accept_asahi_restore_archive("selected.ipsw".into(), crate::asahi_firmware_archive::RestoreArchiveInfo {
-            product_version: "26.5.1".into(), product_build: "Test".into(),
-            identities: vec![crate::asahi_firmware_archive::RestoreTarget {board:"j274ap".into(),chip_id:0x8103}],
-        });
+        app.accept_asahi_restore_archive(
+            "selected.ipsw".into(),
+            crate::asahi_firmware_archive::RestoreArchiveInfo {
+                product_version: "26.5.1".into(),
+                product_build: "Test".into(),
+                identities: vec![crate::asahi_firmware_archive::RestoreTarget {
+                    board: "j274ap".into(),
+                    chip_id: 0x8103,
+                }],
+            },
+        );
         assert_eq!(app.asahi_step, AsahiStep::WaitIpsw);
         assert!(app.asahi_job_rx.is_none());
         assert!(app.asahi_ipsw.is_none());
@@ -3332,20 +3430,41 @@ mod tests {
         app.run_asahi_work();
         assert_eq!(app.asahi_step, AsahiStep::WaitIpsw);
         assert!(app.asahi_job_rx.is_none());
-        app.accept_asahi_restore_archive(std::path::PathBuf::from("selected.ipsw"), RestoreArchiveInfo {
-            product_version: "test-version".into(), product_build: "test-build".into(),
-            identities: vec![RestoreTarget { board: "j274ap".into(), chip_id: 0x8103 },
-                RestoreTarget { board: "j293ap".into(), chip_id: 0x8103 }],
-        });
+        app.accept_asahi_restore_archive(
+            std::path::PathBuf::from("selected.ipsw"),
+            RestoreArchiveInfo {
+                product_version: "test-version".into(),
+                product_build: "test-build".into(),
+                identities: vec![
+                    RestoreTarget {
+                        board: "j274ap".into(),
+                        chip_id: 0x8103,
+                    },
+                    RestoreTarget {
+                        board: "j293ap".into(),
+                        chip_id: 0x8103,
+                    },
+                ],
+            },
+        );
         assert_eq!(app.asahi_step, AsahiStep::RestoreTarget);
         assert!(app.asahi_selected_target.is_none());
         press(&mut app, KeyCode::Down);
         assert_eq!(app.asahi_restore_cursor, 1);
         let text = picker_text(&mut app);
         assert!(text.contains("j293ap"));
-        app.asahi_selected_target = app.asahi_restore_info.as_ref().unwrap().identities.get(1).cloned();
+        app.asahi_selected_target = app
+            .asahi_restore_info
+            .as_ref()
+            .unwrap()
+            .identities
+            .get(1)
+            .cloned();
         let plan = app.asahi_work_plan();
-        assert_eq!(plan.ipsw.as_deref(), Some(std::path::Path::new("selected.ipsw")));
+        assert_eq!(
+            plan.ipsw.as_deref(),
+            Some(std::path::Path::new("selected.ipsw"))
+        );
         assert_eq!(plan.restore_target.unwrap().board, "j293ap");
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.asahi_step, AsahiStep::WaitIpsw);
@@ -3356,10 +3475,14 @@ mod tests {
     fn asahi_empty_restore_manifest_does_not_advance_picker() {
         let mut app = App::with_banner_order(crate::banner::BannerOrder::sequential());
         app.asahi_step = AsahiStep::WaitIpsw;
-        app.accept_asahi_restore_archive(std::path::PathBuf::from("empty.ipsw"),
+        app.accept_asahi_restore_archive(
+            std::path::PathBuf::from("empty.ipsw"),
             crate::asahi_firmware_archive::RestoreArchiveInfo {
-                product_version: String::new(), product_build: String::new(), identities: Vec::new(),
-            });
+                product_version: String::new(),
+                product_build: String::new(),
+                identities: Vec::new(),
+            },
+        );
         assert_eq!(app.asahi_step, AsahiStep::WaitIpsw);
         assert!(app.asahi_ipsw.is_none());
         assert!(app.asahi_error.is_some());

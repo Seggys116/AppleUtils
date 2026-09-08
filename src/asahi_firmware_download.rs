@@ -75,7 +75,11 @@ pub fn resolve_firmware_archives(
     inputs: &FirmwareArchiveInputs<'_>,
     mut progress: impl FnMut(&str, Option<f64>),
 ) -> Result<ResolvedFirmwareArchives, String> {
-    let ipsw = local_file(inputs.ipsw.ok_or("select a local IPSW file before starting setup")?)?;
+    let ipsw = local_file(
+        inputs
+            .ipsw
+            .ok_or("select a local IPSW file before starting setup")?,
+    )?;
     let supported = if let Some(repair) = inputs.repair_identity {
         if inputs
             .requirements
@@ -90,7 +94,9 @@ pub fn resolve_firmware_archives(
         inputs.requirements.supported_fw.clone()
     };
     let archive_info = crate::asahi_firmware_archive::validate_archive_for_package(
-        &ipsw, supported.as_deref(), Some((inputs.board, inputs.chip_id)),
+        &ipsw,
+        supported.as_deref(),
+        Some((inputs.board, inputs.chip_id)),
     )?;
     std::fs::create_dir_all(inputs.workdir).map_err(|e| e.to_string())?;
     let directory = tempfile::Builder::new()
@@ -171,12 +177,20 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let work = directory.path().join("unused");
         let requirements = FirmwareRequirements {
-            supported_fw: None, firmware_partitions: vec![], installer_data_partitions: vec![],
+            supported_fw: None,
+            firmware_partitions: vec![],
+            installer_data_partitions: vec![],
         };
         let inputs = FirmwareArchiveInputs {
-            board: "testap", chip_id: 1, expert: false, workdir: &work,
-            requirements: &requirements, installer_archive: None,
-            installer_source_uri: None, ipsw: None, repair_identity: None,
+            board: "testap",
+            chip_id: 1,
+            expert: false,
+            workdir: &work,
+            requirements: &requirements,
+            installer_archive: None,
+            installer_source_uri: None,
+            ipsw: None,
+            repair_identity: None,
         };
         let mut progressed = false;
         let result = resolve_firmware_archives(&inputs, |_, _| progressed = true);

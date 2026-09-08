@@ -36,17 +36,34 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             let rows = Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).split(area);
             let hint = app.asahi_ipsw_hint();
             let message = app.asahi_error.as_deref().unwrap_or(&hint);
-            frame.render_widget(Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: false }), rows[0]);
+            frame.render_widget(
+                Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: false }),
+                rows[0],
+            );
             ui::render_file_picker(frame, rows[1], app, "local restore IPSW");
         }
         AsahiStep::RestoreTarget => {
             if let Some(info) = &app.asahi_restore_info {
-                let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
-                frame.render_widget(Paragraph::new(format!("Restore {} ({})\nSelect the target from this IPSW", info.product_version, info.product_build)), rows[0]);
-                let items = info.identities.iter().map(|target| ratatui::widgets::ListItem::new(
-                    format!("{}  ({}, chip {:#x})", crate::ramrod::boards::describe_board(&target.board, None).title, target.board, target.chip_id)));
+                let rows =
+                    Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        "Restore {} ({})\nSelect the target from this IPSW",
+                        info.product_version, info.product_build
+                    )),
+                    rows[0],
+                );
+                let items = info.identities.iter().map(|target| {
+                    ratatui::widgets::ListItem::new(format!(
+                        "{}  ({}, chip {:#x})",
+                        crate::ramrod::boards::describe_board(&target.board, None).title,
+                        target.board,
+                        target.chip_id
+                    ))
+                });
                 let list = ratatui::widgets::List::new(items).highlight_symbol("> ");
-                let mut state = ratatui::widgets::ListState::default().with_selected(Some(app.asahi_restore_cursor));
+                let mut state = ratatui::widgets::ListState::default()
+                    .with_selected(Some(app.asahi_restore_cursor));
                 frame.render_stateful_widget(list, rows[1], &mut state);
             }
         }
@@ -212,8 +229,18 @@ fn render_done(frame: &mut Frame, area: Rect, app: &App) {
         .unwrap_or(app.asahi_status.as_str());
     let style = if failed { theme::wait() } else { theme::ice() };
     let rows = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(inner);
-    frame.render_widget(Paragraph::new(if failed { "failed" } else { "finished" }).style(style).alignment(Alignment::Center), rows[0]);
-    frame.render_widget(Paragraph::new(message).style(style).wrap(ratatui::widgets::Wrap { trim: false }), rows[1]);
+    frame.render_widget(
+        Paragraph::new(if failed { "failed" } else { "finished" })
+            .style(style)
+            .alignment(Alignment::Center),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(message)
+            .style(style)
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        rows[1],
+    );
 }
 
 fn stacked_cards<const N: usize>(area: Rect) -> [Rect; N] {

@@ -25,9 +25,15 @@ impl InstallerDataTemplate {
         ));
         Ok(files)
     }
-    pub fn matches_firmware(&self, firmware: &crate::asahi_firmware::BoundFirmware) -> bool { &self.firmware == firmware }
-    pub fn preboot_files(&self) -> &[(String, Vec<u8>)] { &self.preboot_files }
-    pub fn system_files(&self) -> &[(String, Vec<u8>)] { &self.system_files }
+    pub fn matches_firmware(&self, firmware: &crate::asahi_firmware::BoundFirmware) -> bool {
+        &self.firmware == firmware
+    }
+    pub fn preboot_files(&self) -> &[(String, Vec<u8>)] {
+        &self.preboot_files
+    }
+    pub fn system_files(&self) -> &[(String, Vec<u8>)] {
+        &self.system_files
+    }
     pub fn system_version_bytes(&self) -> &[u8] {
         &self
             .files
@@ -158,8 +164,12 @@ fn validate_vgid(vgid: &str) -> Result<(), String> {
 }
 
 pub(crate) fn relative_path(path: &str) -> Result<&str, String> {
-    if path.is_empty() || path.contains(['\\', ':', '\0'])
-        || path.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
+    if path.is_empty()
+        || path.contains(['\\', ':', '\0'])
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
         return Err(format!("invalid restore bundle path {path:?}"));
     }
     Ok(path)
@@ -167,38 +177,68 @@ pub(crate) fn relative_path(path: &str) -> Result<&str, String> {
 
 pub(crate) fn restore_bundle_path(bootcaches: &[u8]) -> Result<String, String> {
     let value = metadata(bootcaches)?;
-    let path = value.as_dictionary().and_then(|d| d.get("bless2"))
-        .and_then(Value::as_dictionary).and_then(|d| d.get("RestoreBundlePath"))
-        .and_then(Value::as_string).ok_or("bootcaches lacks bless2 RestoreBundlePath")?;
-    if path.starts_with('/') || path.contains(['\\', ':', '\0']) || path.split('/').any(|part| part.is_empty() || part == "..") {
+    let path = value
+        .as_dictionary()
+        .and_then(|d| d.get("bless2"))
+        .and_then(Value::as_dictionary)
+        .and_then(|d| d.get("RestoreBundlePath"))
+        .and_then(Value::as_string)
+        .ok_or("bootcaches lacks bless2 RestoreBundlePath")?;
+    if path.starts_with('/')
+        || path.contains(['\\', ':', '\0'])
+        || path.split('/').any(|part| part.is_empty() || part == "..")
+    {
         return Err(format!("invalid restore bundle path {path:?}"));
     }
-    let normalized = path.split('/').filter(|part| *part != ".").collect::<Vec<_>>().join("/");
+    let normalized = path
+        .split('/')
+        .filter(|part| *part != ".")
+        .collect::<Vec<_>>()
+        .join("/");
     relative_path(&normalized)?;
     Ok(normalized)
 }
 
-fn preboot_payloads(extracted: &ExtractedFirmware, manifest: &[u8], bootcaches: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
+fn preboot_payloads(
+    extracted: &ExtractedFirmware,
+    manifest: &[u8],
+    bootcaches: &[u8],
+) -> Result<Vec<(String, Vec<u8>)>, String> {
     let bundle = restore_bundle_path(bootcaches)?;
     let mut files = std::collections::BTreeMap::new();
     let mut insert = |relative: &str, bytes: Vec<u8>| -> Result<(), String> {
         relative_path(relative)?;
         let path = format!("{bundle}/{relative}");
-        if let Some((old, _)) = files.iter().find(|(old, _): &(&String, &Vec<u8>)| old.eq_ignore_ascii_case(&path)) {
+        if let Some((old, _)) = files
+            .iter()
+            .find(|(old, _): &(&String, &Vec<u8>)| old.eq_ignore_ascii_case(&path))
+        {
             return Err(format!("duplicate restore file {old}"));
         }
         files.insert(path, bytes);
         Ok(())
     };
     insert("BuildManifest.plist", manifest.to_vec())?;
-    for name in ["SystemVersion.plist", "RestoreVersion.plist", "usr/standalone/bootcaches.plist"] {
-        let path = extracted.metadata.get(name).ok_or_else(|| format!("missing restore metadata {name}"))?;
+    for name in [
+        "SystemVersion.plist",
+        "RestoreVersion.plist",
+        "usr/standalone/bootcaches.plist",
+    ] {
+        let path = extracted
+            .metadata
+            .get(name)
+            .ok_or_else(|| format!("missing restore metadata {name}"))?;
         insert(name, std::fs::read(path).map_err(|e| e.to_string())?)?;
     }
     let mut copied = std::collections::BTreeSet::new();
     for (key, relative) in &extracted.catalog {
-        if !crate::asahi_firmware_archive::preboot_component(key) || !copied.insert(relative) { continue; }
-        let path = extracted.extracted.get(key).ok_or_else(|| format!("missing selected restore component {key}"))?;
+        if !crate::asahi_firmware_archive::preboot_component(key) || !copied.insert(relative) {
+            continue;
+        }
+        let path = extracted
+            .extracted
+            .get(key)
+            .ok_or_else(|| format!("missing selected restore component {key}"))?;
         insert(relative, std::fs::read(path).map_err(|e| e.to_string())?)?;
     }
     for (relative, path) in &extracted.preboot_supplemental {
@@ -306,17 +346,43 @@ mod tests {
     #[test]
     fn restore_bundle_path_is_source_driven_and_confined() {
         let encode = |path: &str| {
-            let value = Value::Dictionary([("bless2".to_owned(), Value::Dictionary([
-                ("RestoreBundlePath".to_owned(), Value::String(path.into()))
-            ].into_iter().collect()))].into_iter().collect());
+            let value = Value::Dictionary(
+                [(
+                    "bless2".to_owned(),
+                    Value::Dictionary(
+                        [("RestoreBundlePath".to_owned(), Value::String(path.into()))]
+                            .into_iter()
+                            .collect(),
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+            );
             let mut bytes = Vec::new();
             value.to_writer_xml(&mut bytes).unwrap();
             bytes
         };
-        assert_eq!(restore_bundle_path(&encode("custom/restore")).unwrap(), "custom/restore");
-        assert_eq!(restore_bundle_path(&encode("./Restore")).unwrap(), "Restore");
-        assert_eq!(restore_bundle_path(&encode("./custom/./restore")).unwrap(), "custom/restore");
-        for path in ["/restore", "../restore", "a/../b", "a//b", "a\\b", "C:/restore", ""] {
+        assert_eq!(
+            restore_bundle_path(&encode("custom/restore")).unwrap(),
+            "custom/restore"
+        );
+        assert_eq!(
+            restore_bundle_path(&encode("./Restore")).unwrap(),
+            "Restore"
+        );
+        assert_eq!(
+            restore_bundle_path(&encode("./custom/./restore")).unwrap(),
+            "custom/restore"
+        );
+        for path in [
+            "/restore",
+            "../restore",
+            "a/../b",
+            "a//b",
+            "a\\b",
+            "C:/restore",
+            "",
+        ] {
             assert!(restore_bundle_path(&encode(path)).is_err(), "{path}");
         }
     }
@@ -327,7 +393,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let bootcaches = br#"<?xml version="1.0"?><plist version="1.0"><dict><key>bless2</key><dict><key>RestoreBundlePath</key><string>source/restore</string></dict></dict></plist>"#;
         let mut metadata = std::collections::BTreeMap::new();
-        for (name, bytes) in [("SystemVersion.plist", b"version".as_slice()), ("RestoreVersion.plist", b"restore".as_slice()), ("usr/standalone/bootcaches.plist", bootcaches.as_slice())] {
+        for (name, bytes) in [
+            ("SystemVersion.plist", b"version".as_slice()),
+            ("RestoreVersion.plist", b"restore".as_slice()),
+            ("usr/standalone/bootcaches.plist", bootcaches.as_slice()),
+        ] {
             let path = directory.path().join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, bytes).unwrap();
@@ -337,24 +407,70 @@ mod tests {
         std::fs::write(&component, b"original-firmware").unwrap();
         let bound = BoundFirmware {
             selection: SelectedFirmware {
-                entry: FirmwareCatalogEntry { version: "1".into(), min_macos: "1".into(), min_iboot: "1".into(), min_sfr: "1".into(), expert_only: false, devices: None, restore_url: "https://example.test/restore".into() },
-                board: "testap".into(), chip_id: 1,
-                provenance: CatalogProvenance { source_uri: "https://example.test/installer".into(), revision: "test".into() },
+                entry: FirmwareCatalogEntry {
+                    version: "1".into(),
+                    min_macos: "1".into(),
+                    min_iboot: "1".into(),
+                    min_sfr: "1".into(),
+                    expert_only: false,
+                    devices: None,
+                    restore_url: "https://example.test/restore".into(),
+                },
+                board: "testap".into(),
+                chip_id: 1,
+                provenance: CatalogProvenance {
+                    source_uri: "https://example.test/installer".into(),
+                    revision: "test".into(),
+                },
             },
-            restore: RestoreIdentity { product_version: "1".into(), product_build: "test".into(), board: "testap".into(), chip_id: 1, identity: "test".into(), manifest_digest: "test".into(), archive_digest: "test".into() },
+            restore: RestoreIdentity {
+                product_version: "1".into(),
+                product_build: "test".into(),
+                board: "testap".into(),
+                chip_id: 1,
+                identity: "test".into(),
+                manifest_digest: "test".into(),
+                archive_digest: "test".into(),
+            },
         };
         let mut extracted = ExtractedFirmware {
-            directory, bound, identity: plist::Dictionary::new(), metadata,
-            catalog: [("DCP".into(), "Firmware/dcp.im4p".into()), ("BaseSystem".into(), "base.dmg".into())].into_iter().collect(),
+            directory,
+            bound,
+            identity: plist::Dictionary::new(),
+            metadata,
+            catalog: [
+                ("DCP".into(), "Firmware/dcp.im4p".into()),
+                ("BaseSystem".into(), "base.dmg".into()),
+            ]
+            .into_iter()
+            .collect(),
             extracted: [("DCP".into(), component)].into_iter().collect(),
             preboot_supplemental: std::collections::BTreeMap::new(),
         };
         let files = preboot_payloads(&extracted, b"selected-manifest", bootcaches).unwrap();
-        assert_eq!(files.iter().find(|(name, _)| name == "source/restore/Firmware/dcp.im4p").unwrap().1, b"original-firmware");
-        assert!(files.iter().any(|(name, bytes)| name == "source/restore/BuildManifest.plist" && bytes == b"selected-manifest"));
+        assert_eq!(
+            files
+                .iter()
+                .find(|(name, _)| name == "source/restore/Firmware/dcp.im4p")
+                .unwrap()
+                .1,
+            b"original-firmware"
+        );
+        assert!(
+            files
+                .iter()
+                .any(|(name, bytes)| name == "source/restore/BuildManifest.plist"
+                    && bytes == b"selected-manifest")
+        );
         assert!(!files.iter().any(|(name, _)| name.ends_with("base.dmg")));
-        extracted.catalog.insert("SEP".into(), "Firmware/sep.im4p".into());
-        assert!(preboot_payloads(&extracted, b"manifest", bootcaches).unwrap_err().contains("missing selected restore component SEP"));
+        extracted
+            .catalog
+            .insert("SEP".into(), "Firmware/sep.im4p".into());
+        assert!(
+            preboot_payloads(&extracted, b"manifest", bootcaches)
+                .unwrap_err()
+                .contains("missing selected restore component SEP")
+        );
     }
 
     #[test]
@@ -364,48 +480,152 @@ mod tests {
         let system = br#"<?xml version="1.0"?><plist version="1.0"><dict><key>ProductName</key><string>Test</string><key>ProductVersion</key><string>1</string><key>ProductBuildVersion</key><string>test</string></dict></plist>"#.to_vec();
         let bootcaches = br#"<?xml version="1.0"?><plist version="1.0"><dict><key>bless2</key><dict><key>RestoreBundlePath</key><string>./Restore</string></dict></dict></plist>"#.to_vec();
         let mut manifest = plist::Value::from_reader(std::io::Cursor::new(br#"<?xml version="1.0"?><plist version="1.0"><dict><key>ProductVersion</key><string>1</string><key>ProductBuildVersion</key><string>test</string><key>BuildIdentities</key><array><dict><key>ApChipID</key><integer>1</integer><key>Info</key><dict><key>DeviceClass</key><string>testap</string><key>Variant</key><string>macOS Customer</string><key>RestoreBehavior</key><string>Erase</string></dict><key>Manifest</key><dict><key>DCP</key><dict><key>Info</key><dict><key>Path</key><string>Firmware/dcp.im4p</string></dict></dict></dict></dict></array></dict></plist>"#)).unwrap();
-        manifest.as_dictionary_mut().unwrap().get_mut("BuildIdentities").unwrap().as_array_mut().unwrap()[0].as_dictionary_mut().unwrap().get_mut("Manifest").unwrap().as_dictionary_mut().unwrap().get_mut("DCP").unwrap().as_dictionary_mut().unwrap().insert("Digest".into(), Value::Data(crate::crypto::sha256(b"source-firmware").to_vec()));
+        manifest
+            .as_dictionary_mut()
+            .unwrap()
+            .get_mut("BuildIdentities")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()[0]
+            .as_dictionary_mut()
+            .unwrap()
+            .get_mut("Manifest")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap()
+            .get_mut("DCP")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap()
+            .insert(
+                "Digest".into(),
+                Value::Data(crate::crypto::sha256(b"source-firmware").to_vec()),
+            );
         let mut manifest_bytes = Vec::new();
         manifest.to_writer_xml(&mut manifest_bytes).unwrap();
-        let mut artifacts = crate::asahi_ops::Artifacts::memory(b"kernel".to_vec(), b"stage2".to_vec(), vec![0;4096]);
-        artifacts.m1n1_stage1 = vec![0;2048];
-        artifacts.m1n1_stage1.extend_from_slice(b"##m1n1_ver##test\0chainload=\0");
+        let mut artifacts = crate::asahi_ops::Artifacts::memory(
+            b"kernel".to_vec(),
+            b"stage2".to_vec(),
+            vec![0; 4096],
+        );
+        artifacts.m1n1_stage1 = vec![0; 2048];
+        artifacts
+            .m1n1_stage1
+            .extend_from_slice(b"##m1n1_ver##test\0chainload=\0");
         artifacts.installer_data = Some(InstallerDataTemplate {
             firmware: bound.clone(),
-            files: vec![("SystemVersion.plist".into(), system.clone())], stub_info: serde_json::json!({}),
+            files: vec![("SystemVersion.plist".into(), system.clone())],
+            stub_info: serde_json::json!({}),
             system_files: vec![("usr/standalone/bootcaches.plist".into(), bootcaches.clone())],
-            preboot_files: vec![("Restore/SystemVersion.plist".into(), system.clone()), ("Restore/BuildManifest.plist".into(), manifest_bytes), ("Restore/usr/standalone/bootcaches.plist".into(), bootcaches), ("Restore/Firmware/dcp.im4p".into(), b"source-firmware".to_vec())],
+            preboot_files: vec![
+                ("Restore/SystemVersion.plist".into(), system.clone()),
+                ("Restore/BuildManifest.plist".into(), manifest_bytes),
+                ("Restore/usr/standalone/bootcaches.plist".into(), bootcaches),
+                (
+                    "Restore/Firmware/dcp.im4p".into(),
+                    b"source-firmware".to_vec(),
+                ),
+            ],
         });
         let dir = tempfile::tempdir().unwrap();
         let disk = dir.path().join("disk.qcow2");
-        crate::asahi_ops::create_qcow2_disc(&disk, &artifacts, 16*1024*1024, "m1n1/boot.bin", "Test").unwrap();
+        crate::asahi_ops::create_qcow2_disc(
+            &disk,
+            &artifacts,
+            16 * 1024 * 1024,
+            "m1n1/boot.bin",
+            "Test",
+        )
+        .unwrap();
         assert!(!crate::asahi_ops::validate_installed_restore_bundle(&disk, &bound).unwrap());
         let legacy = dir.path().join("legacy.qcow2");
         let mut legacy_artifacts = artifacts.clone();
         legacy_artifacts.installer_data = None;
-        crate::asahi_ops::create_qcow2_disc(&legacy, &legacy_artifacts, 16*1024*1024, "m1n1/boot.bin", "Test").unwrap();
+        crate::asahi_ops::create_qcow2_disc(
+            &legacy,
+            &legacy_artifacts,
+            16 * 1024 * 1024,
+            "m1n1/boot.bin",
+            "Test",
+        )
+        .unwrap();
         crate::asahi_ops::update_disc(&legacy, &artifacts).unwrap();
         crate::asahi_ops::validate_installed_restore_bundle(&legacy, &bound).unwrap();
         let mut other = bound.clone();
         other.restore.product_build = "different".into();
         artifacts.firmware = Some(other);
-        assert!(crate::asahi_ops::create_qcow2_disc(&disk, &artifacts, 16*1024*1024, "m1n1/boot.bin", "Test").unwrap_err().to_string().contains("on-disk restore bundle"));
+        assert!(
+            crate::asahi_ops::create_qcow2_disc(
+                &disk,
+                &artifacts,
+                16 * 1024 * 1024,
+                "m1n1/boot.bin",
+                "Test"
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("on-disk restore bundle")
+        );
         crate::asahi_ops::validate_installed_restore_bundle(&disk, &bound).unwrap();
         artifacts.firmware = None;
-        artifacts.installer_data.as_mut().unwrap().preboot_files.last_mut().unwrap().1 = b"stale-firmware".to_vec();
+        artifacts
+            .installer_data
+            .as_mut()
+            .unwrap()
+            .preboot_files
+            .last_mut()
+            .unwrap()
+            .1 = b"stale-firmware".to_vec();
         crate::asahi_ops::update_disc(&disk, &artifacts).unwrap();
-        assert!(crate::asahi_ops::validate_installed_restore_bundle(&disk, &bound).unwrap_err().to_string().contains("digest mismatch"));
-        artifacts.installer_data.as_mut().unwrap().preboot_files.pop();
+        assert!(
+            crate::asahi_ops::validate_installed_restore_bundle(&disk, &bound)
+                .unwrap_err()
+                .to_string()
+                .contains("digest mismatch")
+        );
+        artifacts
+            .installer_data
+            .as_mut()
+            .unwrap()
+            .preboot_files
+            .pop();
         let missing = dir.path().join("missing.qcow2");
-        crate::asahi_ops::create_qcow2_disc(&missing, &artifacts, 16*1024*1024, "m1n1/boot.bin", "Test").unwrap();
-        assert!(crate::asahi_ops::validate_installed_restore_bundle(&missing, &bound).unwrap_err().to_string().contains("component DCP is missing"));
+        crate::asahi_ops::create_qcow2_disc(
+            &missing,
+            &artifacts,
+            16 * 1024 * 1024,
+            "m1n1/boot.bin",
+            "Test",
+        )
+        .unwrap();
+        assert!(
+            crate::asahi_ops::validate_installed_restore_bundle(&missing, &bound)
+                .unwrap_err()
+                .to_string()
+                .contains("component DCP is missing")
+        );
         let template = artifacts.installer_data.as_mut().unwrap();
-        let changed = String::from_utf8(system).unwrap().replace("<string>1</string>", "<string>2</string>").into_bytes();
+        let changed = String::from_utf8(system)
+            .unwrap()
+            .replace("<string>1</string>", "<string>2</string>")
+            .into_bytes();
         template.files[0].1 = changed.clone();
         template.preboot_files[0].1 = changed;
         let stale = dir.path().join("stale-version.qcow2");
-        crate::asahi_ops::create_qcow2_disc(&stale, &artifacts, 16*1024*1024, "m1n1/boot.bin", "Test").unwrap();
-        assert!(crate::asahi_ops::validate_installed_restore_bundle(&stale, &bound).unwrap_err().to_string().contains("SystemVersion.plist ProductVersion differs"));
+        crate::asahi_ops::create_qcow2_disc(
+            &stale,
+            &artifacts,
+            16 * 1024 * 1024,
+            "m1n1/boot.bin",
+            "Test",
+        )
+        .unwrap();
+        assert!(
+            crate::asahi_ops::validate_installed_restore_bundle(&stale, &bound)
+                .unwrap_err()
+                .to_string()
+                .contains("SystemVersion.plist ProductVersion differs")
+        );
     }
 
     #[test]
@@ -417,15 +637,32 @@ mod tests {
         std::fs::create_dir_all(recovery.join("usr/share/firmware")).unwrap();
         std::fs::create_dir_all(recovery.join("usr/sbin")).unwrap();
         std::fs::write(fud.join("target.im4p"), b"selected-fud").unwrap();
-        std::fs::write(recovery.join("usr/share/firmware/target.bin"), b"selected-firmware").unwrap();
-        std::fs::write(recovery.join("usr/sbin/appleh13camerad"), b"selected-camera").unwrap();
+        std::fs::write(
+            recovery.join("usr/share/firmware/target.bin"),
+            b"selected-firmware",
+        )
+        .unwrap();
+        std::fs::write(
+            recovery.join("usr/sbin/appleh13camerad"),
+            b"selected-camera",
+        )
+        .unwrap();
         let backup = build_raw_firmware_backup(&fud, &recovery, None).unwrap();
-        let result = std::process::Command::new("tar").arg("-xOf").arg(backup.path())
-            .arg("firmware/target.bin").output().unwrap();
+        let result = std::process::Command::new("tar")
+            .arg("-xOf")
+            .arg(backup.path())
+            .arg("firmware/target.bin")
+            .output()
+            .unwrap();
         assert!(result.status.success());
         assert_eq!(result.stdout, b"selected-firmware");
-        let template = InstallerDataTemplate { firmware: fixture_bound(), preboot_files: vec![], system_files: vec![], files: vec![("SystemVersion.plist".into(), b"source".to_vec())],
-            stub_info: serde_json::json!({"manifest_info":{"build_number":"test"}}) };
+        let template = InstallerDataTemplate {
+            firmware: fixture_bound(),
+            preboot_files: vec![],
+            system_files: vec![],
+            files: vec![("SystemVersion.plist".into(), b"source".to_vec())],
+            stub_info: serde_json::json!({"manifest_info":{"build_number":"test"}}),
+        };
         let vgid = "01234567-89ab-cdef-0123-456789abcdef";
         let files = template.files_for_vgid(vgid).unwrap();
         let info: serde_json::Value = serde_json::from_slice(&files.last().unwrap().1).unwrap();
@@ -452,7 +689,11 @@ mod tests {
             "/usr/share/firmware/valid": "original",
             "/usr/share/firmware/directory-link": "original-directory"
         });
-        std::fs::write(recovery.join(".appleutils-symlinks.json"), metadata.to_string()).unwrap();
+        std::fs::write(
+            recovery.join(".appleutils-symlinks.json"),
+            metadata.to_string(),
+        )
+        .unwrap();
         let backup = build_raw_firmware_backup(&fud, &recovery, None).unwrap();
         let reader = flate2::read::GzDecoder::new(std::fs::File::open(backup.path()).unwrap());
         let mut archive = tar::Archive::new(reader);
@@ -463,16 +704,35 @@ mod tests {
             assert_ne!(name, "firmware/directory-link/copied");
             assert!(!name.contains(".appleutils-symlinks.json"));
             if entry.header().entry_type().is_symlink() {
-                found.insert(name, entry.link_name().unwrap().unwrap().to_string_lossy().into_owned());
+                found.insert(
+                    name,
+                    entry
+                        .link_name()
+                        .unwrap()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                );
                 assert_eq!(entry.size(), 0);
             }
         }
         assert_eq!(found.get("firmware/dangling").unwrap(), "missing.trx");
         assert_eq!(found.get("firmware/valid").unwrap(), "original");
-        assert_eq!(found.get("firmware/directory-link").unwrap(), "original-directory");
+        assert_eq!(
+            found.get("firmware/directory-link").unwrap(),
+            "original-directory"
+        );
         let invalid = serde_json::json!({"/usr/share/firmware/../escape": "missing"});
-        std::fs::write(recovery.join(".appleutils-symlinks.json"), invalid.to_string()).unwrap();
-        assert!(build_raw_firmware_backup(&fud, &recovery, None).unwrap_err().contains("invalid recovery symlink path"));
+        std::fs::write(
+            recovery.join(".appleutils-symlinks.json"),
+            invalid.to_string(),
+        )
+        .unwrap();
+        assert!(
+            build_raw_firmware_backup(&fud, &recovery, None)
+                .unwrap_err()
+                .contains("invalid recovery symlink path")
+        );
     }
 
     #[test]

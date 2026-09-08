@@ -27,8 +27,8 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 .ok_or_else(|| "create requires --output PATH".to_string())?;
             let (arts, next, os_name, _firmware) = opts.artifacts(true)?;
             let size = opts.size.unwrap_or_else(min_disc_bytes);
-            let report = create_qcow2_disc(&out, &arts, size, &next, &os_name)
-                .map_err(|e| e.to_string())?;
+            let report =
+                create_qcow2_disc(&out, &arts, size, &next, &os_name).map_err(|e| e.to_string())?;
             let info = validate_disc(&out).map_err(|e| e.to_string())?;
             Ok(format!(
                 "created {}\nos={os_name}\n{}",
@@ -44,10 +44,9 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 .ok_or_else(|| "install requires --output PATH".to_string())?;
             let (arts, next, os_name, _firmware) = opts.artifacts(true)?;
             let size = opts.size.unwrap_or_else(min_disc_bytes);
-            let report = install_raw_disc(&dest, &arts, size, &next, &os_name)
-                .map_err(|e| e.to_string())?;
-            let info =
-                validate_disc(&dest).map_err(|e| e.to_string())?;
+            let report =
+                install_raw_disc(&dest, &arts, size, &next, &os_name).map_err(|e| e.to_string())?;
+            let info = validate_disc(&dest).map_err(|e| e.to_string())?;
             Ok(format!(
                 "installed {}\nos={os_name}\n{}",
                 report.path,
@@ -62,10 +61,8 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 .or(opts.output.clone())
                 .ok_or_else(|| "update requires PATH".to_string())?;
             let (arts, _, os_name, _firmware) = opts.update_artifacts()?;
-            let report =
-                update_disc(&disc, &arts).map_err(|e| e.to_string())?;
-            let info =
-                validate_disc(&disc).map_err(|e| e.to_string())?;
+            let report = update_disc(&disc, &arts).map_err(|e| e.to_string())?;
+            let info = validate_disc(&disc).map_err(|e| e.to_string())?;
             Ok(format!(
                 "updated {}\nos={os_name}\n{}",
                 report.path,
@@ -254,7 +251,9 @@ impl CliOpts {
     }
 
     fn provisioning_inputs(&self) -> Result<(&str, u32, bool), String> {
-        if self.ipsw.is_none() { return Err("firmware provisioning requires --ipsw FILE".into()); }
+        if self.ipsw.is_none() {
+            return Err("firmware provisioning requires --ipsw FILE".into());
+        }
         if self.stage1.is_some() {
             return Err(
                 "--stage1 cannot replace stage one from the selected installer archive".into(),
@@ -271,7 +270,10 @@ impl CliOpts {
         ))
     }
 
-    fn resolve_archives(&self, requirements: &asahi_ops::FirmwareRequirements) -> Result<crate::asahi_firmware_download::ResolvedFirmwareArchives, String> {
+    fn resolve_archives(
+        &self,
+        requirements: &asahi_ops::FirmwareRequirements,
+    ) -> Result<crate::asahi_firmware_download::ResolvedFirmwareArchives, String> {
         let (board, chip_id, _) = self.provisioning_inputs()?;
         let workdir = self.workdir();
         let mut last_url = String::new();
@@ -304,11 +306,16 @@ impl CliOpts {
         )
     }
 
-    fn provision(&self, artifacts: &mut Artifacts, preflight: Option<crate::asahi_firmware_download::ResolvedFirmwareArchives>) -> Result<Option<ProvisionedFirmware>, String> {
-        let required = artifacts
-            .firmware_requirements
-            .as_ref()
-            .is_some_and(|r| r.supported_fw.is_some() || !r.firmware_partitions.is_empty() || !r.installer_data_partitions.is_empty());
+    fn provision(
+        &self,
+        artifacts: &mut Artifacts,
+        preflight: Option<crate::asahi_firmware_download::ResolvedFirmwareArchives>,
+    ) -> Result<Option<ProvisionedFirmware>, String> {
+        let required = artifacts.firmware_requirements.as_ref().is_some_and(|r| {
+            r.supported_fw.is_some()
+                || !r.firmware_partitions.is_empty()
+                || !r.installer_data_partitions.is_empty()
+        });
         if !required && !self.provisioning_requested() {
             return Ok(None);
         }
@@ -382,10 +389,14 @@ impl CliOpts {
             {
                 let (board, chip, _) = self.provisioning_inputs()?;
                 crate::asahi_firmware_archive::validate_archive_for_package(
-                    self.ipsw.as_deref().ok_or("select a local IPSW with --ipsw FILE")?,
-                    resolved.supported_fw.as_deref(), Some((board, chip)),
+                    self.ipsw
+                        .as_deref()
+                        .ok_or("select a local IPSW with --ipsw FILE")?,
+                    resolved.supported_fw.as_deref(),
+                    Some((board, chip)),
                 )?;
-                preflight = Some(self.resolve_archives(&asahi_ops::FirmwareRequirements::from(&resolved))?);
+                preflight =
+                    Some(self.resolve_archives(&asahi_ops::FirmwareRequirements::from(&resolved))?);
             }
             let work = self.workdir();
             std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
@@ -479,7 +490,7 @@ impl CliOpts {
                 efi_files: Vec::new(),
                 firmware_requirements: None,
                 firmware: None,
-            installer_data: None,
+                installer_data: None,
                 m1n1_stage1: self.stage1_bytes()?,
                 root_fs,
                 root_path,
@@ -536,7 +547,12 @@ mod tests {
         ]
         .map(str::to_owned);
         let mut opts = CliOpts::parse(&args).unwrap();
-        assert!(CliOpts::parse(&["--firmware-output".into(), "output".into()]).err().unwrap().contains("inside the disk"));
+        assert!(
+            CliOpts::parse(&["--firmware-output".into(), "output".into()])
+                .err()
+                .unwrap()
+                .contains("inside the disk")
+        );
         assert_eq!(opts.target_chip, Some(0x8103));
         opts.requires_als_calibration = Some(false);
         assert!(opts.provisioning_inputs().is_ok());

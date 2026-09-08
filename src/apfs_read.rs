@@ -1939,22 +1939,33 @@ impl<'a> ApfsContainer<'a> {
                 mode: facts.mode,
             });
         }
-        let bytes = match self.reader.xattr(&volume.volume, file_id, "com.apple.fs.symlink", path)? {
-            Some(XattrData::Embedded(bytes)) => bytes,
-            Some(XattrData::Stream { object_id, size }) => {
-                self.reader.read_data_stream(&volume.volume, object_id, size, path)?
-            }
-            None => {
-                let size = facts.stream_size.unwrap_or(0);
-                self.reader.read_data_stream(&volume.volume, file_id, size, path)?
-            }
-        };
+        let bytes =
+            match self
+                .reader
+                .xattr(&volume.volume, file_id, "com.apple.fs.symlink", path)?
+            {
+                Some(XattrData::Embedded(bytes)) => bytes,
+                Some(XattrData::Stream { object_id, size }) => {
+                    self.reader
+                        .read_data_stream(&volume.volume, object_id, size, path)?
+                }
+                None => {
+                    let size = facts.stream_size.unwrap_or(0);
+                    self.reader
+                        .read_data_stream(&volume.volume, file_id, size, path)?
+                }
+            };
         let bytes = bytes.strip_suffix(&[0]).unwrap_or(&bytes);
         let malformed = |reason| ApfsReadError::RecordMalformed {
-            path: path.to_string(), object_id: file_id, kind: J_XATTR, reason,
+            path: path.to_string(),
+            object_id: file_id,
+            kind: J_XATTR,
+            reason,
         };
         if bytes.is_empty() || bytes.contains(&0) {
-            return Err(malformed("symlink target is empty or contains an embedded NUL"));
+            return Err(malformed(
+                "symlink target is empty or contains an embedded NUL",
+            ));
         }
         std::str::from_utf8(bytes)
             .map(str::to_owned)

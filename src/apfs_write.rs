@@ -270,7 +270,7 @@ fn build_leaf(block_size: u32, records: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<u8>
     put_u16(&mut block, 0x22, 0);
     put_u32(&mut block, 0x24, records.len() as u32);
     put_u16(&mut block, 0x28, 0);
-    let toc_len = (records.len().max(8) * 8) as u16;
+    let toc_len = variable_toc_len(records.len()) as u16;
     put_u16(&mut block, 0x2A, toc_len);
     let toc = BTNODE_TOC_BASE;
     let key_base = toc + toc_len as usize;
@@ -596,9 +596,34 @@ pub(crate) struct TreeLayout {
     pub(crate) subtype: u32,
 }
 
-fn node_bytes(records: &[(Vec<u8>, Vec<u8>)], fixed: bool, root: bool) -> usize {
+// fsck_apfs rejects a tight TOC on fixed-KV nodes (`invalid btn_table_space`).
+fn fixed_toc_len(block_size: usize, key_size: usize, val_size: usize) -> usize {
+    let capacity = (block_size - BTNODE_TOC_BASE) / (FIXED_TOC_ENTRY_BYTES + key_size + val_size);
+    capacity * FIXED_TOC_ENTRY_BYTES
+}
+
+// fsck_apfs rejects btn_table_space.len == 0 on variable-KV nodes (empty extentref trees).
+const MIN_VARIABLE_TOC_SLOTS: usize = 8;
+
+fn variable_toc_len(nkeys: usize) -> usize {
+    nkeys.max(MIN_VARIABLE_TOC_SLOTS) * 8
+}
+
+fn node_bytes(
+    records: &[(Vec<u8>, Vec<u8>)],
+    layout: TreeLayout,
+    root: bool,
+    level: u16,
+    block_size: usize,
+) -> usize {
+    let toc = if let Some((ks, vs)) = layout.fixed {
+        let vs = if level == 0 { vs } else { 8 };
+        fixed_toc_len(block_size, ks, vs)
+    } else {
+        variable_toc_len(records.len())
+    };
     BTNODE_TOC_BASE
-        + records.len() * if fixed { 4 } else { 8 }
+        + toc
         + records
             .iter()
             .map(|(k, v)| k.len() + v.len())
@@ -615,7 +640,7 @@ fn encode_tree_node(
     totals: (u64, u64, usize, usize),
 ) -> Result<Vec<u8>, String> {
     let bs = block_size as usize;
-    if node_bytes(records, layout.fixed.is_some(), root) > bs {
+    if node_bytes(records, layout, root, level, bs) > bs {
         return Err("b-tree records exceed node capacity".into());
     }
     let mut block = vec![0; bs];
@@ -630,16 +655,21 @@ fn encode_tree_node(
     put_u16(&mut block, 0x22, level);
     put_u32(&mut block, 0x24, records.len() as u32);
     let stride = if layout.fixed.is_some() { 4 } else { 8 };
-    let toc_len = records.len() * stride;
+    let toc_len = if let Some((ks, vs)) = layout.fixed {
+        let vs = if level == 0 { vs } else { 8 };
+        fixed_toc_len(bs, ks, vs)
+    } else {
+        variable_toc_len(records.len())
+    };
     put_u16(&mut block, 0x2A, toc_len as u16);
     let key_base = BTNODE_TOC_BASE + toc_len;
     let value_end = bs - if root { BTREE_INFO_BYTES } else { 0 };
     let (mut key_used, mut value_used) = (0, 0);
     for (i, (key, value)) in records.iter().enumerate() {
-        if let Some((ks, vs)) = layout.fixed {
-            if key.len() != ks || value.len() != if level == 0 { vs } else { 8 } {
-                return Err("invalid fixed-size b-tree record".into());
-            }
+        if let Some((ks, vs)) = layout.fixed
+            && (key.len() != ks || value.len() != if level == 0 { vs } else { 8 })
+        {
+            return Err("invalid fixed-size b-tree record".into());
         }
         let at = BTNODE_TOC_BASE + i * stride;
         value_used += value.len();
@@ -714,20 +744,22 @@ pub(crate) fn write_tree(
     );
     let mut level = 0u16;
     let mut current = records;
-    while node_bytes(&current, layout.fixed.is_some(), true) > image.block_size() as usize {
+    while node_bytes(&current, layout, true, level, image.block_size() as usize)
+        > image.block_size() as usize
+    {
         let mut parents = Vec::new();
         let mut start = 0;
         while start < current.len() {
             let mut end = start;
-            let mut used = BTNODE_TOC_BASE;
-            while end < current.len() {
-                let cost = current[end].0.len()
-                    + current[end].1.len()
-                    + if layout.fixed.is_some() { 4 } else { 8 };
-                if used + cost > image.block_size() as usize {
-                    break;
-                }
-                used += cost;
+            while end < current.len()
+                && node_bytes(
+                    &current[start..=end],
+                    layout,
+                    false,
+                    level,
+                    image.block_size() as usize,
+                ) <= image.block_size() as usize
+            {
                 end += 1;
             }
             if end == start {
