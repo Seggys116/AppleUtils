@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+.DS_Store
+
+# Local protocol refs. idevicerestore is LGPL and must not be published here.
+/refs

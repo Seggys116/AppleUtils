@@ -1,0 +1,11 @@
+[package]
+name = "apple-tui"
+version = "0.1.0"
+edition = "2024"
+authors = ["Zak Noble-Clarke"]
+description = "Shared TUI chrome: theme, glyphs, positioning, wait and progress widgets"
+license = "MIT"
+publish = false
+
+[dependencies]
+ratatui = "0.30"

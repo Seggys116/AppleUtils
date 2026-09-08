@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# checkout@v7 and rust-cache@v2 declare node24. node20 runners go away on 2026-09-23.
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # rust-toolchain.toml selects stable; rustup show installs it.
+      - name: Install Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      # After the toolchain step so the cache key includes rustc.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Confirm curl is available
+        run: curl --version
+
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  # Apple's fsck_apfs cannot be installed on Linux. macos-latest is free on
+  # public repos; do not switch to -large or -xlarge (those are billed).
+  apfs-fsck:
+    name: APFS containers vs Apple fsck_apfs
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Confirm the real oracle is present
+        run: |
+          test -x /System/Library/Filesystems/apfs.fs/Contents/Resources/fsck_apfs
+          test -x /usr/bin/hdiutil
+          test -x /usr/sbin/diskutil
+
+      # Serial: each test builds a 2560 MiB container; the runner has 7 GB RAM.
+      - name: Validate written containers with fsck_apfs and diskutil
+        run: cargo test --locked --test apfs_fsck_macos -- --test-threads=1 --nocapture
+
+  lint:
+    name: Format and clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show
+          cargo clippy --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
