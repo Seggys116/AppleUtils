@@ -185,8 +185,10 @@ pub fn parse_gpt(image: &[u8], block_size: u32) -> Result<GptTable, GptError> {
 
 fn utf16le_z(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .take_while(|u| *u != 0)
         .collect();
     String::from_utf16_lossy(&units)
@@ -270,8 +272,8 @@ pub fn fletcher64_valid(block: &[u8]) -> bool {
 fn fletcher64_sums(body: &[u8]) -> (u64, u64) {
     let mut lo: u64 = 0;
     let mut hi: u64 = 0;
-    for word in body.chunks_exact(4) {
-        lo = (lo + u32::from_le_bytes([word[0], word[1], word[2], word[3]]) as u64) % 0xFFFF_FFFF;
+    for word in body.as_chunks::<4>().0 {
+        lo = (lo + u32::from_le_bytes(*word) as u64) % 0xFFFF_FFFF;
         hi = (hi + lo) % 0xFFFF_FFFF;
     }
     (lo, hi)

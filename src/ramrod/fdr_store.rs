@@ -134,7 +134,7 @@ impl SikInstance {
         }
         let mut public_key = Vec::with_capacity(tail.len() / 2);
         let bytes = tail.as_bytes();
-        for pair in bytes.chunks_exact(2) {
+        for pair in bytes.as_chunks::<2>().0 {
             let text = std::str::from_utf8(pair).ok()?;
             public_key.push(u8::from_str_radix(text, 16).ok()?);
         }

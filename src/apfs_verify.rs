@@ -665,8 +665,8 @@ pub(crate) fn checksum_valid(block: &[u8]) -> bool {
     }
     let mut low: u64 = 0;
     let mut high: u64 = 0;
-    for word in block.chunks_exact(4) {
-        low = (low + u32::from_le_bytes([word[0], word[1], word[2], word[3]]) as u64) % 0xFFFF_FFFF;
+    for word in block.as_chunks::<4>().0 {
+        low = (low + u32::from_le_bytes(*word) as u64) % 0xFFFF_FFFF;
         high = (high + low) % 0xFFFF_FFFF;
     }
     low == 0
@@ -3084,9 +3084,8 @@ mod tests {
     fn reseal(block: &mut [u8]) {
         let mut low: u64 = 0;
         let mut high: u64 = 0;
-        for word in block[8..].chunks_exact(4) {
-            low = (low + u32::from_le_bytes([word[0], word[1], word[2], word[3]]) as u64)
-                % 0xFFFF_FFFF;
+        for word in block[8..].as_chunks::<4>().0 {
+            low = (low + u32::from_le_bytes(*word) as u64) % 0xFFFF_FFFF;
             high = (high + low) % 0xFFFF_FFFF;
         }
         let first = 0xFFFF_FFFF - ((low + high) % 0xFFFF_FFFF);

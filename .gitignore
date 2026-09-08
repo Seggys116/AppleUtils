@@ -1,6 +1,8 @@
 /target
 **/*.rs.bk
 .DS_Store
+/.ci-rustup
+/.ci-cargo
 
 # Local protocol refs. idevicerestore is LGPL and must not be published here.
 /refs

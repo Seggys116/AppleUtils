@@ -1008,15 +1008,19 @@ impl Qcow2 {
         let mut raw_table = vec![0u8; table_bytes as usize];
         file.read_exact(&mut raw_table)?;
         let refcount_table = raw_table
-            .chunks_exact(8)
-            .map(|c| u64::from_be_bytes(c.try_into().unwrap()) & !0x1ff)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_be_bytes(*c) & !0x1ff)
             .collect();
         file.seek(SeekFrom::Start(l1_offset))?;
         let mut raw = vec![0u8; l1_size as usize * 8];
         file.read_exact(&mut raw)?;
         let l1 = raw
-            .chunks_exact(8)
-            .map(|c| u64::from_be_bytes(c.try_into().unwrap()) & !QCOW_COPIED)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_be_bytes(*c) & !QCOW_COPIED)
             .collect();
         Ok(Self {
             file,
@@ -1171,8 +1175,10 @@ impl Qcow2 {
         self.file.seek(SeekFrom::Start(l2_off))?;
         self.file.read_exact(&mut raw)?;
         let table = raw
-            .chunks_exact(8)
-            .map(|chunk| u64::from_be_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| u64::from_be_bytes(*chunk))
             .collect();
         self.l2_cache.insert(l1_idx, table);
         Ok(())

@@ -1267,8 +1267,10 @@ impl Qcow2File {
         let mut raw = vec![0u8; l1_size as usize * 8];
         file.read_exact(&mut raw)?;
         let l1 = raw
-            .chunks_exact(8)
-            .map(|c| u64::from_be_bytes(c.try_into().unwrap()) & !QCOW_COPIED)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_be_bytes(*c) & !QCOW_COPIED)
             .collect();
         Ok(Self {
             path: path.to_path_buf(),
