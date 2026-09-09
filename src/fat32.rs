@@ -126,6 +126,7 @@ struct Layout {
     root_entry_count: u32,
     total_sectors: u64,
     hidden_sectors: u32,
+    volume_id: u32,
     fat_size_sectors: u32,
 }
 
@@ -286,7 +287,7 @@ fn write_bpb(image: &mut [u8], layout: &Layout, root_cluster: u32, volume_label:
             image[64] = 0x80;
             image[65] = 0;
             image[66] = 0x29;
-            image[67..71].copy_from_slice(&0x5253_5546u32.to_le_bytes());
+            image[67..71].copy_from_slice(&layout.volume_id.to_le_bytes());
             image[71..82].copy_from_slice(volume_label);
             image[82..90].copy_from_slice(b"FAT32   ");
         }
@@ -294,7 +295,7 @@ fn write_bpb(image: &mut [u8], layout: &Layout, root_cluster: u32, volume_label:
             image[36] = 0x80;
             image[37] = 0;
             image[38] = 0x29;
-            image[39..43].copy_from_slice(&0x5253_5546u32.to_le_bytes());
+            image[39..43].copy_from_slice(&layout.volume_id.to_le_bytes());
             image[43..54].copy_from_slice(volume_label);
             image[54..62].copy_from_slice(b"FAT16   ");
         }
@@ -790,6 +791,7 @@ fn format_image(
     total_sectors: u64,
     bytes_per_sector: u32,
     hidden_sectors: u32,
+    volume_id: u32,
     staged: &Path,
 ) -> Result<Vec<u8>, String> {
     let (spc, reserved, num_fats, root_entry_count) = match fat_type {
@@ -810,6 +812,7 @@ fn format_image(
         root_entry_count,
         total_sectors,
         hidden_sectors,
+        volume_id,
         fat_size_sectors: 0,
     };
     layout.fat_size_sectors = compute_fat_size(&layout)?;
@@ -872,6 +875,11 @@ fn parse_layout(container: &[u8]) -> Result<(Layout, u32), String> {
         root_entry_count,
         total_sectors,
         hidden_sectors: hidden,
+        volume_id: if fat_type == FatType::Fat32 {
+            le32(67)
+        } else {
+            le32(39)
+        },
         fat_size_sectors: fat_size,
     };
     let expected_len = total_sectors
@@ -1148,6 +1156,29 @@ pub fn create_efi(
     partition_start_lba: u32,
     files: &[(String, Vec<u8>)],
 ) -> Result<Vec<u8>, String> {
+    create_efi_with_volume_id(
+        part_bytes,
+        sector_size,
+        partition_start_lba,
+        new_volume_id(),
+        files,
+    )
+}
+
+fn new_volume_id() -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish() as u32
+}
+
+pub fn create_efi_with_volume_id(
+    part_bytes: u64,
+    sector_size: u32,
+    partition_start_lba: u32,
+    volume_id: u32,
+    files: &[(String, Vec<u8>)],
+) -> Result<Vec<u8>, String> {
     validate_efi_files(files)?;
     validate_efi_geometry(part_bytes, sector_size)?;
     let total_sectors = part_bytes / u64::from(sector_size);
@@ -1160,6 +1191,7 @@ pub fn create_efi(
         total_sectors,
         sector_size,
         partition_start_lba,
+        volume_id,
         staged.path(),
     )?;
     self_check(&image)?;
@@ -1167,8 +1199,19 @@ pub fn create_efi(
 }
 
 pub fn update_efi(container: &[u8], files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
+    update_efi_with_volume_id(container, None, files)
+}
+
+pub fn update_efi_with_volume_id(
+    container: &[u8],
+    volume_id: Option<u32>,
+    files: &[(String, Vec<u8>)],
+) -> Result<Vec<u8>, String> {
     validate_efi_files(files)?;
-    let (layout, root_cluster) = parse_layout(container)?;
+    let (mut layout, root_cluster) = parse_layout(container)?;
+    if let Some(volume_id) = volume_id {
+        layout.volume_id = volume_id;
+    }
     let staged = tempfile::tempdir().map_err(|e| e.to_string())?;
     extract_to_dir(container, &layout, root_cluster, staged.path())?;
     for (name, bytes) in files {
@@ -1228,7 +1271,14 @@ fn format_fat16_for_test(
     for (name, bytes) in files {
         write(staged.path(), name, bytes)?;
     }
-    let image = format_image(FatType::Fat16, total_sectors, sector_size, 0, staged.path())?;
+    let image = format_image(
+        FatType::Fat16,
+        total_sectors,
+        sector_size,
+        0,
+        new_volume_id(),
+        staged.path(),
+    )?;
     self_check(&image)?;
     Ok(image)
 }
@@ -1352,11 +1402,81 @@ mod tests {
         let updated =
             update_efi(&bytes, &[("m1n1/boot.bin".into(), b"replacement".to_vec())]).unwrap();
         assert_eq!(efi_sector_size(&updated).unwrap(), 512);
+        assert_eq!(
+            parse_layout(&bytes).unwrap().0.volume_id,
+            parse_layout(&updated).unwrap().0.volume_id
+        );
         assert_ne!(u16::from_le_bytes(updated[22..24].try_into().unwrap()), 0);
         assert_eq!(
             read_efi_file(&updated, "m1n1/boot.bin").unwrap(),
             b"replacement"
         );
+    }
+
+    #[test]
+    fn explicit_volume_identity_survives_file_updates() {
+        for volume_id in [0x17ab_c902, 0xfeca_4312] {
+            let image = create_efi_with_volume_id(
+                32 * 1024 * 1024,
+                512,
+                2048,
+                volume_id,
+                &[("boot.bin".into(), b"first".to_vec())],
+            )
+            .unwrap();
+            assert_eq!(parse_layout(&image).unwrap().0.volume_id, volume_id);
+            assert_eq!(
+                u32::from_le_bytes(image[6 * 512 + 67..6 * 512 + 71].try_into().unwrap()),
+                volume_id
+            );
+            let updated = update_efi(&image, &[("boot.bin".into(), vec![0xa9; 8192])]).unwrap();
+            assert_eq!(parse_layout(&updated).unwrap().0.volume_id, volume_id);
+            assert_eq!(
+                read_efi_file(&updated, "boot.bin").unwrap(),
+                vec![0xa9; 8192]
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_update_identity_preserves_files_for_both_fat_types() {
+        let files = vec![("retained.bin".into(), vec![0x71; 9000])];
+        for fat16 in [false, true] {
+            let image = if fat16 {
+                format_fat16_for_test(32 * 1024 * 1024, 512, &files).unwrap()
+            } else {
+                create_efi_with_volume_id(32 * 1024 * 1024, 512, 2048, 0x7cab_9190, &files).unwrap()
+            };
+            let expected_id = 0xc837_281b;
+            let updated = update_efi_with_volume_id(
+                &image,
+                Some(expected_id),
+                &[("new.bin".into(), vec![0x14; 5000])],
+            )
+            .unwrap();
+            assert_eq!(parse_layout(&updated).unwrap().0.volume_id, expected_id);
+            let offset = if fat16 { 39 } else { 67 };
+            assert_eq!(
+                u32::from_le_bytes(updated[offset..offset + 4].try_into().unwrap()),
+                expected_id
+            );
+            if !fat16 {
+                assert_eq!(
+                    u32::from_le_bytes(
+                        updated[6 * 512 + offset..6 * 512 + offset + 4]
+                            .try_into()
+                            .unwrap()
+                    ),
+                    expected_id
+                );
+            }
+            assert_eq!(
+                read_efi_files(&updated, &["retained.bin", "new.bin"]).unwrap(),
+                vec![vec![0x71; 9000], vec![0x14; 5000]]
+            );
+            let retained = update_efi(&updated, &[]).unwrap();
+            assert_eq!(parse_layout(&retained).unwrap().0.volume_id, expected_id);
+        }
     }
 
     #[test]

@@ -93,6 +93,7 @@ pub struct OsEntry {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PartitionTemplate {
+    pub volume_id: Option<String>,
     pub name: String,
     #[serde(rename = "type")]
     pub part_type: Option<String>,
@@ -107,6 +108,7 @@ pub struct PartitionTemplate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedLatest {
+    pub efi_volume_id: Option<u32>,
     pub os_name: String,
     pub package_url: String,
     pub boot_object: String,
@@ -147,6 +149,7 @@ impl From<&ResolvedLatest> for FirmwareRequirements {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Artifacts {
+    pub efi_volume_id: Option<u32>,
     pub kernel: Vec<u8>,
     pub m1n1: Vec<u8>,
     pub efi_files: Vec<(String, Vec<u8>)>,
@@ -166,6 +169,7 @@ impl Artifacts {
             kernel,
             m1n1,
             efi_files: Vec::new(),
+            efi_volume_id: None,
             firmware_requirements: None,
             firmware: None,
             installer_data: None,
@@ -339,6 +343,19 @@ pub fn list_installable_flavors(data: &InstallerData) -> Vec<Flavor> {
         .collect()
 }
 
+fn parse_fat_volume_id(value: &str) -> Result<u32, OpsError> {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if digits.is_empty() || digits.len() > 8 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(err(
+            "installer EFI volume_id must contain up to eight hexadecimal digits",
+        ));
+    }
+    u32::from_str_radix(digits, 16).map_err(|e| err(e.to_string()))
+}
+
 fn resolve_from_entry(os: &OsEntry) -> Result<ResolvedLatest, OpsError> {
     let package_url = os
         .package
@@ -367,7 +384,20 @@ fn resolve_from_entry(os: &OsEntry) -> Result<ResolvedLatest, OpsError> {
         .find(|p| p.image.as_deref() == Some("boot.img") || p.name.eq_ignore_ascii_case("Boot"))
         .and_then(|p| p.image.clone())
         .unwrap_or_else(|| "boot.img".into());
+    let efi_volume_id = os
+        .partitions
+        .iter()
+        .filter(|part| part.part_type.as_deref() == Some("EFI"))
+        .filter_map(|part| part.volume_id.as_deref())
+        .map(parse_fat_volume_id)
+        .collect::<Result<Vec<_>, _>>()?;
+    if efi_volume_id.len() > 1 {
+        return Err(err(
+            "installer metadata contains multiple EFI volume identities",
+        ));
+    }
     Ok(ResolvedLatest {
+        efi_volume_id: efi_volume_id.first().copied(),
         os_name: os
             .default_os_name
             .clone()
@@ -1463,14 +1493,29 @@ fn compose_disk(
     )
     .map_err(err)?;
     let actual_vgid = container_boot_vgid(&apfs)?;
-    let fat = crate::fat32::create_efi(
-        efi_bytes,
-        SECTOR,
-        u32::try_from(layout.efi_lba)
-            .map_err(|_| err("EFI partition start exceeds FAT geometry limits"))?,
-        &efi_payloads(artifacts, next_object, Some(&actual_vgid))?,
-    )
-    .map_err(err)?;
+    let efi_files = efi_payloads(artifacts, next_object, Some(&actual_vgid))?;
+    let create_efi = |volume_id| {
+        crate::fat32::create_efi_with_volume_id(
+            efi_bytes,
+            SECTOR,
+            u32::try_from(layout.efi_lba)
+                .map_err(|_| err("EFI partition start exceeds FAT geometry limits"))?,
+            volume_id,
+            &efi_files,
+        )
+        .map_err(err)
+    };
+    let fat = match artifacts.efi_volume_id {
+        Some(volume_id) => create_efi(volume_id)?,
+        None => crate::fat32::create_efi(
+            efi_bytes,
+            SECTOR,
+            u32::try_from(layout.efi_lba)
+                .map_err(|_| err("EFI partition start exceeds FAT geometry limits"))?,
+            &efi_files,
+        )
+        .map_err(err)?,
+    };
 
     let mut image = SparseImage::new(layout.disc_size);
     let mut parts = vec![
@@ -1814,8 +1859,9 @@ fn update_disc_contents(path: &Path, artifacts: &Artifacts) -> Result<DiscReport
         usize::try_from(apfs_end - apfs_start).map_err(|_| err("APFS partition too large"))?,
     )?;
     let actual_vgid = container_boot_vgid(&container)?;
-    let fat = crate::fat32::update_efi(
+    let fat = crate::fat32::update_efi_with_volume_id(
         &original_fat,
+        artifacts.efi_volume_id,
         &efi_payloads(artifacts, next_object, Some(&actual_vgid))?,
     )
     .map_err(err)?;
@@ -2797,12 +2843,28 @@ pub fn load_artifacts_from_package_file_reporting(
     extract_package_from_path_parts(package, &resolved, workdir, include_root, on_progress)
 }
 
+fn normalize_boot_metadata(artifacts: &mut Artifacts) -> Result<(), OpsError> {
+    if let Some(path) = artifacts.boot_path.as_ref() {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        crate::asahi_boot_metadata::normalize_ext4_environment(&mut file).map_err(err)?;
+    } else if !artifacts.boot_fs.is_empty() {
+        let mut source = std::io::Cursor::new(&mut artifacts.boot_fs);
+        crate::asahi_boot_metadata::normalize_ext4_environment(&mut source).map_err(err)?;
+    }
+    Ok(())
+}
+
 fn extract_package_artifacts(
     package: &[u8],
     resolved: &ResolvedLatest,
 ) -> Result<Artifacts, OpsError> {
     let mut artifacts = extract_package_artifacts_unbound(package, resolved)?;
     artifacts.firmware_requirements = Some(FirmwareRequirements::from(resolved));
+    artifacts.efi_volume_id = resolved.efi_volume_id;
+    normalize_boot_metadata(&mut artifacts)?;
     Ok(artifacts)
 }
 
@@ -2858,6 +2920,8 @@ fn extract_package_from_path_parts(
         on_progress,
     )?;
     artifacts.firmware_requirements = Some(FirmwareRequirements::from(resolved));
+    artifacts.efi_volume_id = resolved.efi_volume_id;
+    normalize_boot_metadata(&mut artifacts)?;
     Ok(artifacts)
 }
 
@@ -2880,6 +2944,7 @@ fn extract_package_from_path_parts_unbound(
             kernel: Vec::new(),
             m1n1: Vec::new(),
             efi_files: Vec::new(),
+            efi_volume_id: None,
             firmware_requirements: None,
             firmware: None,
             installer_data: None,
@@ -2959,6 +3024,7 @@ fn extract_package_from_path_parts_unbound(
         kernel,
         m1n1,
         efi_files: package_efi_files(package, &members)?,
+        efi_volume_id: None,
         firmware_requirements: None,
         firmware: None,
         installer_data: None,
@@ -3358,6 +3424,18 @@ fn inflate_raw(payload: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn installer_efi_identity_is_parsed_and_propagated() {
+        let data = parse_installer_data(r#"{"os_list":[{"name":"Test","package":"https://example.com/image.zip","partitions":[{"name":"EFI","type":"EFI","volume_id":"0x4F1D2C3B"}]}]}"#).unwrap();
+        let resolved = resolve_latest(&data).unwrap();
+        assert_eq!(resolved.efi_volume_id, Some(0x4f1d2c3b));
+        let artifacts = extract_package_artifacts(b"root fixture", &resolved).unwrap();
+        assert_eq!(artifacts.efi_volume_id, resolved.efi_volume_id);
+        for invalid in ["", "123456789", "GG", "0A11-98C0"] {
+            assert!(parse_fat_volume_id(invalid).is_err());
+        }
+    }
     use super::*;
     use crate::apfs_image::{
         APFS_VOL_ROLE_DATA, APFS_VOL_ROLE_PREBOOT, APFS_VOL_ROLE_RECOVERY, APFS_VOL_ROLE_SYSTEM,
@@ -3772,6 +3850,7 @@ mod tests {
             kernel: b"KERN-file".to_vec(),
             m1n1: b"M1N1-file".to_vec(),
             efi_files: Vec::new(),
+            efi_volume_id: None,
             firmware_requirements: None,
             firmware: None,
             installer_data: None,
@@ -4099,6 +4178,7 @@ mod tests {
             kernel: b"KERN".to_vec(),
             m1n1: b"M1N1".to_vec(),
             efi_files: Vec::new(),
+            efi_volume_id: None,
             firmware_requirements: None,
             firmware: None,
             installer_data: None,
