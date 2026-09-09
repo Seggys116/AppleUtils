@@ -233,7 +233,7 @@ impl<R: Read + Seek> Ext4<R> {
         if out.len() + count > 4096 {
             return Err("ext4 boot metadata extent limit exceeded".into());
         }
-        for entry in node[12..12 + count * 12].chunks_exact(12) {
+        for entry in node[12..12 + count * 12].as_chunks::<12>().0 {
             let logical = u32_at(entry, 0)? as u64;
             if depth == 0 {
                 let size = u16_at(entry, 4)?;
