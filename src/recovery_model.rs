@@ -1,9 +1,12 @@
 use std::collections::{HashSet, VecDeque};
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use ratatui::layout::Rect;
 
 use crate::clip::{FileInfo, FileKind, format_size, inspect};
+use crate::ramrod::BUILD_MANIFEST_FILE_NAME;
 
 const MAX_LOG_ENTRIES: usize = 18;
 
@@ -1669,8 +1672,50 @@ fn resolve_from_directory(dir: &FileInfo, spec: &FileRequestSpec) -> Result<Vec<
     Ok(matches)
 }
 
+pub(crate) fn restore_set_manifest(root: &Path) -> Option<PathBuf> {
+    let manifest = root.join(BUILD_MANIFEST_FILE_NAME);
+    manifest.is_file().then_some(manifest)
+}
+
+pub(crate) fn declares_another_restore_set(dir: &Path, root_manifest: &Path) -> bool {
+    let candidate = dir.join(BUILD_MANIFEST_FILE_NAME);
+    candidate.is_file() && !files_have_identical_bytes(&candidate, root_manifest)
+}
+
+fn files_have_identical_bytes(left: &Path, right: &Path) -> bool {
+    let (Ok(left_metadata), Ok(right_metadata)) =
+        (std::fs::metadata(left), std::fs::metadata(right))
+    else {
+        return false;
+    };
+    if left_metadata.len() != right_metadata.len() {
+        return false;
+    }
+    let (Ok(left_file), Ok(right_file)) = (File::open(left), File::open(right)) else {
+        return false;
+    };
+    let mut left_reader = BufReader::new(left_file);
+    let mut right_reader = BufReader::new(right_file);
+    let mut left_chunk = vec![0u8; 64 * 1024];
+    let mut right_chunk = vec![0u8; 64 * 1024];
+    loop {
+        let read = match left_reader.read(&mut left_chunk) {
+            Ok(0) => return true,
+            Ok(read) => read,
+            Err(_) => return false,
+        };
+        if right_reader.read_exact(&mut right_chunk[..read]).is_err() {
+            return false;
+        }
+        if left_chunk[..read] != right_chunk[..read] {
+            return false;
+        }
+    }
+}
+
 fn walk_payload_files(dir: &Path) -> Result<Vec<FileInfo>, String> {
     let mut files = Vec::new();
+    let root_manifest = restore_set_manifest(dir);
     let mut stack = vec![dir.to_path_buf()];
     let mut seen_dirs = HashSet::new();
     let mut visited = 0usize;
@@ -1703,6 +1748,12 @@ fn walk_payload_files(dir: &Path) -> Result<Vec<FileInfo>, String> {
                 continue;
             };
             if metadata.is_dir() {
+                if root_manifest
+                    .as_ref()
+                    .is_some_and(|manifest| declares_another_restore_set(&child, manifest))
+                {
+                    continue;
+                }
                 stack.push(child);
                 continue;
             }
@@ -2736,5 +2787,75 @@ mod tests {
             "{}",
             model.picker_title()
         );
+    }
+
+    #[test]
+    fn payload_walk_skips_other_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_bytes = b"root-manifest";
+        std::fs::write(dir.path().join(BUILD_MANIFEST_FILE_NAME), root_bytes).unwrap();
+
+        let foreign = dir.path().join("other").join("Firmware").join("dcp");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(
+            dir.path().join("other").join(BUILD_MANIFEST_FILE_NAME),
+            b"other-manifest",
+        )
+        .unwrap();
+        std::fs::write(foreign.join("ipad13dcp.im4p"), b"other-payload").unwrap();
+
+        let linked = dir.path().join("linked");
+        std::fs::create_dir_all(linked.join("Firmware").join("dcp")).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("other").join(BUILD_MANIFEST_FILE_NAME),
+            linked.join(BUILD_MANIFEST_FILE_NAME),
+        )
+        .unwrap();
+        std::fs::write(
+            linked.join("Firmware").join("dcp").join("ipad13dcp.im4p"),
+            b"linked-payload",
+        )
+        .unwrap();
+
+        let spec = FileRequestSpec {
+            request_id: "component:Ap,DCP2".into(),
+            role: "Ap,DCP2".into(),
+            preferred_name: Some("ipad13dcp.im4p".into()),
+            accepted_names: vec!["Ap,DCP2__ipad13dcp.im4p".into(), "ipad13dcp.im4p".into()],
+            allowed_extensions: vec!["im4p".into()],
+            accept_directory: false,
+            expected_size: None,
+            expected_hash: None,
+            detail: None,
+            required: true,
+        };
+        let folder = inspect(&dir.path().to_string_lossy()).expect("folder");
+        assert!(resolve_handoff(&folder, &spec).is_err());
+
+        let owned = dir
+            .path()
+            .join("same")
+            .join("restore-assets")
+            .join("Firmware")
+            .join("dcp");
+        std::fs::create_dir_all(&owned).unwrap();
+        std::fs::write(
+            dir.path().join("same").join(BUILD_MANIFEST_FILE_NAME),
+            root_bytes,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path()
+                .join("same")
+                .join("restore-assets")
+                .join(BUILD_MANIFEST_FILE_NAME),
+            root_bytes,
+        )
+        .unwrap();
+        let payload = owned.join("ipad13dcp.im4p");
+        std::fs::write(&payload, b"payload").unwrap();
+
+        let resolved = resolve_handoff(&folder, &spec).unwrap();
+        assert_eq!(resolved.path, payload.canonicalize().unwrap());
     }
 }

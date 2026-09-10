@@ -31,7 +31,8 @@ use crate::ramrod::{
 use crate::recovery_model::RestoreMode;
 use crate::recovery_model::{
     FileRequestSpec, HashExpectation, LogLevel, RecoveryDevice, RecoveryEvent, RestoreProgress,
-    SessionPhase, expand_accepted_names, resolve_handoff, resolve_handoff_candidates,
+    SessionPhase, declares_another_restore_set, expand_accepted_names, resolve_handoff,
+    resolve_handoff_candidates, restore_set_manifest,
 };
 use crate::recovery_runtime::{RecoveryCommand, RecoveryService, RecoveryServiceError};
 use crate::restore::{
@@ -961,8 +962,7 @@ impl ServiceWorker {
                 return;
             }
         }
-        let mut found = self.scan_prepared_pending_from(&dir);
-        found += self.scan_prepared_extract_roots();
+        let found = self.scan_prepared_pending_from(&dir);
         if found == 0 {
             let remaining = self.prepared_remaining_titles();
             if let Some(spec) = self.prepared.as_ref().and_then(|prepared| {
@@ -1765,8 +1765,7 @@ impl ServiceWorker {
                 .to_string(),
             fraction: None,
         }));
-        let mut found = self.scan_session_pending_from(&dir);
-        found += self.scan_session_extract_roots();
+        let found = self.scan_session_pending_from(&dir);
         self.try_fill_pending_from(std::slice::from_ref(&dir));
         let still_pending = self
             .session
@@ -3785,6 +3784,7 @@ fn find_directory_with_suffix(root: &Path, suffix: &[&str]) -> Result<Option<Pat
     }
     let canonical_root = fs::canonicalize(root)
         .map_err(|error| format!("Could not resolve extracted IPSW root: {error}"))?;
+    let root_manifest = restore_set_manifest(&canonical_root);
     let mut stack = vec![canonical_root.clone()];
     let mut seen = HashSet::new();
     let mut visited = 0usize;
@@ -3816,6 +3816,12 @@ fn find_directory_with_suffix(root: &Path, suffix: &[&str]) -> Result<Option<Pat
                 continue;
             };
             if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                continue;
+            }
+            if root_manifest
+                .as_ref()
+                .is_some_and(|manifest| declares_another_restore_set(&child, manifest))
+            {
                 continue;
             }
             stack.push(child);
@@ -8090,5 +8096,223 @@ mod tests {
             vec![HostDetachDisposition::Cancelled]
         );
         assert_eq!(claim.abort_count(), 0);
+    }
+
+    fn handoff_worker() -> (ServiceWorker, Receiver<RecoveryEvent>) {
+        let backend = Arc::new(FakeBackend::new(
+            BackendDiscovery {
+                devices: Vec::new(),
+            },
+            FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success),
+        ));
+        let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_QUEUE_BOUND);
+        drop(command_tx);
+        let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_BOUND);
+        (ServiceWorker::new(backend, command_rx, event_tx), event_rx)
+    }
+
+    fn two_tree_manifest() -> Value {
+        let mut value = manifest("J274AP", &crate::crypto::sha384(b"expected image"));
+        add_identity_component(
+            &mut value,
+            "Ap,DCP2",
+            "Firmware/dcp/ipad13dcp.im4p",
+            &crate::crypto::sha384(b"dcp"),
+        );
+        value
+    }
+
+    fn drained(events: &Receiver<RecoveryEvent>) -> Vec<RecoveryEvent> {
+        events.try_iter().collect()
+    }
+
+    #[test]
+    fn prepared_folder_ignores_prefixed_sibling() {
+        let root = tempdir().unwrap();
+        let manifest_path = root.path().join(BUILD_MANIFEST_FILE_NAME);
+        write_manifest(&manifest_path, &two_tree_manifest());
+
+        let handed = root.path().join("Wanted");
+        fs::create_dir_all(handed.join("restore-assets")).unwrap();
+        fs::write(handed.join("restore-assets").join("notes.txt"), b"empty").unwrap();
+
+        let sibling = root.path().join("Wanted-b");
+        let sibling_dcp = sibling.join("Firmware").join("dcp");
+        fs::create_dir_all(&sibling_dcp).unwrap();
+        fs::write(sibling_dcp.join("ipad13dcp.im4p"), b"other-payload").unwrap();
+
+        let (mut worker, events) = handoff_worker();
+        worker.open_manifest_request();
+        worker.provide_prepared_file(MANIFEST_REQUEST_ID, &manifest_path.to_string_lossy());
+        worker.select_system("J274AP");
+        let request_id = component_request_id("Ap,DCP2");
+        assert!(
+            worker
+                .prepared
+                .as_ref()
+                .is_some_and(|prepared| prepared.pending.contains_key(&request_id))
+        );
+        let _ = drained(&events);
+
+        worker.provide_prepared_file(&request_id, &handed.to_string_lossy());
+
+        let prepared = worker.prepared.as_ref().unwrap();
+        let sibling_root = sibling.canonicalize().unwrap();
+        for accepted in prepared.accepted.values() {
+            assert!(!accepted.source.starts_with(&sibling_root));
+        }
+        assert!(prepared.pending.contains_key(&request_id));
+        let events = drained(&events);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RecoveryEvent::FileRejected { request_id: rejected, reason, .. }
+                if rejected == &request_id && reason.contains(&handed.display().to_string())
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RecoveryEvent::FileRequested(spec) if spec.request_id == request_id
+        )));
+    }
+
+    #[test]
+    fn prepared_folder_uses_nested_payload() {
+        let root = tempdir().unwrap();
+        let manifest_path = root.path().join(BUILD_MANIFEST_FILE_NAME);
+        write_manifest(&manifest_path, &two_tree_manifest());
+
+        let handed = root.path().join("Wanted");
+        let handed_dcp = handed.join("restore-assets").join("Firmware").join("dcp");
+        fs::create_dir_all(&handed_dcp).unwrap();
+        let wanted_payload = handed_dcp.join("ipad13dcp.im4p");
+        fs::write(&wanted_payload, b"payload").unwrap();
+
+        let sibling = root.path().join("Wanted-b");
+        let sibling_dcp = sibling.join("Firmware").join("dcp");
+        fs::create_dir_all(&sibling_dcp).unwrap();
+        fs::write(sibling_dcp.join("ipad13dcp.im4p"), b"other-payload").unwrap();
+
+        let (mut worker, events) = handoff_worker();
+        worker.open_manifest_request();
+        worker.provide_prepared_file(MANIFEST_REQUEST_ID, &manifest_path.to_string_lossy());
+        worker.select_system("J274AP");
+        let request_id = component_request_id("Ap,DCP2");
+        let _ = drained(&events);
+
+        worker.provide_prepared_file(&request_id, &handed.to_string_lossy());
+
+        let accepted = worker
+            .prepared
+            .as_ref()
+            .unwrap()
+            .accepted
+            .get(&request_id)
+            .unwrap();
+        assert_eq!(accepted.source, wanted_payload.canonicalize().unwrap());
+        assert_ne!(
+            accepted.source,
+            sibling_dcp.join("ipad13dcp.im4p").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn session_folder_ignores_prefixed_sibling() {
+        let root = tempdir().unwrap();
+        let manifest_path = root.path().join(BUILD_MANIFEST_FILE_NAME);
+        write_manifest(&manifest_path, &two_tree_manifest());
+
+        let handed = root.path().join("Wanted");
+        fs::create_dir_all(handed.join("restore-assets")).unwrap();
+        fs::write(handed.join("restore-assets").join("notes.txt"), b"empty").unwrap();
+
+        let sibling = root.path().join("Wanted-b");
+        let sibling_dcp = sibling.join("Firmware").join("dcp");
+        fs::create_dir_all(&sibling_dcp).unwrap();
+        fs::write(sibling_dcp.join("ipad13dcp.im4p"), b"other-payload").unwrap();
+
+        let (mut worker, events) = handoff_worker();
+        let claim = FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success);
+        let mut session = ClaimedSession::new(claim, sample_context(), device_reporting("J274AP"));
+        session.reset_for_manifest_request();
+        worker.session = Some(session);
+        worker.provide_file(
+            "vm-1",
+            MANIFEST_REQUEST_ID,
+            &manifest_path.to_string_lossy(),
+        );
+        let request_id = component_request_id("Ap,DCP2");
+        assert!(
+            worker
+                .session
+                .as_ref()
+                .is_some_and(|session| session.pending_requests.contains_key(&request_id))
+        );
+        let _ = drained(&events);
+
+        worker.provide_file("vm-1", &request_id, &handed.to_string_lossy());
+
+        let session = worker.session.as_ref().unwrap();
+        let sibling_root = sibling.canonicalize().unwrap();
+        for accepted in session.accepted_files.values() {
+            assert!(!accepted.source.starts_with(&sibling_root));
+        }
+        assert!(session.pending_requests.contains_key(&request_id));
+        let events = drained(&events);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RecoveryEvent::FileRejected { request_id: rejected, reason, .. }
+                if rejected == &request_id && reason.contains(&handed.display().to_string())
+        )));
+    }
+
+    #[test]
+    fn other_manifest_is_not_global_source() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join(BUILD_MANIFEST_FILE_NAME), b"root-manifest").unwrap();
+        let foreign = root.path().join("other");
+        fs::create_dir_all(foreign.join("Firmware").join("Manifests").join("restore")).unwrap();
+        fs::write(foreign.join(BUILD_MANIFEST_FILE_NAME), b"other-manifest").unwrap();
+
+        assert_eq!(locate_global_manifest_source(root.path()).unwrap(), None);
+        assert_eq!(locate_firmware_source(root.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn matching_manifest_is_global_source() {
+        let root = tempdir().unwrap();
+        let manifest_bytes = b"root-manifest";
+        fs::write(root.path().join(BUILD_MANIFEST_FILE_NAME), manifest_bytes).unwrap();
+
+        let handed = root.path().join("Wanted");
+        let handed_manifests = handed
+            .join("restore-assets")
+            .join("Firmware")
+            .join("Manifests")
+            .join("restore");
+        fs::create_dir_all(&handed_manifests).unwrap();
+        fs::write(handed.join(BUILD_MANIFEST_FILE_NAME), manifest_bytes).unwrap();
+        fs::write(
+            handed.join("restore-assets").join(BUILD_MANIFEST_FILE_NAME),
+            manifest_bytes,
+        )
+        .unwrap();
+
+        let sibling = root.path().join("Wanted-b");
+        fs::create_dir_all(sibling.join("Firmware").join("Manifests").join("restore")).unwrap();
+        fs::write(sibling.join(BUILD_MANIFEST_FILE_NAME), b"other-manifest").unwrap();
+
+        assert_eq!(
+            locate_global_manifest_source(root.path()).unwrap(),
+            Some(handed_manifests.canonicalize().unwrap())
+        );
+        assert_eq!(
+            locate_firmware_source(root.path()).unwrap(),
+            Some(
+                handed
+                    .join("restore-assets")
+                    .join("Firmware")
+                    .canonicalize()
+                    .unwrap()
+            )
+        );
     }
 }
