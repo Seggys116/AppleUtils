@@ -18,17 +18,17 @@ pub fn describe_board(class: &str, platform: Option<&str>) -> BoardLabel {
     let key = class.trim().to_ascii_lowercase();
     let catalog = device_catalog();
     let record = catalog.boards.get(&key);
-    let chip = record
-        .and_then(|record| record.cpu.as_deref())
-        .or_else(|| {
-            platform
-                .map(str::trim)
-                .filter(|platform| !platform.is_empty())
-                .and_then(|platform| catalog.platforms.get(&platform.to_ascii_lowercase()))
-                .map(String::as_str)
-        });
+    let chip = record.and_then(|record| record.cpu.as_deref()).or_else(|| {
+        platform
+            .map(str::trim)
+            .filter(|platform| !platform.is_empty())
+            .and_then(|platform| catalog.platforms.get(&platform.to_ascii_lowercase()))
+            .map(String::as_str)
+    });
     let title = record
-        .map(|record| format_board_title(&record.name, record.cpu.as_deref(), record.radio.as_deref()))
+        .map(|record| {
+            format_board_title(&record.name, record.cpu.as_deref(), record.radio.as_deref())
+        })
         .unwrap_or_else(|| class.to_string());
     let detail = match chip {
         Some(chip) => format!("{class}  ·  {chip}"),
@@ -145,7 +145,9 @@ fn format_board_title(name: &str, cpu: Option<&str>, radio: Option<&str>) -> Str
         extras.push(cpu.to_string());
     }
     if let Some(radio) = radio.map(str::trim).filter(|radio| !radio.is_empty())
-        && !name.to_ascii_lowercase().contains(&radio.to_ascii_lowercase())
+        && !name
+            .to_ascii_lowercase()
+            .contains(&radio.to_ascii_lowercase())
     {
         extras.push(radio.to_string());
     }
@@ -227,7 +229,11 @@ mod tests {
             "iPhone 15 Pro (A17 Pro)"
         );
         assert_eq!(
-            format_board_title("Apple Watch Ultra", Some("S6/S7/S8"), Some("GPS + Cellular")),
+            format_board_title(
+                "Apple Watch Ultra",
+                Some("S6/S7/S8"),
+                Some("GPS + Cellular")
+            ),
             "Apple Watch Ultra (GPS + Cellular)"
         );
     }
@@ -245,10 +251,7 @@ mod tests {
         assert!(air.detail.contains("M1"), "{}", air.detail);
 
         let ipad = describe_board("J617AP", None);
-        assert_eq!(
-            ipad.title,
-            "iPad Pro (11-inch) (4th generation, M2, Wi-Fi)"
-        );
+        assert_eq!(ipad.title, "iPad Pro (11-inch) (4th generation, M2, Wi-Fi)");
     }
 
     #[test]
