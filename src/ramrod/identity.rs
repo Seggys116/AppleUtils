@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::File;
 use std::io::{Cursor, Read};
@@ -238,6 +239,40 @@ pub fn all_build_identities(manifest: &Dictionary) -> Vec<BuildIdentity> {
     (0..entries.len())
         .filter_map(|index| identity_at(entries, index))
         .collect()
+}
+
+#[must_use]
+pub fn installable_device_classes(manifest: &Dictionary) -> Vec<String> {
+    let Ok(entries) = identities(manifest) else {
+        return Vec::new();
+    };
+    let mut classes = BTreeSet::new();
+    for entry in entries {
+        let Some(info) = entry
+            .as_dictionary()
+            .and_then(|body| body.get("Info"))
+            .and_then(Value::as_dictionary)
+        else {
+            continue;
+        };
+        let variant = info
+            .get("Variant")
+            .and_then(Value::as_string)
+            .unwrap_or_default();
+        if variant.contains(RESEARCH_MARKER) {
+            continue;
+        }
+        let Some(class) = info
+            .get("DeviceClass")
+            .and_then(Value::as_string)
+            .map(str::trim)
+            .filter(|class| !class.is_empty())
+        else {
+            continue;
+        };
+        classes.insert(class.to_string());
+    }
+    classes.into_iter().collect()
 }
 
 fn identity_at(entries: &[Value], index: usize) -> Option<BuildIdentity> {
@@ -694,6 +729,28 @@ mod tests {
             ]),
         );
         root
+    }
+
+    #[test]
+    fn installable_classes_skip_research() {
+        let classes = installable_device_classes(&manifest());
+        assert_eq!(classes, vec!["j274ap".to_string(), "j293ap".to_string()]);
+    }
+
+    #[test]
+    fn installable_classes_include_ipados_boards() {
+        let mut root = Dictionary::new();
+        root.insert(
+            "BuildIdentities".into(),
+            Value::Array(vec![
+                identity("j617ap", "Developer Erase Install (IPSW)"),
+                identity("j617ap", "Developer Upgrade Install (IPSW)"),
+                identity("j617ap", "Recovery Customer Install"),
+                identity("j618ap", "Developer Erase Install (IPSW)"),
+            ]),
+        );
+        let classes = installable_device_classes(&root);
+        assert_eq!(classes, vec!["j617ap".to_string(), "j618ap".to_string()]);
     }
 
     #[test]

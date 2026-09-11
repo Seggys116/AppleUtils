@@ -1,0 +1,1925 @@
+{
+  "boards": {
+    "b288ap": {
+      "name": "AirPods",
+      "cpu": "H1",
+      "platform": "t2002"
+    },
+    "b298ap": {
+      "name": "AirPods Pro",
+      "cpu": "H1",
+      "platform": "t2002"
+    },
+    "b494ap": {
+      "name": "Beats Fit Pro",
+      "cpu": "H1",
+      "platform": "t2002"
+    },
+    "b520ap": {
+      "name": "HomePod mini",
+      "cpu": "S4 Non-LTE and LTE",
+      "platform": "t8006"
+    },
+    "b620ap": {
+      "name": "HomePod (2nd generation)",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301"
+    },
+    "b688ap": {
+      "name": "AirPods with MagSafe Charging Case",
+      "cpu": "H1",
+      "platform": "t2002"
+    },
+    "b698ap": {
+      "name": "AirPods Pro (2nd generation)",
+      "cpu": "H2",
+      "platform": "t2016"
+    },
+    "b768eap": {
+      "name": "AirPods 4",
+      "cpu": "H2",
+      "platform": "t2016"
+    },
+    "b768map": {
+      "name": "AirPods 4 (ANC)",
+      "cpu": "H2",
+      "platform": "t2016"
+    },
+    "b788ap": {
+      "name": "AirPods Pro (3rd generation)",
+      "cpu": "H2",
+      "platform": "t2016"
+    },
+    "bcpad101ap": {
+      "name": "Apple Vision",
+      "cpu": "M2",
+      "platform": "t8112"
+    },
+    "d101ap": {
+      "name": "iPhone 7",
+      "cpu": "A10 Fusion",
+      "platform": "t8010"
+    },
+    "d10ap": {
+      "name": "iPhone 7",
+      "cpu": "A10 Fusion",
+      "platform": "t8010"
+    },
+    "d111ap": {
+      "name": "iPhone 7 Plus",
+      "cpu": "A10 Fusion",
+      "platform": "t8010"
+    },
+    "d11ap": {
+      "name": "iPhone 7 Plus",
+      "cpu": "A10 Fusion",
+      "platform": "t8010"
+    },
+    "d16ap": {
+      "name": "iPhone 13 mini",
+      "cpu": "A15 Bionic",
+      "platform": "t8110"
+    },
+    "d17ap": {
+      "name": "iPhone 13",
+      "cpu": "A15 Bionic",
+      "platform": "t8110"
+    },
+    "d201ap": {
+      "name": "iPhone 8",
+      "cpu": "A11 Bionic",
+      "platform": "t8015"
+    },
+    "d20ap": {
+      "name": "iPhone 8",
+      "cpu": "A11 Bionic",
+      "platform": "t8015"
+    },
+    "d211ap": {
+      "name": "iPhone 8 Plus",
+      "cpu": "A11 Bionic",
+      "platform": "t8015"
+    },
+    "d21ap": {
+      "name": "iPhone 8 Plus",
+      "cpu": "A11 Bionic",
+      "platform": "t8015"
+    },
+    "d221ap": {
+      "name": "iPhone X",
+      "cpu": "A11 Bionic",
+      "platform": "t8015"
+    },
+    "d22ap": {
+      "name": "iPhone X",
+      "cpu": "A11 Bionic",
+      "platform": "t8015"
+    },
+    "d23ap": {
+      "name": "iPhone Air",
+      "cpu": "A19 Pro",
+      "platform": "t8150"
+    },
+    "d27ap": {
+      "name": "iPhone 14",
+      "cpu": "A15 Bionic",
+      "platform": "t8110"
+    },
+    "d28ap": {
+      "name": "iPhone 14 Plus",
+      "cpu": "A15 Bionic",
+      "platform": "t8110"
+    },
+    "d321ap": {
+      "name": "iPhone XS",
+      "cpu": "A12 Bionic",
+      "platform": "t8020"
+    },
+    "d331ap": {
+      "name": "iPhone XS Max",
+      "cpu": "A12 Bionic",
+      "platform": "t8020"
+    },
+    "d331pap": {
+      "name": "iPhone XS Max",
+      "cpu": "A12 Bionic",
+      "platform": "t8020"
+    },
+    "d37ap": {
+      "name": "iPhone 15",
+      "cpu": "A16 Bionic",
+      "platform": "t8120"
+    },
+    "d38ap": {
+      "name": "iPhone 15 Plus",
+      "cpu": "A16 Bionic",
+      "platform": "t8120"
+    },
+    "d421ap": {
+      "name": "iPhone 11 Pro",
+      "cpu": "A13 Bionic",
+      "platform": "t8030"
+    },
+    "d431ap": {
+      "name": "iPhone 11 Pro Max",
+      "cpu": "A13 Bionic",
+      "platform": "t8030"
+    },
+    "d47ap": {
+      "name": "iPhone 16",
+      "cpu": "A18 Pro",
+      "platform": "t8140"
+    },
+    "d48ap": {
+      "name": "iPhone 16 Plus",
+      "cpu": "A18 Pro",
+      "platform": "t8140"
+    },
+    "d49ap": {
+      "name": "iPhone SE (3rd generation)",
+      "cpu": "A15 Bionic",
+      "platform": "t8110"
+    },
+    "d52gap": {
+      "name": "iPhone 12 mini",
+      "cpu": "A14 Bionic",
+      "platform": "t8101"
+    },
+    "d53gap": {
+      "name": "iPhone 12",
+      "cpu": "A14 Bionic",
+      "platform": "t8101"
+    },
+    "d53pap": {
+      "name": "iPhone 12 Pro",
+      "cpu": "A14 Bionic",
+      "platform": "t8101"
+    },
+    "d54pap": {
+      "name": "iPhone 12 Pro Max",
+      "cpu": "A14 Bionic",
+      "platform": "t8101"
+    },
+    "d63ap": {
+      "name": "iPhone 13 Pro",
+      "cpu": "A15 Bionic",
+      "platform": "t8110"
+    },
+    "d64ap": {
+      "name": "iPhone 13 Pro Max",
+      "cpu": "A15 Bionic",
+      "platform": "t8110"
+    },
+    "d73ap": {
+      "name": "iPhone 14 Pro",
+      "cpu": "A16 Bionic",
+      "platform": "t8120"
+    },
+    "d74ap": {
+      "name": "iPhone 14 Pro Max",
+      "cpu": "A16 Bionic",
+      "platform": "t8120"
+    },
+    "d79ap": {
+      "name": "iPhone SE (2nd generation)",
+      "cpu": "A13 Bionic",
+      "platform": "t8030"
+    },
+    "d83ap": {
+      "name": "iPhone 15 Pro",
+      "cpu": "A17 Pro",
+      "platform": "t8130"
+    },
+    "d84ap": {
+      "name": "iPhone 15 Pro Max",
+      "cpu": "A17 Pro",
+      "platform": "t8130"
+    },
+    "d93ap": {
+      "name": "iPhone 16 Pro",
+      "cpu": "A18 Pro",
+      "platform": "t8140"
+    },
+    "d94ap": {
+      "name": "iPhone 16 Pro",
+      "cpu": "A18 Pro",
+      "platform": "t8140"
+    },
+    "j105aap": {
+      "name": "Apple TV 4K",
+      "cpu": "A10X Fusion",
+      "platform": "t8011"
+    },
+    "j120ap": {
+      "name": "iPad Pro (12.9-inch) (2nd generation)",
+      "cpu": "A10X Fusion",
+      "platform": "t8011",
+      "radio": "Wi-Fi"
+    },
+    "j121ap": {
+      "name": "iPad Pro (12.9-inch) (2nd generation)",
+      "cpu": "A10X Fusion",
+      "platform": "t8011",
+      "radio": "Cellular"
+    },
+    "j127ap": {
+      "name": "iPad Pro",
+      "cpu": "A9X",
+      "platform": "s8001",
+      "radio": "Wi-Fi"
+    },
+    "j128ap": {
+      "name": "iPad Pro",
+      "cpu": "A9X",
+      "platform": "s8001",
+      "radio": "Cellular"
+    },
+    "j171aap": {
+      "name": "iPad (8th generation)",
+      "cpu": "A12 Bionic",
+      "platform": "t8020",
+      "radio": "Wi-Fi"
+    },
+    "j171ap": {
+      "name": "iPad (7th generation)",
+      "cpu": "A10 Fusion",
+      "platform": "t8010",
+      "radio": "Wi-Fi"
+    },
+    "j172aap": {
+      "name": "iPad (8th generation)",
+      "cpu": "A12 Bionic",
+      "platform": "t8020",
+      "radio": "Cellular"
+    },
+    "j172ap": {
+      "name": "iPad (7th generation)",
+      "cpu": "A10 Fusion",
+      "platform": "t8010",
+      "radio": "Cellular"
+    },
+    "j180dap": {
+      "name": "Mac Pro (2023)",
+      "cpu": "M2 Ultra",
+      "platform": "t6022"
+    },
+    "j181ap": {
+      "name": "iPad",
+      "cpu": "A13 Bionic",
+      "platform": "t8030",
+      "radio": "Wi-Fi"
+    },
+    "j182ap": {
+      "name": "iPad",
+      "cpu": "A13 Bionic",
+      "platform": "t8030",
+      "radio": "Cellular"
+    },
+    "j1ap": {
+      "name": "iPad (3rd generation)",
+      "cpu": "A5X",
+      "platform": "s5l8945x",
+      "radio": "Wi-Fi"
+    },
+    "j207ap": {
+      "name": "iPad Pro (10.5-inch)",
+      "cpu": "A10X Fusion",
+      "platform": "t8011",
+      "radio": "Wi-Fi"
+    },
+    "j208ap": {
+      "name": "iPad Pro (10.5-inch)",
+      "cpu": "A10X Fusion",
+      "platform": "t8011",
+      "radio": "Cellular"
+    },
+    "j210ap": {
+      "name": "iPad mini (5th generation)",
+      "cpu": "A12 Bionic",
+      "platform": "t8020",
+      "radio": "Wi-Fi"
+    },
+    "j211ap": {
+      "name": "iPad mini (5th generation)",
+      "cpu": "A12 Bionic",
+      "platform": "t8020",
+      "radio": "Cellular"
+    },
+    "j217ap": {
+      "name": "iPad Air (3rd generation)",
+      "cpu": "A12 Bionic",
+      "platform": "t8020",
+      "radio": "Wi-Fi"
+    },
+    "j218ap": {
+      "name": "iPad Air (3rd generation)",
+      "cpu": "A12 Bionic",
+      "platform": "t8020",
+      "radio": "Cellular"
+    },
+    "j255ap": {
+      "name": "Apple TV 4K (3rd generation)",
+      "cpu": "A15 Bionic",
+      "platform": "t8110"
+    },
+    "j271ap": {
+      "name": "iPad (10th generation)",
+      "cpu": "A14 Bionic",
+      "platform": "t8101",
+      "radio": "Wi-Fi"
+    },
+    "j272ap": {
+      "name": "iPad (10th generation)",
+      "cpu": "A14 Bionic",
+      "platform": "t8101",
+      "radio": "Cellular"
+    },
+    "j273aap": {
+      "name": "Developer Transition Kit",
+      "cpu": "A12X/A12Z Bionic",
+      "platform": "t8027"
+    },
+    "j274ap": {
+      "name": "Mac mini (M1, 2020)",
+      "cpu": "M1",
+      "platform": "t8103"
+    },
+    "j293ap": {
+      "name": "MacBook Pro (13-inch, M1, 2020)",
+      "cpu": "M1",
+      "platform": "t8103"
+    },
+    "j2aap": {
+      "name": "iPad (3rd generation)",
+      "cpu": "A5X",
+      "platform": "s5l8945x",
+      "radio": "Cellular"
+    },
+    "j2ap": {
+      "name": "iPad (3rd generation)",
+      "cpu": "A5X",
+      "platform": "s5l8945x",
+      "radio": "Cellular"
+    },
+    "j305ap": {
+      "name": "Apple TV 4K (2nd generation)",
+      "cpu": "A12 Bionic",
+      "platform": "t8020"
+    },
+    "j307ap": {
+      "name": "iPad Air (4th generation)",
+      "cpu": "A14 Bionic",
+      "platform": "t8101",
+      "radio": "Wi-Fi"
+    },
+    "j308ap": {
+      "name": "iPad Air (4th generation)",
+      "cpu": "A14 Bionic",
+      "platform": "t8101",
+      "radio": "Cellular"
+    },
+    "j310ap": {
+      "name": "iPad mini",
+      "cpu": "A15 Bionic",
+      "platform": "t8110",
+      "radio": "Wi-Fi"
+    },
+    "j311ap": {
+      "name": "iPad mini",
+      "cpu": "A15 Bionic",
+      "platform": "t8110",
+      "radio": "Cellular"
+    },
+    "j313ap": {
+      "name": "MacBook Air (M1, 2020)",
+      "cpu": "M1",
+      "platform": "t8103"
+    },
+    "j314cap": {
+      "name": "MacBook Pro (14-inch, 2021)",
+      "cpu": "M1 Max",
+      "platform": "t6001"
+    },
+    "j314sap": {
+      "name": "MacBook Pro (14-inch, 2021)",
+      "cpu": "M1 Pro",
+      "platform": "t6000"
+    },
+    "j316cap": {
+      "name": "MacBook Pro (16-inch, 2021)",
+      "cpu": "M1 Max",
+      "platform": "t6001"
+    },
+    "j316sap": {
+      "name": "MacBook Pro (16-inch, 2021)",
+      "cpu": "M1 Pro",
+      "platform": "t6000"
+    },
+    "j317ap": {
+      "name": "iPad Pro (11-inch)",
+      "cpu": "A12X/A12Z Bionic",
+      "platform": "t8027",
+      "radio": "Wi-Fi"
+    },
+    "j317xap": {
+      "name": "iPad Pro (11-inch)",
+      "cpu": "A12X/A12Z Bionic",
+      "platform": "t8027",
+      "radio": "Wi-Fi"
+    },
+    "j318ap": {
+      "name": "iPad Pro (11-inch)",
+      "cpu": "A12X/A12Z Bionic",
+      "platform": "t8027",
+      "radio": "Cellular"
+    },
+    "j318xap": {
+      "name": "iPad Pro (11-inch)",
+      "cpu": "A12X/A12Z Bionic",
+      "platform": "t8027",
+      "radio": "Cellular"
+    },
+    "j320ap": {
+      "name": "iPad Pro (12.9-inch) (3rd generation)",
+      "cpu": "A12X/A12Z Bionic",
+      "platform": "t8027",
+      "radio": "Wi-Fi"
+    },
+    "j320xap": {
+      "name": "iPad Pro (12.9-inch) (3rd generation)",
+      "cpu": "A12X/A12Z Bionic",
+      "platform": "t8027",
+      "radio": "Wi-Fi"
+    },
+    "j321ap": {
+      "name": "iPad Pro (12.9-inch) (3rd generation)",
+      "cpu": "A12X/A12Z Bionic",
+      "platform": "t8027",
+      "radio": "Cellular"
+    },
+    "j321xap": {
+      "name": "iPad Pro (12.9-inch) (3rd generation)",
+      "cpu": "A12X/A12Z Bionic",
+      "platform": "t8027",
+      "radio": "Cellular"
+    },
+    "j327ap": {
+      "name": "Studio Display",
+      "cpu": "A13 Bionic",
+      "platform": "t8030"
+    },
+    "j375cap": {
+      "name": "Mac Studio",
+      "cpu": "M1 Max",
+      "platform": "t6001"
+    },
+    "j375dap": {
+      "name": "Mac Studio",
+      "cpu": "M1 Ultra",
+      "platform": "t6002"
+    },
+    "j407ap": {
+      "name": "iPad Air (5th generation)",
+      "cpu": "M1",
+      "platform": "t8103",
+      "radio": "Wi-Fi"
+    },
+    "j408ap": {
+      "name": "iPad Air (5th generation)",
+      "cpu": "M1",
+      "platform": "t8103",
+      "radio": "Cellular"
+    },
+    "j410ap": {
+      "name": "iPad mini (A17 Pro) [Wi-Fi]",
+      "cpu": "A17 Pro",
+      "platform": "t8130"
+    },
+    "j411ap": {
+      "name": "iPad mini (A17 Pro) [Wi-Fi + Cellular]",
+      "cpu": "A17 Pro",
+      "platform": "t8130"
+    },
+    "j413ap": {
+      "name": "MacBook Air (M2, 2022)",
+      "cpu": "M2",
+      "platform": "t8112"
+    },
+    "j414cap": {
+      "name": "MacBook Pro (14-inch, 2023)",
+      "cpu": "M2 Max",
+      "platform": "t6021"
+    },
+    "j414sap": {
+      "name": "MacBook Pro (14-inch, 2023)",
+      "cpu": "M2 Pro",
+      "platform": "t6020"
+    },
+    "j415ap": {
+      "name": "MacBook Air (15-inch, M2, 2023)",
+      "cpu": "M2",
+      "platform": "t8112"
+    },
+    "j416cap": {
+      "name": "MacBook Pro (16-inch, 2023)",
+      "cpu": "M2 Max",
+      "platform": "t6021"
+    },
+    "j416sap": {
+      "name": "MacBook Pro (16-inch, 2023)",
+      "cpu": "M2 Pro",
+      "platform": "t6020"
+    },
+    "j417ap": {
+      "name": "iPad Pro (11-inch) (2nd generation)",
+      "cpu": "A12X/A12Z Bionic",
+      "platform": "t8027",
+      "radio": "Wi-Fi"
+    },
+    "j418ap": {
+      "name": "iPad Pro (11-inch) (2nd generation)",
+      "cpu": "A12X/A12Z Bionic",
+      "platform": "t8027",
+      "radio": "Cellular"
+    },
+    "j420ap": {
+      "name": "iPad Pro (12.9-inch) (4th generation)",
+      "cpu": "A12X/A12Z Bionic",
+      "platform": "t8027",
+      "radio": "Wi-Fi"
+    },
+    "j421ap": {
+      "name": "iPad Pro (12.9-inch) (4th generation)",
+      "cpu": "A12X/A12Z Bionic",
+      "platform": "t8027",
+      "radio": "Cellular"
+    },
+    "j427ap": {
+      "name": "Studio Display XDR",
+      "cpu": "A19 Pro",
+      "platform": "t8150"
+    },
+    "j42dap": {
+      "name": "Apple TV",
+      "cpu": "A8",
+      "platform": "t7000"
+    },
+    "j433ap": {
+      "name": "iMac (24-inch, 2023)",
+      "cpu": "M3",
+      "platform": "t8122"
+    },
+    "j434ap": {
+      "name": "iMac (24-inch, 2023)",
+      "cpu": "M3",
+      "platform": "t8122"
+    },
+    "j456ap": {
+      "name": "iMac (24-inch, M1, 2021)",
+      "cpu": "M1",
+      "platform": "t8103"
+    },
+    "j457ap": {
+      "name": "iMac (24-inch, M1, 2021)",
+      "cpu": "M1",
+      "platform": "t8103"
+    },
+    "j473ap": {
+      "name": "Mac mini (2023)",
+      "cpu": "M2",
+      "platform": "t8112"
+    },
+    "j474sap": {
+      "name": "Mac mini (2023)",
+      "cpu": "M2 Pro",
+      "platform": "t6020"
+    },
+    "j475cap": {
+      "name": "Mac Studio (2023)",
+      "cpu": "M2 Max",
+      "platform": "t6021"
+    },
+    "j475dap": {
+      "name": "Mac Studio (2023)",
+      "cpu": "M2 Ultra",
+      "platform": "t6022"
+    },
+    "j481ap": {
+      "name": "iPad (A16)",
+      "cpu": "A16 Bionic",
+      "platform": "t8120",
+      "radio": "Wi-Fi"
+    },
+    "j482ap": {
+      "name": "iPad (A16)",
+      "cpu": "A16 Bionic",
+      "platform": "t8120",
+      "radio": "Cellular"
+    },
+    "j493ap": {
+      "name": "MacBook Pro (13-inch, M2, 2022)",
+      "cpu": "M2",
+      "platform": "t8112"
+    },
+    "j504ap": {
+      "name": "MacBook Pro (14-inch, Nov 2023)",
+      "cpu": "M3",
+      "platform": "t8122"
+    },
+    "j507ap": {
+      "name": "iPad Air 11-inch (M2)",
+      "cpu": "M2",
+      "platform": "t8112",
+      "radio": "Wi-Fi"
+    },
+    "j508ap": {
+      "name": "iPad Air 11-inch (M2)",
+      "cpu": "M2",
+      "platform": "t8112",
+      "radio": "Cellular"
+    },
+    "j514cap": {
+      "name": "MacBook Pro (14-inch, Nov 2023)",
+      "cpu": "M3 Max",
+      "platform": "t6031"
+    },
+    "j514map": {
+      "name": "MacBook Pro (14-inch, Nov 2023)",
+      "cpu": "M3 Max",
+      "platform": "t6034"
+    },
+    "j514sap": {
+      "name": "MacBook Pro (14-inch, Nov 2023)",
+      "cpu": "M3 Pro",
+      "platform": "t6030"
+    },
+    "j516cap": {
+      "name": "MacBook Pro (16-inch, Nov 2023)",
+      "cpu": "M3 Max",
+      "platform": "t6031"
+    },
+    "j516map": {
+      "name": "MacBook Pro (16-inch, Nov 2023)",
+      "cpu": "M3 Max",
+      "platform": "t6034"
+    },
+    "j516sap": {
+      "name": "MacBook Pro (16-inch, Nov 2023)",
+      "cpu": "M3 Pro",
+      "platform": "t6030"
+    },
+    "j517ap": {
+      "name": "iPad Pro (11-inch) (3rd generation)",
+      "cpu": "M1",
+      "platform": "t8103",
+      "radio": "Wi-Fi"
+    },
+    "j517xap": {
+      "name": "iPad Pro (11-inch) (3rd generation)",
+      "cpu": "M1",
+      "platform": "t8103",
+      "radio": "Wi-Fi"
+    },
+    "j518ap": {
+      "name": "iPad Pro (11-inch) (3rd generation)",
+      "cpu": "M1",
+      "platform": "t8103",
+      "radio": "Cellular"
+    },
+    "j518xap": {
+      "name": "iPad Pro (11-inch) (3rd generation)",
+      "cpu": "M1",
+      "platform": "t8103",
+      "radio": "Cellular"
+    },
+    "j522ap": {
+      "name": "iPad Pro (12.9-inch) (5th generation)",
+      "cpu": "M1",
+      "platform": "t8103",
+      "radio": "Wi-Fi"
+    },
+    "j522xap": {
+      "name": "iPad Pro (12.9-inch) (5th generation)",
+      "cpu": "M1",
+      "platform": "t8103",
+      "radio": "Wi-Fi"
+    },
+    "j523ap": {
+      "name": "iPad Pro (12.9-inch) (5th generation)",
+      "cpu": "M1",
+      "platform": "t8103",
+      "radio": "Cellular"
+    },
+    "j523xap": {
+      "name": "iPad Pro (12.9-inch) (5th generation)",
+      "cpu": "M1",
+      "platform": "t8103",
+      "radio": "Cellular"
+    },
+    "j527ap": {
+      "name": "Studio Display (2026)",
+      "cpu": "A19 Pro",
+      "platform": "t8150"
+    },
+    "j537ap": {
+      "name": "iPad Air 13-inch (M2)",
+      "cpu": "M2",
+      "platform": "t8112",
+      "radio": "Wi-Fi"
+    },
+    "j538ap": {
+      "name": "iPad Air 13-inch (M2)",
+      "cpu": "M2",
+      "platform": "t8112",
+      "radio": "Cellular"
+    },
+    "j575cap": {
+      "name": "Mac Studio (2025)",
+      "cpu": "M4 Max",
+      "platform": "t6041"
+    },
+    "j575dap": {
+      "name": "Mac Studio (2025)",
+      "cpu": "M3 Ultra",
+      "platform": "t6032"
+    },
+    "j604ap": {
+      "name": "MacBook Pro (14-inch, Nov 2024)",
+      "cpu": "M4",
+      "platform": "t8132"
+    },
+    "j607ap": {
+      "name": "iPad Air 11-inch (M3)",
+      "cpu": "M3",
+      "platform": "t8122",
+      "radio": "Wi-Fi"
+    },
+    "j608ap": {
+      "name": "iPad Air 11-inch (M3)",
+      "cpu": "M3",
+      "platform": "t8122",
+      "radio": "Cellular"
+    },
+    "j613ap": {
+      "name": "MacBook Air (13-inch, M3, 2024)",
+      "cpu": "M3",
+      "platform": "t8122"
+    },
+    "j614cap": {
+      "name": "MacBook Pro (14-inch, Nov 2024)",
+      "cpu": "M4 Max",
+      "platform": "t6041"
+    },
+    "j614sap": {
+      "name": "MacBook Pro (14-inch, Nov 2024)",
+      "cpu": "M4 Pro",
+      "platform": "t6040"
+    },
+    "j615ap": {
+      "name": "MacBook Air (15-inch, M3, 2024)",
+      "cpu": "M3",
+      "platform": "t8122"
+    },
+    "j616cap": {
+      "name": "MacBook Pro (16-inch, Nov 2024)",
+      "cpu": "M4 Max",
+      "platform": "t6041"
+    },
+    "j616sap": {
+      "name": "MacBook Pro (16-inch, Nov 2024)",
+      "cpu": "M4 Pro",
+      "platform": "t6040"
+    },
+    "j617ap": {
+      "name": "iPad Pro (11-inch) (4th generation)",
+      "cpu": "M2",
+      "platform": "t8112",
+      "radio": "Wi-Fi"
+    },
+    "j618ap": {
+      "name": "iPad Pro (11-inch) (4th generation)",
+      "cpu": "M2",
+      "platform": "t8112",
+      "radio": "Cellular"
+    },
+    "j620ap": {
+      "name": "iPad Pro (12.9-inch) (6th generation)",
+      "cpu": "M2",
+      "platform": "t8112",
+      "radio": "Wi-Fi"
+    },
+    "j621ap": {
+      "name": "iPad Pro (12.9-inch) (6th generation)",
+      "cpu": "M2",
+      "platform": "t8112",
+      "radio": "Cellular"
+    },
+    "j623ap": {
+      "name": "iMac (24-inch, 2024)",
+      "cpu": "M4",
+      "platform": "t8132"
+    },
+    "j624ap": {
+      "name": "iMac (24-inch, 2024)",
+      "cpu": "M4",
+      "platform": "t8132"
+    },
+    "j637ap": {
+      "name": "iPad Air 13-inch (M3)",
+      "cpu": "M3",
+      "platform": "t8122",
+      "radio": "Wi-Fi"
+    },
+    "j638ap": {
+      "name": "iPad Air 13-inch (M3)",
+      "cpu": "M3",
+      "platform": "t8122",
+      "radio": "Cellular"
+    },
+    "j700ap": {
+      "name": "MacBook Neo",
+      "cpu": "A18 Pro",
+      "platform": "t8140"
+    },
+    "j704ap": {
+      "name": "MacBook Pro (14-inch, M5)",
+      "cpu": "M5",
+      "platform": "t8142"
+    },
+    "j707ap": {
+      "name": "iPad Air 11-inch (M4) [Wi-Fi]",
+      "cpu": "M4",
+      "platform": "t8132"
+    },
+    "j708ap": {
+      "name": "iPad Air 11-inch (M4) [Wi-Fi + Cellular]",
+      "cpu": "M4",
+      "platform": "t8132"
+    },
+    "j713ap": {
+      "name": "MacBook Air (13-inch, M4, 2025)",
+      "cpu": "M4",
+      "platform": "t8132"
+    },
+    "j714cap": {
+      "name": "MacBook Pro (14-inch, M5 Max)",
+      "cpu": "M5 Max",
+      "platform": "t6060"
+    },
+    "j714sap": {
+      "name": "MacBook Pro (14-inch, M5 Pro)",
+      "cpu": "M5 Pro",
+      "platform": "t6050"
+    },
+    "j715ap": {
+      "name": "MacBook Air (15-inch, M4, 2025)",
+      "cpu": "M4",
+      "platform": "t8132"
+    },
+    "j716cap": {
+      "name": "MacBook Pro (16-inch, M5 Max)",
+      "cpu": "M5 Max",
+      "platform": "t6060"
+    },
+    "j716sap": {
+      "name": "MacBook Pro (16-inch, M5 Pro)",
+      "cpu": "M5 Pro",
+      "platform": "t6050"
+    },
+    "j717ap": {
+      "name": "iPad Pro 11-inch (M4)",
+      "cpu": "M4",
+      "platform": "t8132",
+      "radio": "Wi-Fi"
+    },
+    "j718ap": {
+      "name": "iPad Pro 11-inch (M4)",
+      "cpu": "M4",
+      "platform": "t8132",
+      "radio": "Cellular"
+    },
+    "j71bap": {
+      "name": "iPad (6th generation)",
+      "cpu": "A10 Fusion",
+      "platform": "t8010",
+      "radio": "Wi-Fi"
+    },
+    "j71sap": {
+      "name": "iPad (5th generation)",
+      "cpu": "A9",
+      "platform": "s8000",
+      "radio": "Wi-Fi"
+    },
+    "j71tap": {
+      "name": "iPad (5th generation)",
+      "cpu": "A9",
+      "platform": "s8003",
+      "radio": "Wi-Fi"
+    },
+    "j720ap": {
+      "name": "iPad Pro 13-inch (M4)",
+      "cpu": "M4",
+      "platform": "t8132",
+      "radio": "Wi-Fi"
+    },
+    "j721ap": {
+      "name": "iPad Pro 13-inch (M4)",
+      "cpu": "M4",
+      "platform": "t8132",
+      "radio": "Cellular"
+    },
+    "j72ap": {
+      "name": "iPad Air",
+      "cpu": "A7",
+      "platform": "s5l8960x",
+      "radio": "Cellular"
+    },
+    "j72bap": {
+      "name": "iPad (6th generation)",
+      "cpu": "A10 Fusion",
+      "platform": "t8010",
+      "radio": "Cellular"
+    },
+    "j72j71ap": {
+      "name": "iPad Air",
+      "cpu": "A7",
+      "platform": "s5l8960x",
+      "radio": "Wi-Fi"
+    },
+    "j72j73ap": {
+      "name": "iPad Air",
+      "cpu": "A7",
+      "platform": "s5l8960x",
+      "radio": "Cellular"
+    },
+    "j72sap": {
+      "name": "iPad (5th generation)",
+      "cpu": "A9",
+      "platform": "s8000",
+      "radio": "Cellular"
+    },
+    "j72tap": {
+      "name": "iPad (5th generation)",
+      "cpu": "A9",
+      "platform": "s8003",
+      "radio": "Cellular"
+    },
+    "j737ap": {
+      "name": "iPad Air 13-inch (M4) [Wi-Fi]",
+      "cpu": "M4",
+      "platform": "t8132"
+    },
+    "j738ap": {
+      "name": "iPad Air 13-inch (M4) [Wi-Fi + Cellular]",
+      "cpu": "M4",
+      "platform": "t8132"
+    },
+    "j773gap": {
+      "name": "Mac mini (2024)",
+      "cpu": "M4",
+      "platform": "t8132"
+    },
+    "j773sap": {
+      "name": "Mac mini (2024)",
+      "cpu": "M4 Pro",
+      "platform": "t6040"
+    },
+    "j813ap": {
+      "name": "MacBook Air (13-inch, M5)",
+      "cpu": "M5",
+      "platform": "t8142"
+    },
+    "j815ap": {
+      "name": "MacBook Air (15-inch, M5)",
+      "cpu": "M5",
+      "platform": "t8142"
+    },
+    "j817ap": {
+      "name": "iPad Pro 11-inch (M5) [Wi-Fi]",
+      "cpu": "M5",
+      "platform": "t8142"
+    },
+    "j818ap": {
+      "name": "iPad Pro 11-inch (M5) [Wi-Fi + Cellular]",
+      "cpu": "M5",
+      "platform": "t8142"
+    },
+    "j820ap": {
+      "name": "iPad Pro 13-inch (M5) [Wi-Fi]",
+      "cpu": "M5",
+      "platform": "t8142"
+    },
+    "j821ap": {
+      "name": "iPad Pro 13-inch (M5) [Wi-Fi + Cellular]",
+      "cpu": "M5",
+      "platform": "t8142"
+    },
+    "j82ap": {
+      "name": "iPad Air 2",
+      "cpu": "A8X",
+      "platform": "t7001",
+      "radio": "Cellular"
+    },
+    "j82j81ap": {
+      "name": "iPad Air 2",
+      "cpu": "A8X",
+      "platform": "t7001",
+      "radio": "Wi-Fi"
+    },
+    "j85ap": {
+      "name": "iPad mini 2",
+      "cpu": "A7",
+      "platform": "s5l8960x",
+      "radio": "Wi-Fi"
+    },
+    "j85j86ap": {
+      "name": "iPad mini 2",
+      "cpu": "A7",
+      "platform": "s5l8960x",
+      "radio": "Cellular"
+    },
+    "j85j86map": {
+      "name": "iPad mini 3",
+      "cpu": "A7",
+      "platform": "s5l8960x",
+      "radio": "Cellular"
+    },
+    "j85j87ap": {
+      "name": "iPad mini 2",
+      "cpu": "A7",
+      "platform": "s5l8960x",
+      "radio": "Cellular"
+    },
+    "j85j87map": {
+      "name": "iPad mini 3",
+      "cpu": "A7",
+      "platform": "s5l8960x",
+      "radio": "Cellular"
+    },
+    "j85map": {
+      "name": "iPad mini 3",
+      "cpu": "A7",
+      "platform": "s5l8960x",
+      "radio": "Wi-Fi"
+    },
+    "j96ap": {
+      "name": "iPad mini 4",
+      "cpu": "A8",
+      "platform": "t7000",
+      "radio": "Wi-Fi"
+    },
+    "j96j97ap": {
+      "name": "iPad mini 4",
+      "cpu": "A8",
+      "platform": "t7000",
+      "radio": "Cellular"
+    },
+    "j98aap": {
+      "name": "iPad Pro",
+      "cpu": "A9X",
+      "platform": "s8001",
+      "radio": "Wi-Fi"
+    },
+    "j99aap": {
+      "name": "iPad Pro",
+      "cpu": "A9X",
+      "platform": "s8001",
+      "radio": "Cellular"
+    },
+    "k48ap": {
+      "name": "iPad",
+      "platform": "s5l8930x",
+      "radio": "Wi-Fi"
+    },
+    "k66ap": {
+      "name": "Apple TV 2G",
+      "platform": "s5l8930x"
+    },
+    "k93aap": {
+      "name": "iPad 2",
+      "cpu": "A5",
+      "platform": "s5l8942x",
+      "radio": "Wi-Fi"
+    },
+    "k93ap": {
+      "name": "iPad 2",
+      "cpu": "A5",
+      "platform": "s5l8940x",
+      "radio": "Wi-Fi"
+    },
+    "k94ap": {
+      "name": "iPad 2",
+      "cpu": "A5",
+      "platform": "s5l8940x",
+      "radio": "Cellular"
+    },
+    "k95ap": {
+      "name": "iPad 2",
+      "cpu": "A5",
+      "platform": "s5l8940x",
+      "radio": "Cellular"
+    },
+    "m68ap": {
+      "name": "iPhone",
+      "platform": "s5l8900x"
+    },
+    "n102ap": {
+      "name": "iPod touch",
+      "cpu": "A8",
+      "platform": "t7000"
+    },
+    "n104ap": {
+      "name": "iPhone 11",
+      "cpu": "A13 Bionic",
+      "platform": "t8030"
+    },
+    "n111bap": {
+      "name": "Apple Watch Series 3 (GPS + Cellular) 42mm",
+      "cpu": "S3 Non-LTE and LTE",
+      "platform": "t8004",
+      "radio": "GPS + Cellular"
+    },
+    "n111sap": {
+      "name": "Apple Watch Series 3 (GPS + Cellular) 38mm",
+      "cpu": "S3 Non-LTE and LTE",
+      "platform": "t8004",
+      "radio": "GPS + Cellular"
+    },
+    "n112ap": {
+      "name": "iPod touch",
+      "cpu": "A10 Fusion",
+      "platform": "t8010"
+    },
+    "n121bap": {
+      "name": "Apple Watch Series 3 (GPS) 42mm",
+      "cpu": "S3 Non-LTE and LTE",
+      "platform": "t8004"
+    },
+    "n121sap": {
+      "name": "Apple Watch Series 3 (GPS) 38mm",
+      "cpu": "S3 Non-LTE and LTE",
+      "platform": "t8004"
+    },
+    "n131bap": {
+      "name": "Apple Watch Series 4",
+      "cpu": "S4 Non-LTE and LTE",
+      "platform": "t8006",
+      "radio": "GPS"
+    },
+    "n131sap": {
+      "name": "Apple Watch Series 4",
+      "cpu": "S4 Non-LTE and LTE",
+      "platform": "t8006",
+      "radio": "GPS"
+    },
+    "n140bap": {
+      "name": "Apple Watch SE (GPS)",
+      "cpu": "S4 Non-LTE and LTE",
+      "platform": "t8006"
+    },
+    "n140sap": {
+      "name": "Apple Watch SE (GPS)",
+      "cpu": "S4 Non-LTE and LTE",
+      "platform": "t8006"
+    },
+    "n141bap": {
+      "name": "Apple Watch Series 4",
+      "cpu": "S4 Non-LTE and LTE",
+      "platform": "t8006",
+      "radio": "GPS + Cellular"
+    },
+    "n141sap": {
+      "name": "Apple Watch Series 4",
+      "cpu": "S4 Non-LTE and LTE",
+      "platform": "t8006",
+      "radio": "GPS + Cellular"
+    },
+    "n142bap": {
+      "name": "Apple Watch SE (GPS + Cellular)",
+      "cpu": "S4 Non-LTE and LTE",
+      "platform": "t8006",
+      "radio": "GPS + Cellular"
+    },
+    "n142sap": {
+      "name": "Apple Watch SE (GPS + Cellular)",
+      "cpu": "S4 Non-LTE and LTE",
+      "platform": "t8006",
+      "radio": "GPS + Cellular"
+    },
+    "n143bap": {
+      "name": "Apple Watch SE (GPS)",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301"
+    },
+    "n143sap": {
+      "name": "Apple Watch SE (GPS)",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301"
+    },
+    "n144bap": {
+      "name": "Apple Watch Series 5",
+      "cpu": "S4 Non-LTE and LTE",
+      "platform": "t8006",
+      "radio": "GPS"
+    },
+    "n144sap": {
+      "name": "Apple Watch Series 5",
+      "cpu": "S4 Non-LTE and LTE",
+      "platform": "t8006",
+      "radio": "GPS"
+    },
+    "n146bap": {
+      "name": "Apple Watch Series 5",
+      "cpu": "S4 Non-LTE and LTE",
+      "platform": "t8006",
+      "radio": "GPS + Cellular"
+    },
+    "n146sap": {
+      "name": "Apple Watch Series 5",
+      "cpu": "S4 Non-LTE and LTE",
+      "platform": "t8006",
+      "radio": "GPS + Cellular"
+    },
+    "n149bap": {
+      "name": "Apple Watch SE (GPS + Cellular)",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301",
+      "radio": "GPS + Cellular"
+    },
+    "n149sap": {
+      "name": "Apple Watch SE (GPS + Cellular)",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301",
+      "radio": "GPS + Cellular"
+    },
+    "n157bap": {
+      "name": "Apple Watch Series 6 (GPS)",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301"
+    },
+    "n157sap": {
+      "name": "Apple Watch Series 6 (GPS)",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301"
+    },
+    "n158bap": {
+      "name": "Apple Watch Series 6 (GPS + Cellular)",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301",
+      "radio": "GPS + Cellular"
+    },
+    "n158sap": {
+      "name": "Apple Watch Series 6 (GPS + Cellular)",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301",
+      "radio": "GPS + Cellular"
+    },
+    "n187bap": {
+      "name": "Apple Watch Series 7 (GPS)",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301"
+    },
+    "n187sap": {
+      "name": "Apple Watch Series 7 (GPS)",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301"
+    },
+    "n188bap": {
+      "name": "Apple Watch Series 7 (GPS + Cellular)",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301",
+      "radio": "GPS + Cellular"
+    },
+    "n188sap": {
+      "name": "Apple Watch Series 7 (GPS + Cellular)",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301",
+      "radio": "GPS + Cellular"
+    },
+    "n18ap": {
+      "name": "iPod touch",
+      "platform": "s5l8922x"
+    },
+    "n197bap": {
+      "name": "Apple Watch Series 8 (GPS)",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301"
+    },
+    "n197sap": {
+      "name": "Apple Watch Series 8 (GPS)",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301"
+    },
+    "n198bap": {
+      "name": "Apple Watch Series 8 (GPS + Cellular)",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301",
+      "radio": "GPS + Cellular"
+    },
+    "n198sap": {
+      "name": "Apple Watch Series 8 (GPS + Cellular)",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301",
+      "radio": "GPS + Cellular"
+    },
+    "n199ap": {
+      "name": "Apple Watch Ultra",
+      "cpu": "S6/S7/S8",
+      "platform": "t8301",
+      "radio": "GPS + Cellular"
+    },
+    "n207bap": {
+      "name": "Apple Watch Series 9 (GPS)",
+      "cpu": "S9/S10",
+      "platform": "t8310"
+    },
+    "n207sap": {
+      "name": "Apple Watch Series 9 (GPS)",
+      "cpu": "S9/S10",
+      "platform": "t8310"
+    },
+    "n208bap": {
+      "name": "Apple Watch Series 9 (GPS + Cellular)",
+      "cpu": "S9/S10",
+      "platform": "t8310",
+      "radio": "GPS + Cellular"
+    },
+    "n208sap": {
+      "name": "Apple Watch Series 9 (GPS + Cellular)",
+      "cpu": "S9/S10",
+      "platform": "t8310",
+      "radio": "GPS + Cellular"
+    },
+    "n210ap": {
+      "name": "Apple Watch Ultra 2",
+      "cpu": "S9/S10",
+      "platform": "t8310",
+      "radio": "GPS + Cellular"
+    },
+    "n217bap": {
+      "name": "Apple Watch Series 10 (GPS)",
+      "cpu": "S10",
+      "platform": "t8310"
+    },
+    "n217sap": {
+      "name": "Apple Watch Series 10 (GPS)",
+      "cpu": "S10",
+      "platform": "t8310"
+    },
+    "n218bap": {
+      "name": "Apple Watch Series 10 (GPS + Cellular)",
+      "cpu": "S10",
+      "platform": "t8310",
+      "radio": "GPS"
+    },
+    "n218sap": {
+      "name": "Apple Watch Series 10 (GPS + Cellular)",
+      "cpu": "S10",
+      "platform": "t8310",
+      "radio": "GPS"
+    },
+    "n227bap": {
+      "name": "Apple Watch Series 11 (GPS)",
+      "cpu": "S9/S10",
+      "platform": "t8310"
+    },
+    "n227sap": {
+      "name": "Apple Watch Series 11 (GPS)",
+      "cpu": "S9/S10",
+      "platform": "t8310"
+    },
+    "n228bap": {
+      "name": "Apple Watch Series 11 (GPS + Cellular)",
+      "cpu": "S9/S10",
+      "platform": "t8310"
+    },
+    "n228sap": {
+      "name": "Apple Watch Series 11 (GPS + Cellular)",
+      "cpu": "S9/S10",
+      "platform": "t8310"
+    },
+    "n230ap": {
+      "name": "Apple Watch Ultra 3",
+      "cpu": "S9/S10",
+      "platform": "t8310"
+    },
+    "n237bap": {
+      "name": "Apple Watch Series 12"
+    },
+    "n237sap": {
+      "name": "Apple Watch Series 12"
+    },
+    "n238bap": {
+      "name": "Apple Watch Series 12"
+    },
+    "n238sap": {
+      "name": "Apple Watch Series 12"
+    },
+    "n240ap": {
+      "name": "Apple Watch Ultra 4"
+    },
+    "n243bap": {
+      "name": "Apple Watch SE 3 (GPS)",
+      "cpu": "S9/S10",
+      "platform": "t8310"
+    },
+    "n243sap": {
+      "name": "Apple Watch SE 3 (GPS)",
+      "cpu": "S9/S10",
+      "platform": "t8310"
+    },
+    "n244bap": {
+      "name": "Apple Watch SE 3 (GPS + Cellular)",
+      "cpu": "S9/S10",
+      "platform": "t8310"
+    },
+    "n244sap": {
+      "name": "Apple Watch SE 3 (GPS + Cellular)",
+      "cpu": "S9/S10",
+      "platform": "t8310"
+    },
+    "n27aap": {
+      "name": "Apple Watch (1st generation) 38mm",
+      "cpu": "S1",
+      "platform": "s7002"
+    },
+    "n27dap": {
+      "name": "Apple Watch Series 1 38mm",
+      "cpu": "S1P",
+      "platform": "t8002"
+    },
+    "n27n28aap": {
+      "name": "Apple Watch (1st generation) 42mm",
+      "cpu": "S1",
+      "platform": "s7002"
+    },
+    "n28dap": {
+      "name": "Apple Watch Series 1 42mm",
+      "cpu": "S1P",
+      "platform": "t8002"
+    },
+    "n301aap": {
+      "name": "Apple Vision Pro (M5)",
+      "cpu": "M5",
+      "platform": "t8142"
+    },
+    "n301ap": {
+      "name": "Apple Vision Pro",
+      "cpu": "M2",
+      "platform": "t8112"
+    },
+    "n41ap": {
+      "name": "iPhone 5",
+      "cpu": "A6",
+      "platform": "s5l8950x"
+    },
+    "n42ap": {
+      "name": "iPhone 5",
+      "cpu": "A6",
+      "platform": "s5l8950x"
+    },
+    "n45ap": {
+      "name": "iPod touch",
+      "platform": "s5l8900x"
+    },
+    "n48ap": {
+      "name": "iPhone 5c",
+      "cpu": "A6",
+      "platform": "s5l8950x"
+    },
+    "n49ap": {
+      "name": "iPhone 5c",
+      "cpu": "A6",
+      "platform": "s5l8950x"
+    },
+    "n51ap": {
+      "name": "iPhone 5s",
+      "cpu": "A7",
+      "platform": "s5l8960x"
+    },
+    "n51n53ap": {
+      "name": "iPhone 5s",
+      "cpu": "A7",
+      "platform": "s5l8960x"
+    },
+    "n56ap": {
+      "name": "iPhone 6 Plus",
+      "cpu": "A8",
+      "platform": "t7000"
+    },
+    "n61ap": {
+      "name": "iPhone 6",
+      "cpu": "A8",
+      "platform": "t7000"
+    },
+    "n66ap": {
+      "name": "iPhone 6s Plus",
+      "cpu": "A9",
+      "platform": "s8000"
+    },
+    "n66map": {
+      "name": "iPhone 6s Plus",
+      "cpu": "A9",
+      "platform": "s8003"
+    },
+    "n69ap": {
+      "name": "iPhone SE (1st generation)",
+      "cpu": "A9",
+      "platform": "s8003"
+    },
+    "n69uap": {
+      "name": "iPhone SE (1st generation)",
+      "cpu": "A9",
+      "platform": "s8000"
+    },
+    "n71ap": {
+      "name": "iPhone 6s",
+      "cpu": "A9",
+      "platform": "s8000"
+    },
+    "n71map": {
+      "name": "iPhone 6s",
+      "cpu": "A9",
+      "platform": "s8003"
+    },
+    "n72ap": {
+      "name": "iPod touch",
+      "platform": "s5l8720x"
+    },
+    "n74ap": {
+      "name": "Apple Watch Series 2 38mm",
+      "cpu": "S1P",
+      "platform": "t8002"
+    },
+    "n75ap": {
+      "name": "Apple Watch Series 2 42mm",
+      "cpu": "S1P",
+      "platform": "t8002"
+    },
+    "n78ap": {
+      "name": "iPod touch",
+      "cpu": "A5",
+      "platform": "s5l8942x"
+    },
+    "n81ap": {
+      "name": "iPod touch",
+      "platform": "s5l8930x"
+    },
+    "n82ap": {
+      "name": "iPhone 3G",
+      "platform": "s5l8900x"
+    },
+    "n841ap": {
+      "name": "iPhone XR",
+      "cpu": "A12 Bionic",
+      "platform": "t8020"
+    },
+    "n88ap": {
+      "name": "iPhone 3GS",
+      "platform": "s5l8920x"
+    },
+    "n90ap": {
+      "name": "iPhone 4 (GSM)",
+      "platform": "s5l8930x"
+    },
+    "n90bap": {
+      "name": "iPhone 4 (GSM / 2012)",
+      "platform": "s5l8930x"
+    },
+    "n92ap": {
+      "name": "iPhone 4 (CDMA)",
+      "platform": "s5l8930x"
+    },
+    "n94ap": {
+      "name": "iPhone 4S",
+      "cpu": "A5",
+      "platform": "s5l8940x"
+    },
+    "p101ap": {
+      "name": "iPad",
+      "cpu": "A6X",
+      "platform": "s5l8955x",
+      "radio": "Wi-Fi"
+    },
+    "p102ap": {
+      "name": "iPad",
+      "cpu": "A6X",
+      "platform": "s5l8955x",
+      "radio": "Cellular"
+    },
+    "p103ap": {
+      "name": "iPad",
+      "cpu": "A6X",
+      "platform": "s5l8955x",
+      "radio": "Cellular"
+    },
+    "p105ap": {
+      "name": "iPad mini",
+      "cpu": "A5",
+      "platform": "s5l8942x",
+      "radio": "Wi-Fi"
+    },
+    "p106ap": {
+      "name": "iPad mini",
+      "cpu": "A5",
+      "platform": "s5l8942x",
+      "radio": "Cellular"
+    },
+    "p107ap": {
+      "name": "iPad mini",
+      "cpu": "A5",
+      "platform": "s5l8942x",
+      "radio": "Cellular"
+    },
+    "rprod300ap": {
+      "name": "Virtual N301",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "t2011ap": {
+      "name": "MacBookPro xxx",
+      "cpu": "M3 Pro",
+      "platform": "t6030"
+    },
+    "t2030ap": {
+      "name": "iPhone 15 Pro",
+      "cpu": "A17 Pro",
+      "platform": "t8130"
+    },
+    "t365ap": {
+      "name": "iPad Pro XXX (T365)",
+      "cpu": "A10X Fusion",
+      "platform": "t8011"
+    },
+    "t366ap": {
+      "name": "iPad Pro XXX (T366)",
+      "cpu": "A10X Fusion",
+      "platform": "t8011",
+      "radio": "Cellular"
+    },
+    "t367ap": {
+      "name": "iPad Pro XXX (T367)",
+      "cpu": "A10X Fusion",
+      "platform": "t8011"
+    },
+    "t368ap": {
+      "name": "iPad Pro XXX (T368)",
+      "cpu": "A10X Fusion",
+      "platform": "t8011",
+      "radio": "Cellular"
+    },
+    "v159ap": {
+      "name": "iPhone 17e",
+      "cpu": "A19 Pro",
+      "platform": "t8150"
+    },
+    "v53ap": {
+      "name": "iPhone 17 Pro",
+      "cpu": "A19 Pro",
+      "platform": "t8150"
+    },
+    "v54ap": {
+      "name": "iPhone 17 Pro Max",
+      "cpu": "A19 Pro",
+      "platform": "t8150"
+    },
+    "v57ap": {
+      "name": "iPhone 17",
+      "cpu": "A19 Pro",
+      "platform": "t8150"
+    },
+    "v59ap": {
+      "name": "iPhone 16e",
+      "cpu": "A18 Pro",
+      "platform": "t8140"
+    },
+    "v63ap": {
+      "name": "iPhone 18 Pro"
+    },
+    "v64ap": {
+      "name": "iPhone 18 Pro Max"
+    },
+    "v64sap": {
+      "name": "iPhone 18 Pro Max"
+    },
+    "vappletv300ap": {
+      "name": "Virtual AppleTV",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "vappletv400ap": {
+      "name": "Virtual AppleTV with internal Apple ISA extensions",
+      "cpu": "VCPU",
+      "platform": "vminternal4"
+    },
+    "vapplewatch300ap": {
+      "name": "Virtual Apple Watch",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "vapplewatch350ap": {
+      "name": "Virtual Apple Watch",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "vapplewatch400ap": {
+      "name": "Virtual Apple Watch SoC",
+      "cpu": "VCPU",
+      "platform": "vminternal4"
+    },
+    "vhomepod300ap": {
+      "name": "Virtual HomePod",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "vhomepod400ap": {
+      "name": "Virtual HomePod with internal Apple ISA extensions",
+      "cpu": "VCPU",
+      "platform": "vminternal4"
+    },
+    "vma2iosap": {
+      "name": "virtual machine for ARM-v8.4 with Apple Silicon extensions",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "vma2macosap": {
+      "name": "virtual machine for ARM-v8.4 with Apple Silicon extensions",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "vmac300ap": {
+      "name": "virtual machine for ARM-v8.4 with Apple Silicon extensions",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "vmac400ap": {
+      "name": "virtual Mac with internal Apple ISA extensions",
+      "cpu": "VCPU",
+      "platform": "vminternal4"
+    },
+    "vpad201ap": {
+      "name": "Virtual iPad Pro 12.9 inch",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "vpad202ap": {
+      "name": "Virtual iPad Pro 11 inch",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "vpad203ap": {
+      "name": "Virtual iPad mini",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "vpad300ap": {
+      "name": "Virtual iPad Pro 12.9 inch",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "vpad400ap": {
+      "name": "Virtual iPad Pro 12.9 inch",
+      "cpu": "VCPU",
+      "platform": "vminternal4"
+    },
+    "vphone201ap": {
+      "name": "Virtual iPhone mini",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "vphone202ap": {
+      "name": "Virtual iPhone",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "vphone203ap": {
+      "name": "Virtual iPhone Pro Max",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "vphone204ap": {
+      "name": "Virtual iPhone SE",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "vphone300ap": {
+      "name": "Virtual iPhone Pro Max",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "vphone350ap": {
+      "name": "Virtual iPhone Pro Max",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    },
+    "vphone400ap": {
+      "name": "Virtual iPhone Pro Max",
+      "cpu": "VCPU",
+      "platform": "vminternal4"
+    },
+    "vphone600ap": {
+      "name": "virtual machine for iPhone Research Environment",
+      "cpu": "vresearch1",
+      "platform": "vresearch1"
+    },
+    "vprod201ap": {
+      "name": "RealityDevice99,1 virtual machine for ARM-v8.4 with Apple Silicon extensions",
+      "cpu": "VCPU",
+      "platform": "vmapple2"
+    }
+  },
+  "platforms": {
+    "s5l8940x": "A5",
+    "s5l8942x": "A5",
+    "s5l8945x": "A5X",
+    "s5l8950x": "A6",
+    "s5l8955x": "A6X",
+    "s5l8960x": "A7",
+    "s7002": "S1",
+    "s8000": "A9",
+    "s8001": "A9X",
+    "s8003": "A9",
+    "t2002": "H1",
+    "t2016": "H2",
+    "t6000": "M1 Pro",
+    "t6001": "M1 Max",
+    "t6002": "M1 Ultra",
+    "t6020": "M2 Pro",
+    "t6021": "M2 Max",
+    "t6022": "M2 Ultra",
+    "t6030": "M3 Pro",
+    "t6031": "M3 Max",
+    "t6032": "M3 Ultra",
+    "t6034": "M3 Max",
+    "t6040": "M4 Pro",
+    "t6041": "M4 Max",
+    "t6050": "M5 Pro",
+    "t6060": "M5 Max",
+    "t7000": "A8",
+    "t7001": "A8X",
+    "t8002": "S1P",
+    "t8004": "S3 Non-LTE and LTE",
+    "t8006": "S4 Non-LTE and LTE",
+    "t8010": "A10 Fusion",
+    "t8011": "A10X Fusion",
+    "t8015": "A11 Bionic",
+    "t8020": "A12 Bionic",
+    "t8027": "A12X/A12Z Bionic",
+    "t8030": "A13 Bionic",
+    "t8101": "A14 Bionic",
+    "t8103": "M1",
+    "t8110": "A15 Bionic",
+    "t8112": "M2",
+    "t8120": "A16 Bionic",
+    "t8122": "M3",
+    "t8130": "A17 Pro",
+    "t8132": "M4",
+    "t8140": "A18 Pro",
+    "t8142": "M5",
+    "t8150": "A19 Pro",
+    "t8301": "S6/S7/S8",
+    "vmapple2": "VCPU",
+    "vminternal4": "VCPU",
+    "vresearch1": "vresearch1"
+  }
+}

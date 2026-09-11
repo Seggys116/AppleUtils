@@ -631,7 +631,7 @@ mod tests {
             });
         let text = render_text(&mut app, 100, 32);
         assert!(text.contains("Mac mini (M1, 2020)"), "{text}");
-        assert!(text.contains("MacBook Pro 13-inch (M1, 2020)"), "{text}");
+        assert!(text.contains("MacBook Pro (13-inch, M1, 2020)"), "{text}");
         assert!(text.contains("j274ap"), "{text}");
         assert!(text.contains("j293ap"), "{text}");
         assert!(!text.contains("waiting for"), "{text}");

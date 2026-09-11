@@ -1353,15 +1353,20 @@ impl ServiceWorker {
                 accepted.expected_hash = None;
             }
         }
+        self.emit(RecoveryEvent::Progress(RestoreProgress {
+            stage: "reading".into(),
+            detail: BUILD_MANIFEST_FILE_NAME.to_string(),
+            fraction: None,
+        }));
         let dict = load_build_manifest(&build_manifest).map_err(|error| error.to_string())?;
-        let identities = crate::ramrod::all_build_identities(&dict);
-        if identities.is_empty() {
+        let classes = crate::ramrod::installable_device_classes(&dict);
+        if classes.is_empty() {
             return Err("BuildManifest.plist carries no build identities".into());
         }
         let catalog = load_restore_catalog(&root);
-        let systems = compatible_systems_from(&identities, catalog.as_ref());
+        let systems = compatible_systems_from(classes, catalog.as_ref());
         if systems.is_empty() {
-            return Err("this restore set names no Macs".into());
+            return Err("this restore set names no devices".into());
         }
         let (product_version, product_build) = catalog
             .as_ref()
@@ -3206,12 +3211,12 @@ fn identities_for_board(
     device_class: &str,
     behavior: RestoreBehavior,
 ) -> Result<Vec<BuildIdentity>, String> {
-    let macos = select_macos_identity(dict, device_class)
-        .ok_or_else(|| format!("BuildManifest.plist has no macOS identity for {device_class}"))?;
     let install =
         select_install_identity(dict, device_class, behavior).map_err(|error| error.to_string())?;
     let mut identities = vec![install];
-    if identities[0].index != macos.index {
+    if let Some(macos) = select_macos_identity(dict, device_class)
+        && identities[0].index != macos.index
+    {
         identities.push(macos);
     }
     Ok(identities)
@@ -3248,19 +3253,13 @@ fn product_version_from_manifest(dict: &plist::Dictionary) -> (Option<String>, O
 }
 
 fn compatible_systems_from(
-    identities: &[BuildIdentity],
+    classes: Vec<String>,
     catalog: Option<&crate::ramrod::RestoreCatalog>,
 ) -> Vec<crate::recovery_model::CompatibleSystem> {
-    let mut classes = BTreeSet::new();
-    for identity in identities {
-        if identity.variant.contains(crate::ramrod::RESEARCH_MARKER) {
-            continue;
-        }
-        if identity.device_class.trim().is_empty() {
-            continue;
-        }
-        classes.insert(identity.device_class.clone());
-    }
+    let classes = classes
+        .into_iter()
+        .filter(|class| !class.trim().is_empty())
+        .collect::<BTreeSet<_>>();
     let mapped = catalog
         .filter(|catalog| !catalog.boards.is_empty())
         .map(|catalog| {
@@ -3272,18 +3271,13 @@ fn compatible_systems_from(
         });
     let mut classes: Vec<String> = match mapped {
         Some(map) => {
+            let fallback = classes.clone();
             let intersect: Vec<String> = classes
                 .into_iter()
                 .filter(|class| map.contains(&class.to_ascii_lowercase()))
                 .collect();
             if intersect.is_empty() {
-                identities
-                    .iter()
-                    .filter(|identity| !identity.variant.contains(crate::ramrod::RESEARCH_MARKER))
-                    .map(|identity| identity.device_class.clone())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect()
+                fallback.into_iter().collect()
             } else {
                 intersect
             }
@@ -6859,6 +6853,121 @@ mod tests {
                     RecoveryEvent::ModeSelected {
                         mode: RestoreMode::Update
                     }
+                )
+            }),
+            "{collected:?}"
+        );
+    }
+
+    #[test]
+    fn an_ipados_manifest_lists_boards_without_a_macos_identity() {
+        let directory = tempdir().unwrap();
+        let digest = crate::crypto::sha384(b"ipad image");
+        let value = Value::Dictionary(Dictionary::from_iter([
+            (
+                "ProductVersion".to_string(),
+                Value::String("27.0".to_string()),
+            ),
+            (
+                "ProductBuildVersion".to_string(),
+                Value::String("24A5390f".to_string()),
+            ),
+            (
+                "BuildIdentities".to_string(),
+                Value::Array(vec![
+                    build_identity(
+                        "J617AP",
+                        "Developer Erase Install (IPSW)",
+                        "Erase",
+                        "Developer Erase Install (IPSW)",
+                        digest.as_slice(),
+                    ),
+                    build_identity(
+                        "J617AP",
+                        "Developer Upgrade Install (IPSW)",
+                        "Update",
+                        "Developer Upgrade Install (IPSW)",
+                        digest.as_slice(),
+                    ),
+                    build_identity(
+                        "J617AP",
+                        "Recovery Customer Install",
+                        "Erase",
+                        "Recovery Customer Install",
+                        digest.as_slice(),
+                    ),
+                ]),
+            ),
+        ]));
+        write_manifest(&directory.path().join("BuildManifest.plist"), &value);
+
+        let backend = Arc::new(FakeBackend::new(
+            BackendDiscovery {
+                devices: vec![broker_device("vm-1")],
+            },
+            FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success),
+        ));
+        let mut service = AppleRecoveryService::with_backend(backend);
+        let _ = wait_for(&mut service, |events| {
+            events.iter().any(|event| {
+                matches!(event, RecoveryEvent::FileRequested(spec) if spec.request_id == MANIFEST_REQUEST_ID)
+            })
+        });
+        service
+            .send(RecoveryCommand::ProvideFile {
+                device_id: String::new(),
+                request_id: MANIFEST_REQUEST_ID.to_string(),
+                path: directory
+                    .path()
+                    .join("BuildManifest.plist")
+                    .display()
+                    .to_string(),
+            })
+            .unwrap();
+        let boards = wait_for(&mut service, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, RecoveryEvent::CompatibleBoards { .. }))
+        });
+        let RecoveryEvent::CompatibleBoards { systems, .. } = boards
+            .iter()
+            .find(|event| matches!(event, RecoveryEvent::CompatibleBoards { .. }))
+            .cloned()
+            .expect("catalog")
+        else {
+            panic!("catalog");
+        };
+        assert_eq!(systems.len(), 1, "{systems:?}");
+        assert!(
+            systems[0].class.eq_ignore_ascii_case("j617ap"),
+            "{systems:?}"
+        );
+
+        service
+            .send(RecoveryCommand::SelectSystem {
+                device_class: "J617AP".to_string(),
+            })
+            .unwrap();
+        let _ = wait_for(&mut service, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, RecoveryEvent::CompatibleModes { .. }))
+        });
+        service
+            .send(RecoveryCommand::SelectRestoreMode {
+                mode: RestoreMode::Erase,
+            })
+            .unwrap();
+        let collected = wait_for(&mut service, |events| {
+            events.iter().any(|event| {
+                matches!(event, RecoveryEvent::FileRequested(spec) if spec.request_id == SYSTEM_IMAGE_REQUEST_ID)
+            })
+        });
+        assert!(
+            collected.iter().any(|event| {
+                matches!(
+                    event,
+                    RecoveryEvent::FileRequested(spec) if spec.request_id == SYSTEM_IMAGE_REQUEST_ID
                 )
             }),
             "{collected:?}"

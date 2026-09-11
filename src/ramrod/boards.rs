@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use plist::{Dictionary, Value};
+use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoardLabel {
@@ -14,19 +16,21 @@ pub struct BoardLabel {
 #[must_use]
 pub fn describe_board(class: &str, platform: Option<&str>) -> BoardLabel {
     let key = class.trim().to_ascii_lowercase();
-    let chip = platform
-        .map(str::trim)
-        .filter(|platform| !platform.is_empty())
-        .and_then(chip_name)
-        .or_else(|| board_chip(&key));
-    let title = board_name(&key)
-        .map(str::to_string)
-        .unwrap_or_else(|| match chip {
-            Some(chip) => format!("{chip} Mac"),
-            None => class.to_string(),
+    let catalog = device_catalog();
+    let record = catalog.boards.get(&key);
+    let chip = record
+        .and_then(|record| record.cpu.as_deref())
+        .or_else(|| {
+            platform
+                .map(str::trim)
+                .filter(|platform| !platform.is_empty())
+                .and_then(|platform| catalog.platforms.get(&platform.to_ascii_lowercase()))
+                .map(String::as_str)
         });
+    let title = record
+        .map(|record| format_board_title(&record.name, record.cpu.as_deref(), record.radio.as_deref()))
+        .unwrap_or_else(|| class.to_string());
     let detail = match chip {
-        Some(chip) if board_name(&key).is_some() => format!("{class}  ·  {chip}"),
         Some(chip) => format!("{class}  ·  {chip}"),
         None => class.to_string(),
     };
@@ -119,109 +123,79 @@ fn device_platforms_from_restore(root: &Dictionary) -> HashMap<String, String> {
     restore_catalog_from(root).platforms
 }
 
-fn chip_name(platform: &str) -> Option<&'static str> {
-    Some(match platform.trim().to_ascii_lowercase().as_str() {
-        "t8103" => "M1",
-        "t6000" => "M1 Pro",
-        "t6001" => "M1 Max",
-        "t6002" => "M1 Ultra",
-        "t8112" => "M2",
-        "t6020" => "M2 Pro",
-        "t6021" => "M2 Max",
-        "t6022" => "M2 Ultra",
-        "t8122" => "M3",
-        "t6030" => "M3 Pro",
-        "t6031" => "M3 Max",
-        "t6032" => "M3 Ultra",
-        "t6034" => "M3 Max",
-        "t8132" => "M4",
-        "t6040" => "M4 Pro",
-        "t6041" => "M4 Max",
-        "t8140" => "M5",
-        "t8142" => "M5",
-        "t6050" => "M5 Pro",
-        "vmapple2" => "Virtual Mac",
-        _ => return None,
-    })
+#[derive(Debug, Deserialize)]
+struct DeviceCatalogFile {
+    boards: HashMap<String, BoardRecord>,
+    platforms: HashMap<String, String>,
 }
 
-fn board_chip(class: &str) -> Option<&'static str> {
-    Some(match class {
-        "j274ap" | "j293ap" | "j313ap" | "j456ap" | "j457ap" => "M1",
-        "j314sap" | "j316sap" => "M1 Pro",
-        "j314cap" | "j316cap" | "j375cap" => "M1 Max",
-        "j375dap" => "M1 Ultra",
-        "j413ap" | "j415ap" | "j473ap" | "j493ap" => "M2",
-        "j414sap" | "j416sap" | "j474sap" => "M2 Pro",
-        "j414cap" | "j416cap" | "j475cap" => "M2 Max",
-        "j180dap" | "j475dap" => "M2 Ultra",
-        "j433ap" | "j434ap" | "j504ap" | "j615ap" => "M3",
-        "j514sap" | "j516sap" => "M3 Pro",
-        "j514cap" | "j514map" | "j516cap" | "j516map" => "M3 Max",
-        "j575dap" => "M3 Ultra",
-        "j575cap" | "j604ap" | "j613ap" | "j623ap" | "j624ap" | "j713ap" | "j715ap" => "M4",
-        "j614sap" | "j616sap" | "j773sap" => "M4 Pro",
-        "j614cap" | "j616cap" | "j773gap" => "M4 Max",
-        "j700ap" | "j704ap" | "j813ap" | "j815ap" => "M5",
-        "j714cap" | "j714sap" | "j716cap" | "j716sap" => "M5 Pro",
-        "vma2macosap" => "Virtual Mac",
-        _ => return None,
-    })
+#[derive(Debug, Deserialize)]
+struct BoardRecord {
+    name: String,
+    #[serde(default)]
+    cpu: Option<String>,
+    #[serde(default)]
+    radio: Option<String>,
 }
 
-fn board_name(class: &str) -> Option<&'static str> {
-    Some(match class {
-        "j180dap" => "Mac Pro (M2 Ultra, 2023)",
-        "j274ap" => "Mac mini (M1, 2020)",
-        "j293ap" => "MacBook Pro 13-inch (M1, 2020)",
-        "j313ap" => "MacBook Air (M1, 2020)",
-        "j314cap" => "MacBook Pro 14-inch (M1 Max, 2021)",
-        "j314sap" => "MacBook Pro 14-inch (M1 Pro, 2021)",
-        "j316cap" => "MacBook Pro 16-inch (M1 Max, 2021)",
-        "j316sap" => "MacBook Pro 16-inch (M1 Pro, 2021)",
-        "j375cap" => "Mac Studio (M1 Max, 2022)",
-        "j375dap" => "Mac Studio (M1 Ultra, 2022)",
-        "j413ap" => "MacBook Air 13-inch (M2, 2022)",
-        "j414cap" => "MacBook Pro 14-inch (M2 Max, 2023)",
-        "j414sap" => "MacBook Pro 14-inch (M2 Pro, 2023)",
-        "j415ap" => "MacBook Pro 13-inch (M2, 2022)",
-        "j416cap" => "MacBook Pro 16-inch (M2 Max, 2023)",
-        "j416sap" => "MacBook Pro 16-inch (M2 Pro, 2023)",
-        "j433ap" => "iMac 24-inch (M3, 2023)",
-        "j434ap" => "iMac 24-inch (M3, 2023)",
-        "j456ap" => "iMac 24-inch (M1, 2021)",
-        "j457ap" => "iMac 24-inch (M1, 2021)",
-        "j473ap" => "Mac mini (M2, 2023)",
-        "j474sap" => "Mac mini (M2 Pro, 2023)",
-        "j475cap" => "Mac Studio (M2 Max, 2023)",
-        "j475dap" => "Mac Studio (M2 Ultra, 2023)",
-        "j493ap" => "MacBook Air 15-inch (M2, 2023)",
-        "j504ap" => "MacBook Air 13-inch (M3, 2024)",
-        "j514cap" | "j514map" => "MacBook Pro 14-inch (M3 Max, 2023)",
-        "j514sap" => "MacBook Pro 14-inch (M3 Pro, 2023)",
-        "j516cap" | "j516map" => "MacBook Pro 16-inch (M3 Max, 2023)",
-        "j516sap" => "MacBook Pro 16-inch (M3 Pro, 2023)",
-        "j575cap" => "Mac Studio (M4 Max, 2025)",
-        "j575dap" => "Mac Studio (M3 Ultra, 2025)",
-        "j604ap" => "MacBook Air 13-inch (M4, 2025)",
-        "j613ap" => "Mac mini (M4, 2024)",
-        "j614cap" => "MacBook Pro 14-inch (M4 Max, 2024)",
-        "j614sap" => "MacBook Pro 14-inch (M4 Pro, 2024)",
-        "j615ap" => "MacBook Air 15-inch (M3, 2024)",
-        "j616cap" => "MacBook Pro 16-inch (M4 Max, 2024)",
-        "j616sap" => "MacBook Pro 16-inch (M4 Pro, 2024)",
-        "j623ap" | "j624ap" => "iMac 24-inch (M4, 2024)",
-        "j700ap" => "MacBook Air (M5)",
-        "j704ap" => "MacBook Air 13-inch (M5)",
-        "j713ap" => "Mac mini (M4 Pro, 2024)",
-        "j714cap" | "j714sap" => "MacBook Pro 14-inch (M5)",
-        "j715ap" => "MacBook Air 15-inch (M4, 2025)",
-        "j716cap" | "j716sap" => "MacBook Pro 16-inch (M5)",
-        "j773gap" => "Mac Studio (M4 Max)",
-        "j773sap" => "Mac Studio (M4 Pro)",
-        "j813ap" | "j815ap" => "iMac 24-inch (M5)",
-        "vma2macosap" => "Virtual Mac",
-        _ => return None,
+fn format_board_title(name: &str, cpu: Option<&str>, radio: Option<&str>) -> String {
+    let cpu = cpu.and_then(usable_chip_label);
+    let mut extras = Vec::new();
+    if let Some(cpu) = cpu.filter(|cpu| !name_already_has_chip(name, cpu)) {
+        extras.push(cpu.to_string());
+    }
+    if let Some(radio) = radio.map(str::trim).filter(|radio| !radio.is_empty())
+        && !name.to_ascii_lowercase().contains(&radio.to_ascii_lowercase())
+    {
+        extras.push(radio.to_string());
+    }
+    if extras.is_empty() {
+        return name.to_string();
+    }
+    inject_title_extras(name, &extras)
+}
+
+fn usable_chip_label(cpu: &str) -> Option<&str> {
+    let cpu = cpu.trim();
+    if cpu.is_empty() || cpu.contains('/') || cpu.contains("Non-LTE") || cpu.len() > 20 {
+        return None;
+    }
+    Some(cpu)
+}
+
+fn name_already_has_chip(name: &str, cpu: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let cpu = cpu.to_ascii_lowercase();
+    name.contains(&cpu)
+}
+
+fn inject_title_extras(name: &str, extras: &[String]) -> String {
+    let extra = extras.join(", ");
+    match trailing_paren(name) {
+        Some((prefix, inner))
+            if inner.chars().all(|ch| ch.is_ascii_digit()) && inner.len() == 4 =>
+        {
+            format!("{prefix}({extra}, {inner})")
+        }
+        Some((prefix, inner)) => format!("{prefix}({inner}, {extra})"),
+        None => format!("{name} ({extra})"),
+    }
+}
+
+fn trailing_paren(name: &str) -> Option<(&str, &str)> {
+    let body = name.trim_end();
+    let start = body.rfind('(')?;
+    let inner = body.strip_suffix(')')?.get(start + 1..)?;
+    if inner.is_empty() {
+        return None;
+    }
+    Some((&body[..start], inner))
+}
+
+fn device_catalog() -> &'static DeviceCatalogFile {
+    static CATALOG: OnceLock<DeviceCatalogFile> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        serde_json::from_str(include_str!("data/apple_boards.json")).expect("apple_boards.json")
     })
 }
 
@@ -229,6 +203,34 @@ fn board_name(class: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
     use plist::{Dictionary, Value};
+
+    #[test]
+    fn title_puts_chip_and_radio_where_they_help() {
+        assert_eq!(
+            format_board_title("Mac mini (2023)", Some("M2"), None),
+            "Mac mini (M2, 2023)"
+        );
+        assert_eq!(
+            format_board_title("Mac mini (M1, 2020)", Some("M1"), None),
+            "Mac mini (M1, 2020)"
+        );
+        assert_eq!(
+            format_board_title(
+                "iPad Pro (11-inch) (4th generation)",
+                Some("M2"),
+                Some("Wi-Fi")
+            ),
+            "iPad Pro (11-inch) (4th generation, M2, Wi-Fi)"
+        );
+        assert_eq!(
+            format_board_title("iPhone 15 Pro", Some("A17 Pro"), None),
+            "iPhone 15 Pro (A17 Pro)"
+        );
+        assert_eq!(
+            format_board_title("Apple Watch Ultra", Some("S6/S7/S8"), Some("GPS + Cellular")),
+            "Apple Watch Ultra (GPS + Cellular)"
+        );
+    }
 
     #[test]
     fn known_boards_use_marketing_names() {
@@ -241,13 +243,20 @@ mod tests {
         let air = describe_board("j313ap", None);
         assert_eq!(air.title, "MacBook Air (M1, 2020)");
         assert!(air.detail.contains("M1"), "{}", air.detail);
+
+        let ipad = describe_board("J617AP", None);
+        assert_eq!(
+            ipad.title,
+            "iPad Pro (11-inch) (4th generation, M2, Wi-Fi)"
+        );
     }
 
     #[test]
     fn unknown_boards_keep_the_id_and_use_the_platform_chip() {
         let labeled = describe_board("j999ap", Some("t8103"));
-        assert_eq!(labeled.title, "M1 Mac");
+        assert_eq!(labeled.title, "j999ap");
         assert!(labeled.detail.contains("j999ap"), "{}", labeled.detail);
+        assert!(labeled.detail.contains("M1"), "{}", labeled.detail);
 
         let bare = describe_board("j999ap", None);
         assert_eq!(bare.title, "j999ap");

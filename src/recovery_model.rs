@@ -1307,7 +1307,8 @@ impl RecoveryModel {
             RecoveryEvent::Progress(progress) => {
                 let checking = progress.stage.eq_ignore_ascii_case("checking")
                     || progress.stage.eq_ignore_ascii_case("hashing")
-                    || progress.stage.eq_ignore_ascii_case("scanning");
+                    || progress.stage.eq_ignore_ascii_case("scanning")
+                    || progress.stage.eq_ignore_ascii_case("reading");
                 if checking {
                     self.verifying = Some(progress.clone());
                     self.status_message = if progress.detail.is_empty() {
@@ -1339,6 +1340,8 @@ impl RecoveryModel {
                 product_version,
                 product_build,
             } => {
+                self.verifying = None;
+                self.last_error = None;
                 self.compatible_systems = systems;
                 self.selected_system = None;
                 self.system_cursor = 0;
@@ -1624,6 +1627,12 @@ fn resolve_from_directory(dir: &FileInfo, spec: &FileRequestSpec) -> Result<Vec<
     }
     wanted = expand_accepted_names(&wanted);
 
+    if let Some(named) = named_files_in_directory(&dir.path, spec, &wanted)
+        && !named.is_empty()
+    {
+        return Ok(named);
+    }
+
     let files = walk_payload_files(&dir.path)
         .map_err(|error| format!("Could not read folder {}: {error}", dir.path.display()))?;
 
@@ -1711,6 +1720,47 @@ fn files_have_identical_bytes(left: &Path, right: &Path) -> bool {
             return false;
         }
     }
+}
+
+fn named_files_in_directory(
+    dir: &Path,
+    spec: &FileRequestSpec,
+    wanted: &[String],
+) -> Option<Vec<FileInfo>> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut named = Vec::new();
+    let mut seen_paths = HashSet::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !wanted.iter().any(|item| item.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let Some(info) = inspect(&entry.path().to_string_lossy()) else {
+            continue;
+        };
+        let Ok(file) = accept_regular_file(&info, spec) else {
+            continue;
+        };
+        if seen_paths.insert(file.path.clone()) {
+            named.push(file);
+        }
+    }
+    named.sort_by_key(|file| {
+        wanted
+            .iter()
+            .position(|item| item.eq_ignore_ascii_case(&file.name))
+            .unwrap_or(usize::MAX)
+    });
+    Some(named)
 }
 
 fn walk_payload_files(dir: &Path) -> Result<Vec<FileInfo>, String> {
@@ -2138,6 +2188,38 @@ mod tests {
         assert_eq!(index, 0);
         assert_eq!(resolved.name, "BuildManifest.plist");
         assert_eq!(resolved.path, manifest.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn handoff_prefers_a_top_level_manifest_over_a_nested_restore_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("BuildManifest.plist");
+        std::fs::write(&manifest, b"<?xml version=\"1.0\"?><plist></plist>").unwrap();
+        let nested = dir.path().join("extract");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(
+            nested.join("Restore.plist"),
+            b"<?xml version=\"1.0\"?><plist></plist>",
+        )
+        .unwrap();
+
+        let spec = FileRequestSpec {
+            request_id: "build-manifest".into(),
+            role: "BuildManifest".into(),
+            preferred_name: Some("BuildManifest.plist".into()),
+            accepted_names: vec!["BuildManifest.plist".into(), "Restore.plist".into()],
+            allowed_extensions: vec!["plist".into()],
+            accept_directory: false,
+            expected_size: None,
+            expected_hash: None,
+            detail: None,
+            required: true,
+        };
+        let folder = inspect(&dir.path().to_string_lossy()).expect("folder");
+        let resolved = resolve_handoff_candidates(&folder, &spec).expect("resolved");
+        assert_eq!(resolved.len(), 1, "{resolved:?}");
+        assert_eq!(resolved[0].name, "BuildManifest.plist");
+        assert_eq!(resolved[0].path, manifest.canonicalize().unwrap());
     }
 
     #[test]
@@ -2650,6 +2732,29 @@ mod tests {
     }
 
     #[test]
+    fn listing_boards_leaves_the_catalog_read_wait() {
+        let mut model = RecoveryModel::default();
+        model.requests.clear();
+        model.apply_event(RecoveryEvent::Progress(RestoreProgress {
+            stage: "reading".into(),
+            detail: "BuildManifest.plist".into(),
+            fraction: None,
+        }));
+        assert_eq!(model.step(), RecoveryStep::Working);
+        model.apply_event(RecoveryEvent::CompatibleBoards {
+            systems: vec![CompatibleSystem {
+                class: "j617ap".into(),
+                title: "j617ap".into(),
+                detail: "j617ap".into(),
+            }],
+            product_version: Some("27.0".into()),
+            product_build: Some("24A5390f".into()),
+        });
+        assert!(model.verifying.is_none());
+        assert_eq!(model.step(), RecoveryStep::PickSystem);
+    }
+
+    #[test]
     fn choosing_a_system_with_two_modes_opens_the_mode_picker() {
         let mut model = RecoveryModel::default();
         model.requests.clear();
@@ -2663,6 +2768,7 @@ mod tests {
             product_build: Some("25F80".into()),
         });
         assert_eq!(model.step(), RecoveryStep::PickSystem);
+        assert!(model.verifying.is_none());
         model.apply_event(RecoveryEvent::SystemSelected {
             class: "j274ap".into(),
         });

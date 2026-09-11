@@ -124,9 +124,9 @@ pub use identity::{
     MACOS_CUSTOMER_VARIANT, ManifestError, OPTIONAL_MESSAGE_TYPES, OptionsReport,
     REQUIRED_MESSAGE_TYPES, RESEARCH_MARKER, RESTORE_PLIST_FILE_NAME, RestoreBehavior,
     SESSION_UUID_ENTROPY_SOURCE, all_build_identities, generate_session_uuid,
-    install_behaviors_for_board, load_build_manifest, macos_restore_options,
-    raw_identity_for_variant, recovery_os_partition_size, select_install_identity,
-    select_macos_identity,
+    install_behaviors_for_board, installable_device_classes, load_build_manifest,
+    macos_restore_options, raw_identity_for_variant, recovery_os_partition_size,
+    select_install_identity, select_macos_identity,
 };
 pub use images::{
     BulkImageEntry, BulkImageError, ImageNameRule, ResolvedBulkImage, bulk_image_entry,
