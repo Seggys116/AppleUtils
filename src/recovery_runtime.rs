@@ -31,6 +31,9 @@ pub enum RecoveryCommand {
     SelectRestoreMode {
         mode: crate::recovery_model::RestoreMode,
     },
+    SetLocalPolicySigning {
+        enabled: bool,
+    },
     Autosearch {
         device_id: String,
         path: String,
@@ -268,6 +271,34 @@ impl RecoveryRuntime {
         self.model.status_message = format!("Selecting {}", mode.title());
         self.model
             .push_log(LogLevel::Info, format!("{} requested", mode.title()));
+    }
+
+    pub fn set_local_policy_signing(&mut self, enabled: bool) {
+        if self
+            .service
+            .send(RecoveryCommand::SetLocalPolicySigning { enabled })
+            .is_err()
+        {
+            self.model.last_error = Some("Could not change LocalPolicy signing".into());
+            self.model
+                .push_log(LogLevel::Error, "Could not change LocalPolicy signing");
+            return;
+        }
+        self.model.sign_recovery_os_local_policy = enabled;
+        let stated = crate::recovery_model::local_policy_signing_status(enabled);
+        self.model.status_message = stated.clone();
+        self.model.push_log(
+            if enabled {
+                LogLevel::Warn
+            } else {
+                LogLevel::Info
+            },
+            stated,
+        );
+    }
+
+    pub fn toggle_local_policy_signing(&mut self) {
+        self.set_local_policy_signing(!self.model.sign_recovery_os_local_policy);
     }
 
     pub fn release_claim(&mut self) {
@@ -988,5 +1019,30 @@ mod tests {
         runtime.start_restore();
 
         assert!(matches!(bridge.recv_command(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn the_flag_and_the_screen_key_send_one_signing_command() {
+        let (service, bridge) = ChannelRecoveryService::pair();
+        let mut runtime = RecoveryRuntime::from_service(service);
+
+        runtime.set_local_policy_signing(true);
+        assert_eq!(
+            bridge.recv_command().expect("the flag sends one command"),
+            RecoveryCommand::SetLocalPolicySigning { enabled: true }
+        );
+        assert!(runtime.model.sign_recovery_os_local_policy);
+
+        runtime.toggle_local_policy_signing();
+        assert_eq!(
+            bridge.recv_command().expect("the key sends one command"),
+            RecoveryCommand::SetLocalPolicySigning { enabled: false }
+        );
+        assert!(!runtime.model.sign_recovery_os_local_policy);
+
+        runtime
+            .model
+            .apply_event(RecoveryEvent::LocalPolicySigning { enabled: true });
+        assert!(runtime.model.sign_recovery_os_local_policy);
     }
 }

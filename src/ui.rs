@@ -147,34 +147,46 @@ fn footer_hints(app: &App, width: u16) -> Line<'static> {
             if app.recovery.model.step() == crate::recovery_model::RecoveryStep::PickSystem
                 && w >= 56 =>
         {
-            &["↑↓ scroll", "pgup/pgdn", "enter select", "esc back"]
+            &[
+                "↑↓ scroll",
+                "pgup/pgdn",
+                "enter select",
+                "p signing",
+                "esc back",
+            ]
         }
         (Screen::Recovery, _)
             if app.recovery.model.step() == crate::recovery_model::RecoveryStep::PickSystem =>
         {
-            &["enter", "esc"]
+            &["enter", "p", "esc"]
         }
         (Screen::Recovery, w)
             if app.recovery.model.step() == crate::recovery_model::RecoveryStep::PickMode
                 && w >= 56 =>
         {
-            &["↑↓ move", "enter select", "esc back"]
+            &["↑↓ move", "enter select", "p signing", "esc back"]
         }
         (Screen::Recovery, _)
             if app.recovery.model.step() == crate::recovery_model::RecoveryStep::PickMode =>
         {
-            &["enter", "esc"]
+            &["enter", "p", "esc"]
         }
         (Screen::Recovery, w)
             if app.recovery.model.step() == crate::recovery_model::RecoveryStep::PickDevice
                 && w >= 56 =>
         {
-            &["↑↓ scroll", "pgup/pgdn", "enter claim", "esc back"]
+            &[
+                "↑↓ scroll",
+                "pgup/pgdn",
+                "enter claim",
+                "p signing",
+                "esc back",
+            ]
         }
         (Screen::Recovery, _)
             if app.recovery.model.step() == crate::recovery_model::RecoveryStep::PickDevice =>
         {
-            &["enter", "esc"]
+            &["enter", "p", "esc"]
         }
         (Screen::Recovery, w)
             if app.recovery.model.step() == crate::recovery_model::RecoveryStep::Working

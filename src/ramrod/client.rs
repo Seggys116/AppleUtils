@@ -74,6 +74,7 @@ pub struct RestoreSummary {
     pub crash_logs_written: u64,
     pub guest_log: Option<String>,
     pub checkpoint_error: Option<String>,
+    pub checkpoint_error_endured: bool,
 }
 
 impl RestoreSummary {
@@ -508,9 +509,15 @@ impl<T: Read + Write> RamrodClient<T> {
                                         .body
                                         .get(KEY_CHECKPOINT_ERROR)
                                         .and_then(checkpoint_error_text)
-                                        && summary.checkpoint_error.is_none()
                                     {
-                                        summary.checkpoint_error = Some(text);
+                                        let endured =
+                                            checkpoint_result_is_endured(checkpoint.result);
+                                        if summary.checkpoint_error.is_none()
+                                            || (summary.checkpoint_error_endured && !endured)
+                                        {
+                                            summary.checkpoint_error = Some(text);
+                                            summary.checkpoint_error_endured = endured;
+                                        }
                                     }
                                     if summary.final_status_acks_sent == 0
                                         && checkpoint_is_final_status_wait(&checkpoint)
@@ -874,6 +881,11 @@ fn connection_gone_ramrod(error: &RamrodError) -> bool {
     }
 }
 
+// Negative checkpoint result = CHECKPOINT ENDURED; positive ends the restore.
+fn checkpoint_result_is_endured(result: Option<i64>) -> bool {
+    matches!(result, Some(result) if result < 0)
+}
+
 fn checkpoint_error_text(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => {
@@ -981,10 +993,10 @@ mod tests {
     use super::*;
     use crate::ramrod::message::{
         DataType, KEY_AM_R_ERROR, KEY_ARGUMENTS, KEY_CHECKPOINT_COMPLETE, KEY_CHECKPOINT_ERROR,
-        KEY_CHECKPOINT_ID, KEY_CHECKPOINT_NAME, KEY_DATA_PORT, KEY_DATA_TYPE, KEY_LOG,
-        KEY_OPERATION, KEY_PROGRESS, KEY_REQUEST, KEY_RESULT, KEY_STATUS, KEY_SUCCESSFUL,
-        KEY_SUPPORTED_HOST_PROTOCOLS, KEY_WILL_SEND_EOF, PROTOCOL_MUX_SOCKET, RESULT_SUCCESS,
-        SERVICE_TYPE, SystemImageFormat,
+        KEY_CHECKPOINT_ID, KEY_CHECKPOINT_NAME, KEY_CHECKPOINT_RESULT, KEY_DATA_PORT,
+        KEY_DATA_TYPE, KEY_LOG, KEY_OPERATION, KEY_PROGRESS, KEY_REQUEST, KEY_RESULT, KEY_STATUS,
+        KEY_SUCCESSFUL, KEY_SUPPORTED_HOST_PROTOCOLS, KEY_WILL_SEND_EOF, PROTOCOL_MUX_SOCKET,
+        RESULT_SUCCESS, SERVICE_TYPE, SystemImageFormat,
     };
     use crate::ramrod::provider::{NoBulkTransfers, PreparedAnswers};
     use plist::Integer;
@@ -2320,6 +2332,109 @@ mod tests {
         assert_eq!(summary.final_status_acks_sent, 1);
     }
 
+    fn checkpoint_failed(name: &str, id: i64, result: i64, error: &str) -> Value {
+        dict(vec![
+            (KEY_MSG_TYPE, Value::String("CheckpointMsg".into())),
+            (KEY_CHECKPOINT_NAME, Value::String(name.into())),
+            (KEY_CHECKPOINT_ID, Value::Integer(Integer::from(id))),
+            (KEY_CHECKPOINT_RESULT, Value::Integer(Integer::from(result))),
+            (KEY_CHECKPOINT_COMPLETE, Value::Boolean(true)),
+            (KEY_CHECKPOINT_ERROR, Value::String(error.into())),
+        ])
+    }
+
+    const ENDURED_STOCKHOLM_ERROR: &str =
+        "003fcRx0088Rx00000000000000000000000000000000000000000000)";
+
+    const TERMINAL_RESTORE_ERROR: &str = "[0]D(failed to persist original boot objects)";
+
+    #[test]
+    fn a_failing_checkpoint_error_replaces_the_one_the_guest_endured() {
+        let messages = vec![
+            checkpoint_begin("await_update_stockholm", 0x1330),
+            checkpoint_failed(
+                "await_update_stockholm",
+                0x1330,
+                -1,
+                ENDURED_STOCKHOLM_ERROR,
+            ),
+            checkpoint_begin("preserve_source_boot_objects", 0x068D),
+            checkpoint_failed(
+                "preserve_source_boot_objects",
+                0x068D,
+                85,
+                TERMINAL_RESTORE_ERROR,
+            ),
+            checkpoint_begin("cleanup_wait_status_received", 0x0649),
+        ];
+        let mut client = RamrodClient::new(ScriptedTransport::new(&messages));
+        client.start_restore(RestoreOptions::new()).unwrap();
+        let summary = client
+            .run_restore(&mut PreparedAnswers::new(), &mut NoBulkTransfers, &mut ())
+            .unwrap();
+        assert_eq!(
+            summary.checkpoint_error.as_deref(),
+            Some(TERMINAL_RESTORE_ERROR),
+            "the step that ended the restore names the failure; the endured firmware step is a note it carried on past"
+        );
+        assert!(!summary.checkpoint_error_endured);
+    }
+
+    #[test]
+    fn an_endured_checkpoint_error_is_reported_when_nothing_else_fails() {
+        let messages = vec![
+            checkpoint_begin("await_update_stockholm", 0x1330),
+            checkpoint_failed(
+                "await_update_stockholm",
+                0x1330,
+                -1,
+                ENDURED_STOCKHOLM_ERROR,
+            ),
+            checkpoint_begin("cleanup_wait_status_received", 0x0649),
+        ];
+        let mut client = RamrodClient::new(ScriptedTransport::new(&messages));
+        client.start_restore(RestoreOptions::new()).unwrap();
+        let summary = client
+            .run_restore(&mut PreparedAnswers::new(), &mut NoBulkTransfers, &mut ())
+            .unwrap();
+        assert_eq!(
+            summary.checkpoint_error.as_deref(),
+            Some(ENDURED_STOCKHOLM_ERROR),
+            "an endured error is still the only thing the guest reported, so it is still what gets named"
+        );
+        assert!(summary.checkpoint_error_endured);
+    }
+
+    #[test]
+    fn a_later_failure_does_not_displace_the_first_one() {
+        let messages = vec![
+            checkpoint_begin("preserve_source_boot_objects", 0x068D),
+            checkpoint_failed(
+                "preserve_source_boot_objects",
+                0x068D,
+                85,
+                TERMINAL_RESTORE_ERROR,
+            ),
+            checkpoint_failed(
+                "perform_restore_installing",
+                0x067B,
+                85,
+                "[0]D(a downstream step reporting the same failure)",
+            ),
+            checkpoint_begin("cleanup_wait_status_received", 0x0649),
+        ];
+        let mut client = RamrodClient::new(ScriptedTransport::new(&messages));
+        client.start_restore(RestoreOptions::new()).unwrap();
+        let summary = client
+            .run_restore(&mut PreparedAnswers::new(), &mut NoBulkTransfers, &mut ())
+            .unwrap();
+        assert_eq!(
+            summary.checkpoint_error.as_deref(),
+            Some(TERMINAL_RESTORE_ERROR),
+            "the failure unwinds through the steps above it, so the first one named is the one that broke"
+        );
+    }
+
     #[test]
     fn a_nested_checkpoint_error_dictionary_is_flattened_to_its_description() {
         let mut user_info = Dictionary::new();
@@ -2455,6 +2570,7 @@ mod tests {
                 crash_logs_written: 0,
                 guest_log: Some("restore failed with CFError:".into()),
                 checkpoint_error: None,
+                checkpoint_error_endured: false,
             }
         );
         assert!(

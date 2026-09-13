@@ -83,6 +83,10 @@ impl GptPartition {
         self.type_guid == APPLE_APFS_TYPE_GUID
     }
 
+    pub fn is_apple_apfs_isc(&self) -> bool {
+        self.type_guid == APPLE_APFS_ISC_TYPE_GUID
+    }
+
     pub fn is_efi(&self) -> bool {
         self.type_guid == EFI_SYSTEM_PARTITION_TYPE_GUID
     }
@@ -90,6 +94,25 @@ impl GptPartition {
     pub fn is_linux(&self) -> bool {
         self.type_guid == LINUX_FILESYSTEM_TYPE_GUID
     }
+
+    /// iSC is a real NX container but holds firmware, not System/Data/Preboot.
+    pub fn apfs_container_rank(&self) -> u8 {
+        if self.is_apple_apfs() {
+            2
+        } else if self.is_apple_apfs_isc() {
+            0
+        } else {
+            1
+        }
+    }
+}
+
+pub fn pick_apfs_container(
+    candidates: &[(GptPartition, bool, u64)],
+) -> Option<&(GptPartition, bool, u64)> {
+    candidates
+        .iter()
+        .max_by_key(|(part, nx, count)| (part.apfs_container_rank(), *nx, *count))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -481,5 +504,32 @@ mod tests {
                 0x7D, 0xE4,
             ]
         );
+        let isc = GptPartition {
+            type_guid: APPLE_APFS_ISC_TYPE_GUID,
+            unique_guid: [0; 16],
+            first_lba: 6,
+            last_lba: 128005,
+            attributes: 0,
+            name: "iSCPreboot".into(),
+        };
+        let macos = GptPartition {
+            type_guid: APPLE_APFS_TYPE_GUID,
+            unique_guid: [1; 16],
+            first_lba: 128006,
+            last_lba: 33554431,
+            attributes: 0,
+            name: "Container".into(),
+        };
+        assert!(isc.is_apple_apfs_isc());
+        assert!(!isc.is_apple_apfs());
+        assert!(macos.is_apple_apfs());
+        let both = [
+            (isc.clone(), true, 128_000),
+            (macos.clone(), true, 33_426_326),
+        ];
+        let picked = pick_apfs_container(&both);
+        assert_eq!(picked.unwrap().0.type_guid, APPLE_APFS_TYPE_GUID);
+        let only_isc = [(isc, true, 128_000)];
+        assert_eq!(pick_apfs_container(&only_isc).unwrap().0.name, "iSCPreboot");
     }
 }

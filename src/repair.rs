@@ -210,11 +210,6 @@ fn render_chrome(frame: &mut Frame, path_row: Rect, status_row: Rect, bar_row: R
         spans.push(Span::styled(format!("{failed} failed"), theme::fail()));
         spans.push(Span::styled("  ·  ", theme::dim()));
         spans.push(Span::styled(format!("{passed} passed"), theme::pass()));
-        let skipped = skipped_count(&app.repair_findings);
-        if skipped > 0 {
-            spans.push(Span::styled("  ·  ", theme::dim()));
-            spans.push(Span::styled(format!("{skipped} n/a"), theme::mute()));
-        }
         if !app.repair_findings.is_empty() {
             spans.push(Span::styled(
                 format!("    {} checks", app.repair_findings.len()),
@@ -256,12 +251,7 @@ fn render_findings_sidebar(frame: &mut Frame, area: Rect, app: &mut App, focused
     let title = if app.repair_scanning() {
         "findings  scanning".into()
     } else {
-        let skipped = skipped_count(&app.repair_findings);
-        if skipped > 0 {
-            format!("findings  {failed} fail  {passed} pass  {skipped} n/a")
-        } else {
-            format!("findings  {failed} fail  {passed} pass")
-        }
+        format!("findings  {failed} fail  {passed} pass")
     };
     let block = ui::pane(&title, focused);
     let inner = block.inner(area);
@@ -326,7 +316,6 @@ fn render_findings_sidebar(frame: &mut Frame, area: Rect, app: &mut App, focused
         let tag_style = match finding.status {
             crate::repair_ops::CheckStatus::Pass => theme::pass(),
             crate::repair_ops::CheckStatus::Fail => theme::fail(),
-            crate::repair_ops::CheckStatus::NotApplicable => theme::mute(),
         };
         let id_budget = inner.width.saturating_sub(2 + 4 + 2).max(4);
         let id = ui::truncate_middle(&finding.id, id_budget);
@@ -402,7 +391,6 @@ fn render_analysis_main(frame: &mut Frame, area: Rect, app: &App, focused: bool)
     let (tag, style) = match finding.status {
         crate::repair_ops::CheckStatus::Pass => ("PASS", theme::pass()),
         crate::repair_ops::CheckStatus::Fail => ("FAIL", theme::fail()),
-        crate::repair_ops::CheckStatus::NotApplicable => ("N/A", theme::mute()),
     };
     let marked = app
         .suggestions
@@ -596,25 +584,15 @@ fn finding_counts(findings: &[crate::repair_ops::Finding]) -> (usize, usize) {
     (passed, failed)
 }
 
-fn skipped_count(findings: &[crate::repair_ops::Finding]) -> usize {
-    findings
-        .iter()
-        .filter(|finding| finding.status == crate::repair_ops::CheckStatus::NotApplicable)
-        .count()
-}
-
 fn display_order(findings: &[crate::repair_ops::Finding]) -> Vec<usize> {
     let mut fails = Vec::new();
-    let mut skipped = Vec::new();
     let mut passes = Vec::new();
     for (index, finding) in findings.iter().enumerate() {
         match finding.status {
             crate::repair_ops::CheckStatus::Fail => fails.push(index),
-            crate::repair_ops::CheckStatus::NotApplicable => skipped.push(index),
             crate::repair_ops::CheckStatus::Pass => passes.push(index),
         }
     }
-    fails.extend(skipped);
     fails.extend(passes);
     fails
 }

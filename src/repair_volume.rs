@@ -42,6 +42,7 @@ pub struct VolumeFinding {
     pub summary: String,
     pub detail: String,
     pub repairable: bool,
+    pub create_root_snapshot: bool,
 }
 
 impl VolumeFinding {
@@ -71,13 +72,25 @@ pub fn inspect_seals(seals: &ContainerSeals) -> Vec<VolumeFinding> {
 
 pub fn inspect_source(source: &mut dyn BlockSource) -> Result<Vec<VolumeFinding>, String> {
     match seals_from_source(source) {
-        Ok(seals) => Ok(inspect_seals(&seals)),
+        Ok(seals) => {
+            let mut findings = inspect_seals(&seals);
+            if !container_omap_is_writable_leaf(source, &seals) {
+                for item in &mut findings {
+                    if item.create_root_snapshot {
+                        item.repairable = false;
+                        item.create_root_snapshot = false;
+                    }
+                }
+            }
+            Ok(findings)
+        }
         Err(error) => Ok(vec![VolumeFinding {
             id: "volume-seals".to_string(),
             status: CheckStatus::Fail,
             summary: "failed to read volume seals".to_string(),
             detail: error,
             repairable: false,
+            create_root_snapshot: false,
         }]),
     }
 }
@@ -97,10 +110,35 @@ pub fn apply_volume_repair(container: &mut [u8], block_size: u32, id: &str) -> R
     }
     let (kind, paddr) = parse_volume_id(id)?;
     match kind {
-        "snapshot-count" => repair_snapshot_count(container, block_size, paddr),
+        "snapshot-count" => {
+            if system_has_empty_snapshots(container, block_size, paddr) {
+                apply_missing_root_snapshot_slice(container, block_size, paddr)
+            } else {
+                repair_snapshot_count(container, block_size, paddr)
+            }
+        }
+        "snapshot-names" => {
+            if system_has_empty_snapshot_indexes(container, block_size, paddr) {
+                apply_missing_root_snapshot_slice(container, block_size, paddr)
+            } else {
+                Err(format!("finding {id} is not repairable"))
+            }
+        }
+        "blessing" => {
+            if system_missing_named_root(container, block_size, paddr) {
+                apply_missing_root_snapshot_slice(container, block_size, paddr)
+            } else {
+                Err(format!("finding {id} is not repairable"))
+            }
+        }
         "volume-seal" => repair_volume_seal_flag(container, block_size, paddr),
-        "root-to-xid" => repair_root_to_xid(container, block_size, paddr),
-        "snapshot-names" | "blessing" => Err(format!("finding {id} is not repairable")),
+        "root-to-xid" => {
+            if system_missing_named_root(container, block_size, paddr) {
+                apply_missing_root_snapshot_slice(container, block_size, paddr)
+            } else {
+                repair_root_to_xid(container, block_size, paddr)
+            }
+        }
         _ => Err(format!("unrecognised repair id {id}")),
     }
 }
@@ -164,10 +202,11 @@ fn check_volume_group(seals: &ContainerSeals) -> VolumeFinding {
     match (system, data) {
         (None, _) => VolumeFinding {
             id: "volume-group".to_string(),
-            status: CheckStatus::NotApplicable,
+            status: CheckStatus::Pass,
             summary: "no system volume to pair".to_string(),
             detail: format!("volumes={}", seals.volumes.len()),
             repairable: false,
+            create_root_snapshot: false,
         },
         (Some(_), None) => VolumeFinding {
             id: "volume-group".to_string(),
@@ -175,6 +214,7 @@ fn check_volume_group(seals: &ContainerSeals) -> VolumeFinding {
             summary: "system volume has no data-role volume to pair with".to_string(),
             detail: "SYSTEM is present, APFS_VOL_ROLE_DATA is absent".to_string(),
             repairable: false,
+            create_root_snapshot: false,
         },
         (Some(system), Some(data)) => {
             let ok = system.volume_group_id != ZERO_VGID
@@ -201,6 +241,7 @@ fn check_volume_group(seals: &ContainerSeals) -> VolumeFinding {
                     hex16(&data.volume_group_id)
                 ),
                 repairable: !ok,
+                create_root_snapshot: false,
             }
         }
     }
@@ -218,10 +259,11 @@ fn check_preboot(seals: &ContainerSeals) -> VolumeFinding {
     if !has_system {
         return VolumeFinding {
             id: "preboot".to_string(),
-            status: CheckStatus::NotApplicable,
+            status: CheckStatus::Pass,
             summary: "no system volume to require a preboot volume".to_string(),
             detail: format!("volumes={}", seals.volumes.len()),
             repairable: false,
+            create_root_snapshot: false,
         };
     }
     VolumeFinding {
@@ -242,6 +284,7 @@ fn check_preboot(seals: &ContainerSeals) -> VolumeFinding {
             "SYSTEM volume is present, APFS_VOL_ROLE_PREBOOT is absent".to_string()
         },
         repairable: false,
+        create_root_snapshot: false,
     }
 }
 
@@ -261,25 +304,28 @@ pub(crate) fn check_root_to_xid(volume: &VolumeSealReport) -> VolumeFinding {
     if volume.role != APFS_VOL_ROLE_SYSTEM {
         return VolumeFinding {
             id,
-            status: CheckStatus::NotApplicable,
-            summary: "volume is not a system volume".to_string(),
+            status: CheckStatus::Pass,
+            summary: "not a system volume; apfs_root_to_xid is unused for boot".to_string(),
             detail: format!(
                 "volume {} paddr {paddr}: apfs_root_to_xid={}",
                 volume.name, volume.root_to_xid
             ),
             repairable: false,
+            create_root_snapshot: false,
         };
     }
     let Some(xid) = named_root_snapshot_xid(&volume.snapshots) else {
+        let create = may_create_root_snapshot(volume);
         return VolumeFinding {
             id,
-            status: CheckStatus::NotApplicable,
+            status: CheckStatus::Fail,
             summary: "no named root snapshot to root the live volume at".to_string(),
             detail: format!(
                 "volume {} paddr {paddr}: apfs_root_to_xid={}",
                 volume.name, volume.root_to_xid
             ),
-            repairable: false,
+            repairable: create,
+            create_root_snapshot: create,
         };
     };
     let passed = volume.root_to_xid == xid;
@@ -305,52 +351,73 @@ pub(crate) fn check_root_to_xid(volume: &VolumeSealReport) -> VolumeFinding {
             volume.name, volume.root_to_xid
         ),
         repairable: !passed,
+        create_root_snapshot: false,
     }
+}
+
+pub(crate) fn volume_needs_root_snapshot(volume: &VolumeSealReport) -> bool {
+    volume.role == APFS_VOL_ROLE_SYSTEM
+        && volume.snapshots.snapshots.is_empty()
+        && volume.snapshots.declared_count == 0
+        && named_root_snapshot_xid(&volume.snapshots).is_none()
+}
+
+pub(crate) fn may_create_root_snapshot(volume: &VolumeSealReport) -> bool {
+    volume.role == APFS_VOL_ROLE_SYSTEM
+        && !(volume.snapshots.snapshots.is_empty() && volume.snapshots.declared_count != 0)
 }
 
 pub(crate) fn check_snapshot_count(volume: &VolumeSealReport) -> VolumeFinding {
     let paddr = volume.paddr;
     let declared = volume.snapshots.declared_count;
     let actual = volume.snapshots.snapshots.len() as u64;
-    let passed = declared == actual;
-    if passed && declared == 0 {
-        let system = volume.role == APFS_VOL_ROLE_SYSTEM;
+    let system = volume.role == APFS_VOL_ROLE_SYSTEM;
+    let id = format!("snapshot-count:{paddr}");
+    let detail = format!(
+        "volume {} paddr {paddr}: apfs_num_snapshots is {declared}, SNAP_METADATA holds {actual}",
+        volume.name
+    );
+    if declared == actual && actual > 0 {
         return VolumeFinding {
-            id: format!("snapshot-count:{paddr}"),
-            status: if system {
-                CheckStatus::Fail
-            } else {
-                CheckStatus::NotApplicable
-            },
-            summary: if system {
-                "system volume has no snapshots".to_string()
-            } else {
-                "volume has no snapshots".to_string()
-            },
-            detail: format!(
-                "volume {} paddr {paddr}: apfs_num_snapshots is 0, SNAP_METADATA holds 0",
-                volume.name
-            ),
+            id,
+            status: CheckStatus::Pass,
+            summary: "declared snapshot count matches SNAP_METADATA records".to_string(),
+            detail,
             repairable: false,
+            create_root_snapshot: false,
+        };
+    }
+    if actual == 0
+        && declared == 0
+        && system
+        && named_root_snapshot_xid(&volume.snapshots).is_none()
+    {
+        return VolumeFinding {
+            id,
+            status: CheckStatus::Fail,
+            summary: "system volume has no snapshots".to_string(),
+            detail,
+            repairable: true,
+            create_root_snapshot: true,
+        };
+    }
+    if declared == actual {
+        return VolumeFinding {
+            id,
+            status: CheckStatus::Pass,
+            summary: "volume has no snapshots; none required".to_string(),
+            detail,
+            repairable: false,
+            create_root_snapshot: false,
         };
     }
     VolumeFinding {
-        id: format!("snapshot-count:{paddr}"),
-        status: if passed {
-            CheckStatus::Pass
-        } else {
-            CheckStatus::Fail
-        },
-        summary: if passed {
-            "declared snapshot count matches SNAP_METADATA records".to_string()
-        } else {
-            "declared snapshot count does not match SNAP_METADATA records".to_string()
-        },
-        detail: format!(
-            "volume {} paddr {paddr}: apfs_num_snapshots is {declared}, SNAP_METADATA holds {actual}",
-            volume.name
-        ),
-        repairable: !passed,
+        id,
+        status: CheckStatus::Fail,
+        summary: "declared snapshot count does not match SNAP_METADATA records".to_string(),
+        detail,
+        repairable: true,
+        create_root_snapshot: false,
     }
 }
 
@@ -364,7 +431,7 @@ pub(crate) fn check_snapshot_names(volume: &VolumeSealReport) -> VolumeFinding {
             status: if system {
                 CheckStatus::Fail
             } else {
-                CheckStatus::NotApplicable
+                CheckStatus::Pass
             },
             summary: if system {
                 "system volume has no snapshot name index".to_string()
@@ -375,7 +442,8 @@ pub(crate) fn check_snapshot_names(volume: &VolumeSealReport) -> VolumeFinding {
                 "volume {} paddr {paddr}: both SNAP_METADATA and SNAP_NAME are empty",
                 volume.name
             ),
-            repairable: false,
+            repairable: volume_needs_root_snapshot(volume),
+            create_root_snapshot: volume_needs_root_snapshot(volume),
         };
     }
 
@@ -432,10 +500,11 @@ pub(crate) fn check_snapshot_names(volume: &VolumeSealReport) -> VolumeFinding {
             )
         },
         repairable: false,
+        create_root_snapshot: false,
     }
 }
 
-fn check_volume_seal(volume: &VolumeSealReport) -> VolumeFinding {
+pub(crate) fn check_volume_seal(volume: &VolumeSealReport) -> VolumeFinding {
     let paddr = volume.paddr;
     let flagged = volume.sealed || volume.incompatible_features & APFS_INCOMPAT_SEALED_VOLUME != 0;
     let has_meta = volume.integrity_meta_oid != 0;
@@ -453,6 +522,7 @@ fn check_volume_seal(volume: &VolumeSealReport) -> VolumeFinding {
                 volume.name, seal.oid, seal.paddr, seal.broken_xid
             ),
             repairable: false,
+            create_root_snapshot: false,
         };
     }
 
@@ -466,6 +536,7 @@ fn check_volume_seal(volume: &VolumeSealReport) -> VolumeFinding {
                 volume.name
             ),
             repairable: true,
+            create_root_snapshot: false,
         };
     }
     if has_meta && !flagged {
@@ -478,22 +549,17 @@ fn check_volume_seal(volume: &VolumeSealReport) -> VolumeFinding {
                 volume.name, volume.integrity_meta_oid
             ),
             repairable: true,
+            create_root_snapshot: false,
         };
     }
 
     VolumeFinding {
         id,
-        status: if flagged {
-            CheckStatus::Pass
-        } else if volume.role == APFS_VOL_ROLE_SYSTEM {
-            CheckStatus::Fail
-        } else {
-            CheckStatus::NotApplicable
-        },
+        status: CheckStatus::Pass,
         summary: if flagged {
             "volume is sealed with integrity metadata".to_string()
         } else if volume.role == APFS_VOL_ROLE_SYSTEM {
-            "system volume is not sealed".to_string()
+            "seal is not required for root mount (unauthenticated root)".to_string()
         } else {
             "volume is not sealed".to_string()
         },
@@ -502,10 +568,11 @@ fn check_volume_seal(volume: &VolumeSealReport) -> VolumeFinding {
             volume.name, volume.integrity_meta_oid
         ),
         repairable: false,
+        create_root_snapshot: false,
     }
 }
 
-fn check_blessing(volume: &VolumeSealReport) -> VolumeFinding {
+pub(crate) fn check_blessing(volume: &VolumeSealReport) -> VolumeFinding {
     let paddr = volume.paddr;
     let id = format!("blessing:{paddr}");
 
@@ -521,6 +588,7 @@ fn check_blessing(volume: &VolumeSealReport) -> VolumeFinding {
                     volume.name
                 ),
                 repairable: false,
+                create_root_snapshot: false,
             };
         }
         return VolumeFinding {
@@ -531,7 +599,8 @@ fn check_blessing(volume: &VolumeSealReport) -> VolumeFinding {
                 "volume {} paddr {paddr}: kernel lookup of {name} would fail",
                 volume.name
             ),
-            repairable: false,
+            repairable: may_create_root_snapshot(volume),
+            create_root_snapshot: may_create_root_snapshot(volume),
         };
     }
 
@@ -541,18 +610,19 @@ fn check_blessing(volume: &VolumeSealReport) -> VolumeFinding {
             status: if volume.role == APFS_VOL_ROLE_SYSTEM {
                 CheckStatus::Fail
             } else {
-                CheckStatus::NotApplicable
+                CheckStatus::Pass
             },
             summary: if volume.role == APFS_VOL_ROLE_SYSTEM {
                 "system volume has no blessed root snapshot".to_string()
             } else {
-                "no sealed root snapshot to bless".to_string()
+                "no blessed root snapshot; none required".to_string()
             },
             detail: format!(
                 "volume {} paddr {paddr}: unsealed, no {ROOT_SNAPSHOT_PREFIX}* name records",
                 volume.name
             ),
-            repairable: false,
+            repairable: may_create_root_snapshot(volume),
+            create_root_snapshot: may_create_root_snapshot(volume),
         },
         Some(name) => {
             let xid = volume.snapshots.xid_for_name(name);
@@ -580,6 +650,7 @@ fn check_blessing(volume: &VolumeSealReport) -> VolumeFinding {
                     volume.name
                 ),
                 repairable: false,
+                create_root_snapshot: false,
             }
         }
     }
@@ -698,6 +769,114 @@ fn looks_like_apsb(bytes: &[u8]) -> bool {
     bytes.len() >= APSB_INTEGRITY_META_OID_OFFSET + 8
         && u32_at(bytes, NX_MAGIC_OFFSET) == APFS_MAGIC
         && u32_at(bytes, OBJ_TYPE_OFFSET) & OBJ_TYPE_MASK == TYPE_FS
+}
+
+struct SliceDisc<'a> {
+    bytes: &'a mut [u8],
+}
+
+impl crate::asahi_ops::ImageIo for SliceDisc<'_> {
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), crate::asahi_ops::OpsError> {
+        let start = usize::try_from(offset).map_err(|_| {
+            crate::asahi_ops::OpsError::Message(format!("read offset {offset} overflows usize"))
+        })?;
+        let end = start.checked_add(buf.len()).ok_or_else(|| {
+            crate::asahi_ops::OpsError::Message("read range overflows usize".into())
+        })?;
+        let src = self.bytes.get(start..end).ok_or_else(|| {
+            crate::asahi_ops::OpsError::Message(format!(
+                "read [{start},{end}) is outside the container"
+            ))
+        })?;
+        buf.copy_from_slice(src);
+        Ok(())
+    }
+
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), crate::asahi_ops::OpsError> {
+        let start = usize::try_from(offset).map_err(|_| {
+            crate::asahi_ops::OpsError::Message(format!("write offset {offset} overflows usize"))
+        })?;
+        let end = start.checked_add(data.len()).ok_or_else(|| {
+            crate::asahi_ops::OpsError::Message("write range overflows usize".into())
+        })?;
+        let dst = self.bytes.get_mut(start..end).ok_or_else(|| {
+            crate::asahi_ops::OpsError::Message(format!(
+                "write [{start},{end}) is outside the container"
+            ))
+        })?;
+        dst.copy_from_slice(data);
+        Ok(())
+    }
+}
+
+fn slice_block_count(container: &[u8], block_size: u32) -> u64 {
+    if block_size == 0 {
+        0
+    } else {
+        container.len() as u64 / u64::from(block_size)
+    }
+}
+
+fn apply_missing_root_snapshot_slice(
+    container: &mut [u8],
+    block_size: u32,
+    paddr: u64,
+) -> Result<(), String> {
+    let block_count = slice_block_count(container, block_size);
+    let mut disc = SliceDisc { bytes: container };
+    crate::repair_snapshot::apply_missing_root_snapshot(
+        &mut disc,
+        0,
+        block_size,
+        block_count,
+        paddr,
+    )
+}
+
+fn system_volume(container: &[u8], block_size: u32, paddr: u64) -> Option<VolumeSealReport> {
+    let volume = volume_from_container(container, block_size, paddr)?;
+    (volume.role == APFS_VOL_ROLE_SYSTEM).then_some(volume)
+}
+
+fn system_has_empty_snapshots(container: &[u8], block_size: u32, paddr: u64) -> bool {
+    system_volume(container, block_size, paddr)
+        .is_some_and(|volume| volume_needs_root_snapshot(&volume))
+}
+
+fn container_omap_is_writable_leaf(source: &mut dyn BlockSource, seals: &ContainerSeals) -> bool {
+    let block_size = seals.block_size as usize;
+    if block_size < 0x38 {
+        return false;
+    }
+    let mut sb = vec![0u8; block_size];
+    if source.read_block(seals.superblock_paddr, &mut sb).is_err() {
+        return false;
+    }
+    let omap_paddr = u64_at(&sb, 0xA0);
+    let mut omap = vec![0u8; block_size];
+    if source.read_block(omap_paddr, &mut omap).is_err() {
+        return false;
+    }
+    let tree = u64_at(&omap, 0x30);
+    let mut node = vec![0u8; block_size];
+    if source.read_block(tree, &mut node).is_err() {
+        return false;
+    }
+    crate::repair_writer::btree::is_leaf_node(&node)
+}
+
+fn system_has_empty_snapshot_indexes(container: &[u8], block_size: u32, paddr: u64) -> bool {
+    system_volume(container, block_size, paddr).is_some_and(|volume| {
+        volume.snapshots.snapshots.is_empty()
+            && volume.snapshots.names.is_empty()
+            && volume_needs_root_snapshot(&volume)
+    })
+}
+
+fn system_missing_named_root(container: &[u8], block_size: u32, paddr: u64) -> bool {
+    system_volume(container, block_size, paddr).is_some_and(|volume| {
+        named_root_snapshot_xid(&volume.snapshots).is_none() && may_create_root_snapshot(&volume)
+    })
 }
 
 fn repair_snapshot_count(container: &mut [u8], block_size: u32, paddr: u64) -> Result<(), String> {
@@ -1081,7 +1260,7 @@ mod tests {
             let id = format!("{kind}:{paddr}");
             let item = finding(findings, &id);
             assert!(
-                !item.failed(),
+                item.passed(),
                 "{id} failed: {} — {}",
                 item.summary,
                 item.detail
@@ -1091,17 +1270,12 @@ mod tests {
         for id in ["volume-group", "preboot"] {
             let item = finding(findings, id);
             assert!(
-                !item.failed(),
+                item.passed(),
                 "{id} failed: {} — {}",
                 item.summary,
                 item.detail
             );
             assert!(!item.repairable, "{id} was marked repairable");
-            assert_eq!(
-                item.status,
-                CheckStatus::NotApplicable,
-                "{id} should be N/A on the explorer fixture"
-            );
         }
     }
 
@@ -1207,9 +1381,8 @@ mod tests {
         let after = inspect_image(&path).expect("inspect after repair");
         assert_clean_volume_checks(&after, FIXTURE_VOL_APSB_PADDR);
         let blessing = finding(&after, &format!("blessing:{FIXTURE_VOL_APSB_PADDR}"));
-        assert!(!blessing.failed(), "blessing should not fail once unsealed");
-        assert_eq!(blessing.status, CheckStatus::NotApplicable);
-        assert_eq!(blessing.summary, "no sealed root snapshot to bless");
+        assert!(blessing.passed(), "blessing should not fail once unsealed");
+        assert_eq!(blessing.summary, "no blessed root snapshot; none required");
     }
 
     #[test]
@@ -1235,6 +1408,41 @@ mod tests {
         assert_sorted(&first);
         assert_eq!(first, second);
         assert_clean_volume_checks(&first, FIXTURE_VOL_APSB_PADDR);
+    }
+
+    #[test]
+    fn system_empty_tree_with_nonzero_declared_count_is_a_count_repair() {
+        let mut volume = empty_volume(
+            21,
+            false,
+            0,
+            None,
+            VolumeSnapshots {
+                tree_paddr: 0,
+                declared_count: 7,
+                snapshots: Vec::new(),
+                names: Vec::new(),
+            },
+        );
+        volume.role = APFS_VOL_ROLE_SYSTEM;
+        let findings = inspect_seals(&seals_with(vec![volume]));
+        let item = finding(&findings, "snapshot-count:21");
+        assert!(item.failed(), "{item:?}");
+        assert!(item.repairable, "{item:?}");
+        assert!(
+            !item.create_root_snapshot,
+            "count/tree mismatch must not invent a snapshot: {item:?}"
+        );
+        assert!(!item.summary.contains("has no snapshots"), "{item:?}");
+        let names = finding(&findings, "snapshot-names:21");
+        assert!(!names.create_root_snapshot, "{names:?}");
+        assert!(!names.repairable, "{names:?}");
+        let blessing = finding(&findings, "blessing:21");
+        assert!(!blessing.create_root_snapshot, "{blessing:?}");
+        assert!(!blessing.repairable, "{blessing:?}");
+        let root = finding(&findings, "root-to-xid:21");
+        assert!(!root.create_root_snapshot, "{root:?}");
+        assert!(!root.repairable, "{root:?}");
     }
 
     #[test]
@@ -1304,8 +1512,8 @@ mod tests {
         assert!(!item.passed());
         assert!(item.repairable);
         let blessing = finding(&findings, "blessing:21");
-        assert_eq!(blessing.status, CheckStatus::NotApplicable);
-        assert_eq!(blessing.summary, "no sealed root snapshot to bless");
+        assert!(blessing.passed(), "{blessing:?}");
+        assert_eq!(blessing.summary, "no blessed root snapshot; none required");
     }
 
     #[test]
@@ -1313,23 +1521,26 @@ mod tests {
         let mut volume = empty_volume(21, false, 0, None, VolumeSnapshots::default());
         volume.role = APFS_VOL_ROLE_SYSTEM;
         let findings = inspect_seals(&seals_with(vec![volume]));
-        assert!(finding(&findings, "snapshot-count:21").failed());
-        assert!(finding(&findings, "snapshot-names:21").failed());
-        assert!(finding(&findings, "volume-seal:21").failed());
-        assert!(finding(&findings, "blessing:21").failed());
+        for id in [
+            "snapshot-count:21",
+            "snapshot-names:21",
+            "blessing:21",
+            "root-to-xid:21",
+        ] {
+            let item = finding(&findings, id);
+            assert!(item.failed(), "{id}: {item:?}");
+            assert!(
+                item.repairable,
+                "{id} should create the root snapshot: {item:?}"
+            );
+        }
+        let seal = finding(&findings, "volume-seal:21");
+        assert!(seal.passed(), "unsealed SYSTEM is valid: {seal:?}");
+        assert!(!seal.repairable, "must not invent a seal: {seal:?}");
         assert_eq!(
             finding(&findings, "blessing:21").summary,
             "system volume has no blessed root snapshot"
         );
-        assert!(!finding(&findings, "snapshot-count:21").repairable);
-        assert!(!finding(&findings, "snapshot-names:21").repairable);
-        assert!(!finding(&findings, "volume-seal:21").repairable);
-        assert!(!finding(&findings, "blessing:21").repairable);
-        assert_eq!(
-            finding(&findings, "root-to-xid:21").status,
-            CheckStatus::NotApplicable
-        );
-        assert!(!finding(&findings, "root-to-xid:21").repairable);
         assert!(finding(&findings, "volume-group").failed());
         assert!(!finding(&findings, "volume-group").repairable);
         assert!(finding(&findings, "preboot").failed());
@@ -1379,11 +1590,8 @@ mod tests {
             None,
             VolumeSnapshots::default(),
         )]));
-        assert_eq!(
-            finding(&none, "volume-group").status,
-            CheckStatus::NotApplicable
-        );
-        assert_eq!(finding(&none, "preboot").status, CheckStatus::NotApplicable);
+        assert!(finding(&none, "volume-group").passed());
+        assert!(finding(&none, "preboot").passed());
 
         let no_data = inspect_seals(&seals_with(vec![system.clone()]));
         assert!(finding(&no_data, "volume-group").failed());

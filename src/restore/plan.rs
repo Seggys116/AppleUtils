@@ -41,6 +41,7 @@ pub struct RestorePlan {
     pub staged_boot_manifest_sha384: Option<[u8; 48]>,
     pub fdr_trust_digest: Option<FdrTrustDigest>,
     pub fdr_material_dir: Option<PathBuf>,
+    pub sign_recovery_os_local_policy: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

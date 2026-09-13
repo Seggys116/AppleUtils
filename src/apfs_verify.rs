@@ -168,6 +168,7 @@ const APFS_INCOMPAT_CASE_INSENSITIVE: u64 = 0x1;
 const APFS_INCOMPAT_NORMALIZATION_INSENSITIVE: u64 = 0x8;
 
 const J_DREC_LEN_MASK: u32 = 0x0000_03FF;
+const J_DREC_HASH_SHIFT: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DrecKeyLayout {
@@ -204,7 +205,8 @@ impl DrecKeyLayout {
             Self::Plain => 0,
             Self::Hashed => {
                 if key.len() >= 12 {
-                    u32_at(key, 8)
+                    // btree sorts on hash then name, not the packed (hash<<10)|name_len word
+                    u32_at(key, 8) >> J_DREC_HASH_SHIFT
                 } else {
                     0
                 }
@@ -1162,10 +1164,15 @@ fn validate_checkpoint_bounds(object: &Object) -> Result<(), VerifyError> {
     Ok(())
 }
 
-fn expected_max_file_systems(block_count: u64, block_size: u32) -> u64 {
-    let bytes = block_count.saturating_mul(block_size as u64);
-    const HALF_GIB: u64 = 512 * 1024 * 1024;
-    bytes.div_ceil(HALF_GIB).clamp(1, 100)
+// Apple's nx_max_file_systems is 1..=100, not size/512MiB.
+fn validate_max_file_systems(max_file_systems: u32) -> Result<(), VerifyError> {
+    if max_file_systems == 0 || max_file_systems > 100 {
+        return Err(VerifyError::FieldOutOfRange {
+            what: "nx_max_file_systems",
+            observed: max_file_systems as u64,
+        });
+    }
+    Ok(())
 }
 
 fn validate_ephemeral_info(sb: &[u8]) -> Result<(), VerifyError> {
@@ -1551,14 +1558,7 @@ pub fn verify_container(source: &mut dyn BlockSource) -> Result<VerifiedContaine
     let omap_entries = verifier.collect_omap(omap_tree, "container object map tree")?;
 
     let max_file_systems = u32_at(&sb, 0xB4);
-    let expected_max_file_systems = expected_max_file_systems(block_count, block_size);
-    if max_file_systems as u64 != expected_max_file_systems {
-        return Err(VerifyError::FieldMismatch {
-            what: "nx_max_file_systems",
-            expected: expected_max_file_systems,
-            observed: max_file_systems as u64,
-        });
-    }
+    validate_max_file_systems(max_file_systems)?;
     let mut volumes = Vec::new();
     for index in 0..max_file_systems as usize {
         let oid = u64_at(&sb, 0xB8 + index * 8);
@@ -1754,14 +1754,7 @@ pub fn read_container_seals(source: &mut dyn BlockSource) -> Result<ContainerSea
     let omap_entries = verifier.collect_omap(omap_tree, "container object map tree")?;
 
     let max_file_systems = u32_at(&sb, 0xB4);
-    let expected_max_file_systems = expected_max_file_systems(block_count, block_size);
-    if max_file_systems as u64 != expected_max_file_systems {
-        return Err(VerifyError::FieldMismatch {
-            what: "nx_max_file_systems",
-            expected: expected_max_file_systems,
-            observed: max_file_systems as u64,
-        });
-    }
+    validate_max_file_systems(max_file_systems)?;
 
     let mut volumes = Vec::new();
     for index in 0..max_file_systems as usize {
@@ -3960,6 +3953,7 @@ mod tests {
         assert_eq!(hashed.name_length(key), Some(12));
         assert_eq!(&key[hashed.name_offset()..key.len() - 1], b"private-dir");
         assert_eq!(u32_at(key, 8) >> 10, 0x2B_29A3);
+        assert_eq!(hashed.sort_prefix(key), 0x2B_29A3);
 
         let plain = DrecKeyLayout::Plain;
         assert_eq!(plain.name_length(key), Some(35_852));
@@ -3973,6 +3967,22 @@ mod tests {
             &as_plain[plain.name_offset()..as_plain.len() - 1],
             b"private-dir"
         );
+    }
+
+    #[test]
+    fn hashed_directory_records_with_the_same_hash_sort_by_name_not_packed_length() {
+        let hashed = DrecKeyLayout::Hashed;
+        let mut security = vec![0u8; 8];
+        security.extend_from_slice(&0x8064_c024u32.to_le_bytes());
+        security.extend_from_slice(b"SecurityImprovementsExtension\0");
+        let mut storage = vec![0u8; 8];
+        storage.extend_from_slice(&0x8064_c014u32.to_le_bytes());
+        storage.extend_from_slice(b"StorageDESDXC.appex\0");
+        assert_eq!(hashed.sort_prefix(&security), hashed.sort_prefix(&storage));
+        assert!(u32_at(&security, 8) > u32_at(&storage, 8));
+        let left = RecordTail::of(J_DIR_REC, &security, hashed);
+        let right = RecordTail::of(J_DIR_REC, &storage, hashed);
+        assert!(left < right, "{left:?} should sort before {right:?}");
     }
 
     #[test]

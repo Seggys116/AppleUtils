@@ -74,6 +74,7 @@ pub struct RecoveryHitMap {
     pub requests_pane: Rect,
     pub events_pane: Rect,
     pub handoff: Rect,
+    pub local_policy_signing: Rect,
 }
 
 impl RecoveryHitMap {
@@ -85,6 +86,7 @@ impl RecoveryHitMap {
         self.requests_pane = Rect::default();
         self.events_pane = Rect::default();
         self.handoff = Rect::default();
+        self.local_policy_signing = Rect::default();
     }
 
     pub fn device_at(&self, col: u16, row: u16) -> Option<usize> {
@@ -104,6 +106,10 @@ impl RecoveryHitMap {
 
     pub fn handoff_at(&self, col: u16, row: u16) -> bool {
         contains(&self.handoff, col, row)
+    }
+
+    pub fn local_policy_signing_at(&self, col: u16, row: u16) -> bool {
+        contains(&self.local_policy_signing, col, row)
     }
 
     pub fn pane_at(&self, col: u16, row: u16) -> Option<RecoveryFocus> {
@@ -441,6 +447,7 @@ pub struct RecoveryModel {
     pub device_page_rows: usize,
     pub request_page_rows: usize,
     pub event_page_rows: usize,
+    pub sign_recovery_os_local_policy: bool,
     pub hits: RecoveryHitMap,
 }
 
@@ -472,11 +479,51 @@ impl Default for RecoveryModel {
             device_page_rows: 0,
             request_page_rows: 0,
             event_page_rows: 0,
+            sign_recovery_os_local_policy: false,
             hits: RecoveryHitMap::default(),
         };
         model.push_log(LogLevel::Info, "Recovery monitor online");
         model
     }
+}
+
+#[must_use]
+pub fn local_policy_signing_title(enabled: bool) -> &'static str {
+    if enabled {
+        "LocalPolicy signing armed"
+    } else {
+        "LocalPolicy signing off"
+    }
+}
+
+#[must_use]
+pub fn local_policy_signing_detail(enabled: bool) -> String {
+    if enabled {
+        format!(
+            "sends this Mac's ECID, chip and board to {}",
+            crate::restore::SIGNING_SERVER_DEFAULT_BASE_URL
+        )
+    } else {
+        "Apple is not contacted; the recoveryOS policy stays unbound".to_string()
+    }
+}
+
+#[must_use]
+pub fn local_policy_signing_short(enabled: bool) -> &'static str {
+    if enabled {
+        "signing armed, ECID to Apple"
+    } else {
+        "signing off"
+    }
+}
+
+#[must_use]
+pub fn local_policy_signing_status(enabled: bool) -> String {
+    format!(
+        "{}: {}",
+        local_policy_signing_title(enabled),
+        local_policy_signing_detail(enabled)
+    )
 }
 
 pub fn initial_manifest_request() -> FileRequestSpec {
@@ -1394,6 +1441,9 @@ impl RecoveryModel {
                     format!("Selected {} for {system}", mode.title()),
                 );
             }
+            RecoveryEvent::LocalPolicySigning { enabled } => {
+                self.sign_recovery_os_local_policy = enabled;
+            }
             RecoveryEvent::Cancelled { note } => {
                 self.phase = SessionPhase::Cancelled;
                 self.progress = None;
@@ -2058,6 +2108,9 @@ pub enum RecoveryEvent {
     },
     ModeSelected {
         mode: RestoreMode,
+    },
+    LocalPolicySigning {
+        enabled: bool,
     },
     Cancelled {
         note: Option<String>,

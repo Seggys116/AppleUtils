@@ -17,6 +17,10 @@ use crate::ramrod::{
 };
 use crate::usbmux::{BulkTransport, is_device_gone, is_host_initiated_teardown, is_run_stopped};
 
+use super::local_policy::{
+    RecoveryOsLocalPolicySigner, SIGNING_ENVELOPE_VERSION_INFO, SIGNING_OPT_IN_FLAG,
+    SIGNING_OPT_IN_KEY, SIGNING_SERVER_DEFAULT_BASE_URL, signing_server_signer,
+};
 use super::mux::{ClaimedMuxTransport, bring_up_mux};
 use super::options::{manifest_identity_count, resolve_restore_manifest};
 use super::phases::{
@@ -898,6 +902,14 @@ pub fn run_ramrod_restore_over_mux<T: BulkTransport + Send + 'static>(
                     armed_at_secs,
                     &reporter,
                 ),
+                local_policy_signer: local_policy_signer_for_plan(
+                    plan,
+                    &derived.session_uuid,
+                    port,
+                    armed_at_secs,
+                    &reporter,
+                ),
+                local_policy_census: super::local_policy::LocalPolicyCensus::default(),
                 port,
                 armed_at_secs,
                 reporter: Arc::clone(&reporter),
@@ -982,10 +994,53 @@ pub fn run_ramrod_restore_over_mux<T: BulkTransport + Send + 'static>(
     outcome
 }
 
+pub fn local_policy_signer_for_plan(
+    plan: &RestorePlan,
+    session_uuid: &str,
+    port: u16,
+    armed_at_secs: f64,
+    reporter: &SharedReporter,
+) -> Option<Arc<dyn RecoveryOsLocalPolicySigner>> {
+    if !plan.sign_recovery_os_local_policy {
+        let line = format!(
+            "{MUX_PREFIX} result=recovery-os-local-policy-signing-not-armed port={port} at={armed_at_secs:.3}s flag={SIGNING_OPT_IN_FLAG} key={SIGNING_OPT_IN_KEY} meaning=\"LocalPolicy signing not armed\" detail=\"pass {SIGNING_OPT_IN_FLAG} or press {SIGNING_OPT_IN_KEY} before the restore starts; issuing posts ECID, chip and board to {SIGNING_SERVER_DEFAULT_BASE_URL}\""
+        );
+        report(
+            reporter,
+            "recovery-os-local-policy-signing-not-armed",
+            &line,
+        );
+        return None;
+    }
+    match signing_server_signer(Some(session_uuid.to_string())) {
+        Ok(signer) => {
+            let line = format!(
+                "{MUX_PREFIX} result=recovery-os-local-policy-signing-armed port={port} at={armed_at_secs:.3}s source={} base_url={SIGNING_SERVER_DEFAULT_BASE_URL} uuid={session_uuid} version_info={SIGNING_ENVELOPE_VERSION_INFO} meaning=\"LocalPolicy signing armed\" detail=\"a request that passes the identity gate is posted to {SIGNING_SERVER_DEFAULT_BASE_URL}; arming itself issues nothing\"",
+                signer.source()
+            );
+            report(reporter, "recovery-os-local-policy-signing-armed", &line);
+            Some(signer)
+        }
+        Err(error) => {
+            let line = format!(
+                "{MUX_PREFIX} result=recovery-os-local-policy-signing-not-armable port={port} at={armed_at_secs:.3}s flag={SIGNING_OPT_IN_FLAG} meaning=\"LocalPolicy signing armed but envelope unreadable\" detail=\"{error}\""
+            );
+            report(
+                reporter,
+                "recovery-os-local-policy-signing-not-armable",
+                &line,
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ReporterProducerTrace, RestoreBootContext, RestoreOutcome, run_ramrod_restore_over_mux,
+        ReporterProducerTrace, RestoreBootContext, RestoreOutcome, SIGNING_OPT_IN_FLAG,
+        SIGNING_OPT_IN_KEY, SIGNING_SERVER_DEFAULT_BASE_URL, local_policy_signer_for_plan,
+        run_ramrod_restore_over_mux,
     };
     use crate::asr_server::AsrServerConfig;
     use crate::asr_server::producer::{AsrProducerEvent, AsrProducerSink};
@@ -1075,6 +1130,7 @@ mod tests {
             staged_boot_manifest_sha384: None,
             fdr_trust_digest: None,
             fdr_material_dir: None,
+            sign_recovery_os_local_policy: false,
         }
     }
 
@@ -1134,5 +1190,66 @@ mod tests {
             RestoreOutcome::Failed { ref stage, .. } if stage == "restore-manifest-unusable"
         ));
         assert_eq!(malformed_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_signing_service_is_armed_only_by_the_plan_the_operator_set() {
+        let image = PathBuf::from("restore.dmg");
+
+        let mut off = plan(image.clone(), None);
+        off.sign_recovery_os_local_policy = false;
+        let (off_recorded, off_reporter) = reporter();
+        let off_signer =
+            local_policy_signer_for_plan(&off, "SESSION-UUID", 62078, 0.0, &off_reporter);
+        let off_events = off_recorded.lock().expect("reporter lock").events.clone();
+        assert_eq!(off_events.len(), 1, "{off_events:?}");
+        assert_eq!(
+            off_events[0].0, "recovery-os-local-policy-signing-not-armed",
+            "an unarmed run records why it will not issue the request: {off_events:?}"
+        );
+        assert!(
+            off_events[0]
+                .1
+                .contains(&format!("flag={SIGNING_OPT_IN_FLAG}")),
+            "the decline names the flag that would arm it: {off_events:?}"
+        );
+        assert!(
+            off_events[0]
+                .1
+                .contains(&format!("key={SIGNING_OPT_IN_KEY}")),
+            "the decline names the screen key that would arm it: {off_events:?}"
+        );
+        assert!(
+            off_signer.is_none(),
+            "an unarmed run carries the same absent service it always has"
+        );
+
+        let mut on = plan(image, None);
+        on.sign_recovery_os_local_policy = true;
+        let (on_recorded, on_reporter) = reporter();
+        let on_signer = local_policy_signer_for_plan(&on, "SESSION-UUID", 62078, 0.0, &on_reporter)
+            .expect("the operator armed the service, so the run carries one");
+        assert_eq!(
+            on_signer.source(),
+            "curl",
+            "the armed service issues over the transport this tree already uses"
+        );
+        let on_events = on_recorded.lock().expect("reporter lock").events.clone();
+        assert_eq!(on_events.len(), 1, "{on_events:?}");
+        assert_eq!(
+            on_events[0].0, "recovery-os-local-policy-signing-armed",
+            "{on_events:?}"
+        );
+        assert!(on_events[0].1.contains("source=curl"), "{on_events:?}");
+        assert!(
+            on_events[0].1.contains("uuid=SESSION-UUID"),
+            "the arm carries the run's own session identifier, not one invented here: {on_events:?}"
+        );
+        assert!(
+            on_events[0]
+                .1
+                .contains(&format!("base_url={SIGNING_SERVER_DEFAULT_BASE_URL}")),
+            "the arm names where the request would go: {on_events:?}"
+        );
     }
 }

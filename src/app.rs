@@ -1017,6 +1017,10 @@ impl App {
                     self.back_to_picker();
                     false
                 }
+                KeyCode::Char('p') => {
+                    self.recovery.toggle_local_policy_signing();
+                    false
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.recovery.model.move_system_cursor(-1);
                     false
@@ -1061,6 +1065,10 @@ impl App {
                     self.recovery.model.clear_restore_mode_choice();
                     false
                 }
+                KeyCode::Char('p') => {
+                    self.recovery.toggle_local_policy_signing();
+                    false
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.recovery.model.move_mode_cursor(-1);
                     false
@@ -1088,6 +1096,10 @@ impl App {
                 KeyCode::Char('q') => true,
                 KeyCode::Esc | KeyCode::Backspace => {
                     self.back_to_picker();
+                    false
+                }
+                KeyCode::Char('p') => {
+                    self.recovery.toggle_local_policy_signing();
                     false
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -1504,11 +1516,7 @@ impl App {
             .iter()
             .position(|finding| finding.failed())
             .unwrap_or(0);
-        let applicable = self
-            .repair_findings
-            .iter()
-            .filter(|finding| finding.status != crate::repair_ops::CheckStatus::NotApplicable)
-            .count() as f64;
+        let applicable = self.repair_findings.len() as f64;
         let passed = self
             .repair_findings
             .iter()
@@ -3018,6 +3026,10 @@ impl App {
     }
 
     fn recovery_click(&mut self, col: u16, row: u16) {
+        if self.recovery.model.hits.local_policy_signing_at(col, row) {
+            self.recovery.toggle_local_policy_signing();
+            return;
+        }
         if self.recovery.model.step() == RecoveryStep::PickSystem
             && let Some(index) = self.recovery.model.hits.device_at(col, row)
         {

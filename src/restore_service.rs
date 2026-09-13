@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::symlink;
@@ -24,9 +24,10 @@ use crate::crypto::{Sha256, Sha512};
 #[cfg(test)]
 use crate::ramrod::BOOT_NONCE_HASH_BYTES;
 use crate::ramrod::{
-    BUILD_MANIFEST_FILE_NAME, BuildIdentity, DeviceType, FinalStatus, RESTORE_PLIST_FILE_NAME,
-    RestoreBehavior, image_candidates, install_behaviors_for_board, load_build_manifest,
-    load_restore_catalog, select_install_identity, select_macos_identity,
+    BUILD_MANIFEST_FILE_NAME, BUNDLE_ROOT_DIR, BuildIdentity, DeviceType, FinalStatus,
+    RESTORE_PLIST_FILE_NAME, RESTORE_VERSION_FILE_NAME, RestoreBehavior, SYSTEM_VERSION_FILE_NAME,
+    image_candidates, install_behaviors_for_board, load_build_manifest, load_restore_catalog,
+    select_install_identity, select_macos_identity,
 };
 use crate::recovery_model::RestoreMode;
 use crate::recovery_model::{
@@ -39,13 +40,14 @@ use crate::restore::{
     BRIDGE_SIGN_MANB_REQUEST, BRIDGE_SIGN_MANB_RESPONSE, ClaimedMuxTransport,
     ClaimedMuxTransportMetadata, FdrTrustDigest, HostDetachDisposition, HostDetachOutcome,
     HostDetacher, MUX_PREFIX, RemoteManifestSigner, RestoreBootContext, RestoreOutcome,
-    RestorePlan, SessionBroker, SessionReply, derive_restore_options, hex_digest,
-    prepare_restore_session_with_branching, run_ramrod_restore_over_mux,
+    RestorePlan, SIGNING_SERVER_DEFAULT_BASE_URL, SessionBroker, SessionReply,
+    derive_restore_options, hex_digest, prepare_restore_session_with_branching,
+    run_ramrod_restore_over_mux,
 };
 use crate::usbmux::{
-    BridgeClaim, BridgeClient, ClaimedSessionControl, LinkWatchdogPolicy, MuxDialer, MuxLink,
-    MuxTraceEvent, MuxTraceSink, SharedLink, SocketBulkTransport, VersionRequest,
-    spawn_link_watchdog,
+    BridgeClaim, BridgeClient, ClaimedSessionControl, LineBudget, LinkWatchdogPolicy, MuxDialer,
+    MuxLink, MuxTraceEvent, MuxTraceSink, RoundtripMeter, SharedLink, SocketBulkTransport,
+    VersionRequest, spawn_link_watchdog,
 };
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_millis(500);
@@ -312,6 +314,18 @@ impl ClaimedRestore for RealClaimedRestore {
     }
 }
 
+fn mux_roundtrip_meter(
+    reporter: crate::restore::SharedReporter,
+    budget: LineBudget,
+) -> RoundtripMeter {
+    RoundtripMeter::with_sink(
+        budget,
+        Box::new(move |line: &str| {
+            crate::restore::report::report(&reporter, "mux-roundtrip", line);
+        }),
+    )
+}
+
 struct MuxReportTrace {
     reporter: crate::restore::SharedReporter,
 }
@@ -352,7 +366,10 @@ fn build_claimed_transport(
     // Held directly off the transport, before it moves into the link, so the watchdog never has
     // to take the link mutex it exists to watch in order to sample it.
     let watchdog_metrics = transport.watchdog_metrics();
-    let link = SharedLink::new(MuxLink::new(transport));
+    let link = SharedLink::new(
+        MuxLink::new(transport)
+            .with_roundtrip_meter(mux_roundtrip_meter(reporter.clone(), LineBudget::process())),
+    );
     // Started before the version exchange, not after it, so the one exchange that is allowed to
     // wait under the link is watched too. Traces only, never aborts: this is a diagnosis fix.
     let watchdog = Arc::new(spawn_link_watchdog(
@@ -531,6 +548,7 @@ struct ServiceWorker {
     discovery_failures: u32,
     session: Option<ClaimedSession>,
     prepared: Option<PreparedRestore>,
+    sign_recovery_os_local_policy: bool,
 }
 
 impl ServiceWorker {
@@ -549,6 +567,7 @@ impl ServiceWorker {
             discovery_failures: 0,
             session: None,
             prepared: None,
+            sign_recovery_os_local_policy: false,
         }
     }
 
@@ -595,6 +614,9 @@ impl ServiceWorker {
             RecoveryCommand::RetryRestore { device_id } => self.retry_restore(&device_id),
             RecoveryCommand::SelectSystem { device_class } => self.select_system(&device_class),
             RecoveryCommand::SelectRestoreMode { mode } => self.select_restore_mode(mode),
+            RecoveryCommand::SetLocalPolicySigning { enabled } => {
+                self.set_local_policy_signing(enabled);
+            }
             RecoveryCommand::Autosearch { device_id, path } => self.autosearch(&device_id, &path),
         }
     }
@@ -1434,6 +1456,44 @@ impl ServiceWorker {
         }
     }
 
+    fn set_local_policy_signing(&mut self, enabled: bool) {
+        let running = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.restore_run.is_some());
+        if running {
+            self.emit(RecoveryEvent::Log {
+                level: LogLevel::Warn,
+                message: format!(
+                    "recoveryOS LocalPolicy signing stays {} for this restore: the run's plan was fixed when it started",
+                    if self.sign_recovery_os_local_policy {
+                        "armed"
+                    } else {
+                        "off"
+                    }
+                ),
+            });
+            self.emit(RecoveryEvent::LocalPolicySigning {
+                enabled: self.sign_recovery_os_local_policy,
+            });
+            return;
+        }
+        self.sign_recovery_os_local_policy = enabled;
+        let message = if enabled {
+            format!(
+                "recoveryOS LocalPolicy signing armed: a restore will send this Mac's ECID, chip and board to {SIGNING_SERVER_DEFAULT_BASE_URL} to have its LocalPolicy signed"
+            )
+        } else {
+            "recoveryOS LocalPolicy signing off: no restore will contact Apple's signing server"
+                .to_string()
+        };
+        self.emit(RecoveryEvent::Log {
+            level: LogLevel::Info,
+            message,
+        });
+        self.emit(RecoveryEvent::LocalPolicySigning { enabled });
+    }
+
     fn offer_or_collect_for_class(&mut self, device_class: &str) -> Result<(), String> {
         let prepared = self
             .prepared
@@ -2219,11 +2279,12 @@ impl ServiceWorker {
         if self.emit_pending_file_requests() {
             return;
         }
+        let sign_recovery_os_local_policy = self.sign_recovery_os_local_policy;
         let plan = match self
             .session
             .as_mut()
             .expect("claimed session")
-            .build_restore_plan()
+            .build_restore_plan(sign_recovery_os_local_policy)
         {
             Ok(plan) => plan,
             Err(error) => {
@@ -2647,7 +2708,10 @@ impl ClaimedSession {
         );
     }
 
-    fn build_restore_plan(&mut self) -> Result<RestorePlan, String> {
+    fn build_restore_plan(
+        &mut self,
+        sign_recovery_os_local_policy: bool,
+    ) -> Result<RestorePlan, String> {
         if !self.pending_requests.is_empty() {
             return Err("More files are still required before restore can start".to_string());
         }
@@ -2685,11 +2749,10 @@ impl ClaimedSession {
                     &overlay_path,
                 )?;
             }
-            let bootability_bundle = mirror_optional_directory(
-                &manifest_root,
-                Path::new("BootabilityBundle"),
-                &overlay_path,
-            )?;
+            // Mirror rewrites relative symlinks; serve the found tree as-is.
+            let bootability_bundle = locate_bootability_bundle_source(&manifest_root)?;
+            // Before accepted files so a same-path overlay still wins; skip missing names.
+            stage_source_version_plists(&manifest_root, &overlay_path)?;
             let manifest_path = materialize_accepted_file(
                 &manifest,
                 &overlay_path,
@@ -2754,6 +2817,7 @@ impl ClaimedSession {
                     .clone()
                     .map(PathBuf::from)
                     .filter(|path| path.is_dir()),
+                sign_recovery_os_local_policy,
             };
             let prepared = prepare_restore_session_with_branching(
                 &plan,
@@ -3772,6 +3836,104 @@ fn locate_firmware_source(root: &Path) -> Result<Option<PathBuf>, String> {
     Ok(exact)
 }
 
+// Handed root can sit above the restore set; search is scoped to this BuildManifest.
+fn locate_bootability_bundle_source(root: &Path) -> Result<Option<PathBuf>, String> {
+    if let Some(exact) = optional_source_directory(root, Path::new(BUNDLE_ROOT_DIR))? {
+        return Ok(Some(exact));
+    }
+    find_directory_with_suffix(root, &[BUNDLE_ROOT_DIR])
+}
+
+pub(crate) const SOURCE_VERSION_PLIST_NAMES: [&str; 2] =
+    [RESTORE_VERSION_FILE_NAME, SYSTEM_VERSION_FILE_NAME];
+
+// Skip missing names; an empty file here would answer the guest instead of refusing.
+fn stage_source_version_plists(
+    manifest_root: &Path,
+    overlay: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let mut staged = Vec::new();
+    for file_name in SOURCE_VERSION_PLIST_NAMES {
+        let Some(source) = locate_version_plist_source(manifest_root, file_name)? else {
+            continue;
+        };
+        let relative = Path::new(file_name);
+        ensure_destination_parent(overlay, relative)?;
+        let destination = overlay.join(relative);
+        link_exact_file(&source, &destination)?;
+        staged.push(destination);
+    }
+    Ok(staged)
+}
+
+fn locate_version_plist_source(root: &Path, file_name: &str) -> Result<Option<PathBuf>, String> {
+    let canonical_root = fs::canonicalize(root)
+        .map_err(|error| format!("Could not resolve extracted IPSW root: {error}"))?;
+    if let Some(exact) = regular_file_in_directory(&canonical_root, file_name) {
+        return Ok(Some(exact));
+    }
+    find_file_named(&canonical_root, file_name)
+}
+
+fn regular_file_in_directory(directory: &Path, file_name: &str) -> Option<PathBuf> {
+    let candidate = directory.join(file_name);
+    let metadata = fs::symlink_metadata(&candidate).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return None;
+    }
+    Some(candidate)
+}
+
+fn find_file_named(canonical_root: &Path, file_name: &str) -> Result<Option<PathBuf>, String> {
+    let root_manifest = restore_set_manifest(canonical_root);
+    let mut queue = VecDeque::from([canonical_root.to_path_buf()]);
+    let mut seen = HashSet::new();
+    let mut visited = 0usize;
+    while let Some(directory) = queue.pop_front() {
+        if visited >= 100_000 {
+            break;
+        }
+        if !seen.insert(directory.clone()) {
+            continue;
+        }
+        if let Some(found) = regular_file_in_directory(&directory, file_name) {
+            return Ok(Some(found));
+        }
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        let mut children: Vec<PathBuf> = Vec::new();
+        for entry in entries.flatten() {
+            visited += 1;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with('.') || name == "__MACOSX" {
+                continue;
+            }
+            let child = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&child) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                continue;
+            }
+            if root_manifest
+                .as_ref()
+                .is_some_and(|manifest| declares_another_restore_set(&child, manifest))
+            {
+                continue;
+            }
+            children.push(child);
+        }
+        children.sort();
+        queue.extend(children);
+    }
+    Ok(None)
+}
+
 fn find_directory_with_suffix(root: &Path, suffix: &[&str]) -> Result<Option<PathBuf>, String> {
     if suffix.is_empty() {
         return Ok(None);
@@ -3872,29 +4034,6 @@ fn mirror_located_directory(
     })?;
     mirror_directory_contents(&canonical_root, &canonical_source, &destination)?;
     Ok(destination)
-}
-
-fn mirror_optional_directory(
-    root: &Path,
-    relative: &Path,
-    overlay: &Path,
-) -> Result<Option<PathBuf>, String> {
-    let Some(source) = optional_source_directory(root, relative)? else {
-        return Ok(None);
-    };
-    validate_relative_path(relative, "mirrored provider directory")?;
-    let destination = overlay.join(relative);
-    ensure_destination_parent(overlay, relative)?;
-    fs::create_dir(&destination).map_err(|error| {
-        format!(
-            "Could not create mirrored provider directory {}: {error}",
-            destination.display()
-        )
-    })?;
-    let canonical_root = fs::canonicalize(root)
-        .map_err(|error| format!("Could not resolve extracted IPSW root: {error}"))?;
-    mirror_directory_contents(&canonical_root, &source, &destination)?;
-    Ok(Some(destination))
 }
 
 fn mirror_directory_contents(root: &Path, source: &Path, destination: &Path) -> Result<(), String> {
@@ -4812,6 +4951,7 @@ mod tests {
             crash_logs_written: 0,
             guest_log: None,
             checkpoint_error: None,
+            checkpoint_error_endured: false,
         }
     }
 
@@ -5877,6 +6017,17 @@ mod tests {
         );
     }
 
+    fn mirror_relative_directory(
+        root: &Path,
+        relative: &Path,
+        overlay: &Path,
+    ) -> Result<Option<PathBuf>, String> {
+        let Some(source) = optional_source_directory(root, relative)? else {
+            return Ok(None);
+        };
+        mirror_located_directory(root, &source, relative, overlay).map(Some)
+    }
+
     #[test]
     fn symlink_inside_mirrored_tree_is_materialized() {
         let directory = tempdir().unwrap();
@@ -5888,7 +6039,7 @@ mod tests {
         let overlay = create_overlay_root().unwrap();
 
         let mirrored =
-            mirror_optional_directory(directory.path(), Path::new("Firmware"), overlay.path())
+            mirror_relative_directory(directory.path(), Path::new("Firmware"), overlay.path())
                 .unwrap()
                 .unwrap();
         let alias = mirrored.join("alias.im4p");
@@ -5914,7 +6065,7 @@ mod tests {
         let overlay = create_overlay_root().unwrap();
 
         let error =
-            mirror_optional_directory(directory.path(), Path::new("Firmware"), overlay.path())
+            mirror_relative_directory(directory.path(), Path::new("Firmware"), overlay.path())
                 .expect_err("an escaping symlink must stop staging");
         assert!(
             error.contains("escapes") || error.contains("symlink"),
@@ -5933,7 +6084,7 @@ mod tests {
         let overlay = create_overlay_root().unwrap();
 
         let mirrored =
-            mirror_optional_directory(directory.path(), Path::new("Firmware"), overlay.path())
+            mirror_relative_directory(directory.path(), Path::new("Firmware"), overlay.path())
                 .unwrap()
                 .unwrap();
         let nested = mirrored.join("nested");
@@ -5970,7 +6121,7 @@ mod tests {
         let mirrored_source = firmware.join("Stockholm7.RELEASE.sefw");
         fs::write(&mirrored_source, b"sefw-payload").unwrap();
         let overlay = create_overlay_root().unwrap();
-        mirror_optional_directory(extract.path(), Path::new("Firmware"), overlay.path())
+        mirror_relative_directory(extract.path(), Path::new("Firmware"), overlay.path())
             .unwrap()
             .unwrap();
 
@@ -5999,7 +6150,7 @@ mod tests {
         fs::create_dir_all(&firmware).unwrap();
         fs::write(firmware.join("Stockholm7.RELEASE.sefw"), b"from-extract").unwrap();
         let overlay = create_overlay_root().unwrap();
-        mirror_optional_directory(extract.path(), Path::new("Firmware"), overlay.path())
+        mirror_relative_directory(extract.path(), Path::new("Firmware"), overlay.path())
             .unwrap()
             .unwrap();
 
@@ -7091,6 +7242,116 @@ mod tests {
             plan.behavior,
             Some(RestoreBehavior::Erase),
             "the user's erase pick must be the restore that is started, not the upgrade default"
+        );
+        assert!(
+            !plan.sign_recovery_os_local_policy,
+            "a restore nobody armed carries the opt in off, so this run reaches no signing server"
+        );
+    }
+
+    #[test]
+    fn the_signing_opt_in_is_what_the_restore_plan_carries() {
+        let directory = tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("Firmware/Manifests/restore")).unwrap();
+        let image_body = b"expected image";
+        let digest = crate::crypto::sha384(image_body);
+        let value = manifest("J274AP", &digest);
+        write_manifest(&directory.path().join("BuildManifest.plist"), &value);
+        write_restore_plist(
+            &directory.path().join("Restore.plist"),
+            &[("j274ap", "t8103")],
+            "26.5.1",
+            "25F80",
+        );
+        let image = directory.path().join("OS__058-12345-001.dmg");
+        fs::write(&image, image_body).unwrap();
+
+        let claim = FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success);
+        let backend = Arc::new(FakeBackend::new(
+            BackendDiscovery {
+                devices: vec![broker_device("vm-1")],
+            },
+            Arc::clone(&claim),
+        ));
+        let mut service = AppleRecoveryService::with_backend(backend);
+        let _ = wait_for(&mut service, |events| {
+            events.iter().any(|event| {
+                matches!(event, RecoveryEvent::FileRequested(spec) if spec.request_id == MANIFEST_REQUEST_ID)
+            })
+        });
+        service
+            .send(RecoveryCommand::ProvideFile {
+                device_id: String::new(),
+                request_id: MANIFEST_REQUEST_ID.to_string(),
+                path: directory.path().join("Restore.plist").display().to_string(),
+            })
+            .unwrap();
+        select_prepared_board(&mut service, "j274ap");
+        let _ = wait_for(&mut service, |events| {
+            events.iter().any(|event| {
+                matches!(event, RecoveryEvent::FileRequested(spec) if spec.request_id == SYSTEM_IMAGE_REQUEST_ID)
+                    || matches!(
+                        event,
+                        RecoveryEvent::FileAccepted { request_id, .. }
+                            if request_id == SYSTEM_IMAGE_REQUEST_ID
+                    )
+            })
+        });
+        service
+            .send(RecoveryCommand::ProvideFile {
+                device_id: String::new(),
+                request_id: SYSTEM_IMAGE_REQUEST_ID.to_string(),
+                path: image.display().to_string(),
+            })
+            .unwrap();
+        let _ = wait_for(&mut service, |events| {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    RecoveryEvent::FileAccepted { request_id, .. }
+                        if request_id == SYSTEM_IMAGE_REQUEST_ID
+                )
+            })
+        });
+        service
+            .send(RecoveryCommand::ClaimDevice {
+                device_id: "vm-1".to_string(),
+            })
+            .unwrap();
+        let _ = wait_for(&mut service, |events| {
+            events.iter().any(|event| {
+                matches!(event, RecoveryEvent::ClaimAccepted { device_id, .. } if device_id == "vm-1")
+            })
+        });
+
+        service
+            .send(RecoveryCommand::SetLocalPolicySigning { enabled: true })
+            .unwrap();
+        let _ = wait_for(&mut service, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, RecoveryEvent::LocalPolicySigning { enabled: true }))
+        });
+
+        service
+            .send(RecoveryCommand::StartRestore {
+                device_id: "vm-1".to_string(),
+            })
+            .unwrap();
+        let _ = wait_for(&mut service, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, RecoveryEvent::Succeeded { .. }))
+        });
+
+        let plan = claim.last_plan().expect("StartRestore armed a plan");
+        assert!(
+            plan.behavior.is_some(),
+            "the plan was built out of the manifest, so the field under test is read off a real plan"
+        );
+        assert!(
+            plan.sign_recovery_os_local_policy,
+            "the opt in the operator set is what the started restore carries"
         );
     }
 
@@ -8385,6 +8646,176 @@ mod tests {
         assert_eq!(locate_firmware_source(root.path()).unwrap(), None);
     }
 
+    fn write_bootability_bundle(bundle_root: &Path) -> PathBuf {
+        let restore = bundle_root.join("Restore");
+        let content = restore.join("Bootability");
+        let framework = content.join("BootabilityBrain.framework");
+        let versions = framework.join("Versions").join("A");
+        fs::create_dir_all(versions.join("Resources")).unwrap();
+        fs::write(versions.join("BootabilityBrain"), b"MACHO-BINARY").unwrap();
+        fs::write(versions.join("Resources").join("Info.plist"), b"<plist/>").unwrap();
+        symlink("A", framework.join("Versions").join("Current")).unwrap();
+        symlink(
+            "Versions/Current/BootabilityBrain",
+            framework.join("BootabilityBrain"),
+        )
+        .unwrap();
+        fs::create_dir_all(restore.join("Firmware")).unwrap();
+        fs::write(
+            restore.join("Firmware").join("Bootability.dmg.trustcache"),
+            b"trustcache",
+        )
+        .unwrap();
+        bundle_root.to_path_buf()
+    }
+
+    #[test]
+    fn a_bundle_below_the_handed_root_is_located_like_the_firmware_tree() {
+        let root = tempdir().unwrap();
+        let manifest_bytes = b"root-manifest";
+        fs::write(root.path().join(BUILD_MANIFEST_FILE_NAME), manifest_bytes).unwrap();
+
+        let set = root.path().join("MacOS");
+        let handed = set.join("restore-assets");
+        fs::create_dir_all(&handed).unwrap();
+        fs::write(set.join(BUILD_MANIFEST_FILE_NAME), manifest_bytes).unwrap();
+        fs::write(handed.join(BUILD_MANIFEST_FILE_NAME), manifest_bytes).unwrap();
+        let bundle = write_bootability_bundle(&handed.join(BUNDLE_ROOT_DIR));
+
+        let other = root.path().join("MacOS-13.5");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join(BUILD_MANIFEST_FILE_NAME), b"other-manifest").unwrap();
+        write_bootability_bundle(&other.join(BUNDLE_ROOT_DIR));
+
+        assert_eq!(
+            optional_source_directory(root.path(), Path::new(BUNDLE_ROOT_DIR)).unwrap(),
+            None,
+            "the handed root holds no bundle of its own, and resolving only that exact path is what left the guest fetching a bundle nothing was serving"
+        );
+        let located = locate_bootability_bundle_source(root.path())
+            .unwrap()
+            .expect("the bundle inside the same restore set is the one to serve");
+        assert_eq!(located, bundle.canonicalize().unwrap());
+
+        let source = crate::ramrod::BootabilityBundleSource::discover(vec![located])
+            .expect("the located directory is what the bundle transfer resolves against");
+        assert_eq!(
+            source.content(),
+            bundle
+                .canonicalize()
+                .unwrap()
+                .join("Restore")
+                .join("Bootability")
+        );
+    }
+
+    #[test]
+    fn the_version_plists_reach_the_overlay_with_the_bytes_that_are_on_disk() {
+        let root = tempdir().unwrap();
+        let manifest_bytes = b"root-manifest";
+        fs::write(root.path().join(BUILD_MANIFEST_FILE_NAME), manifest_bytes).unwrap();
+
+        let set = root.path().join("MacOS");
+        let handed = set.join("restore-assets");
+        fs::create_dir_all(&handed).unwrap();
+        fs::write(set.join(BUILD_MANIFEST_FILE_NAME), manifest_bytes).unwrap();
+        fs::write(handed.join(BUILD_MANIFEST_FILE_NAME), manifest_bytes).unwrap();
+        let restore_version = b"<plist><dict><key>RestoreLongVersion</key><string>25.5.85.0.0,0</string></dict></plist>".to_vec();
+        let system_version =
+            b"<plist><dict><key>ProductBuildVersion</key><string>25F74</string></dict></plist>"
+                .to_vec();
+        fs::write(handed.join(RESTORE_VERSION_FILE_NAME), &restore_version).unwrap();
+        fs::write(handed.join(SYSTEM_VERSION_FILE_NAME), &system_version).unwrap();
+
+        let other = root.path().join("MacOS-13.5");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join(BUILD_MANIFEST_FILE_NAME), b"other-manifest").unwrap();
+        fs::write(other.join(RESTORE_VERSION_FILE_NAME), b"the wrong build").unwrap();
+        fs::write(other.join(SYSTEM_VERSION_FILE_NAME), b"the wrong build").unwrap();
+
+        let overlay = tempdir().unwrap();
+        let staged = stage_source_version_plists(root.path(), overlay.path()).unwrap();
+        assert_eq!(
+            staged.len(),
+            2,
+            "both version plists must reach the overlay"
+        );
+
+        for (file_name, expected) in [
+            (RESTORE_VERSION_FILE_NAME, &restore_version),
+            (SYSTEM_VERSION_FILE_NAME, &system_version),
+        ] {
+            let served = overlay.path().join(file_name);
+            assert!(
+                served.is_file(),
+                "the guest resolves {file_name} at the overlay root, and an unstaged one is answered with no bytes at all"
+            );
+            assert_eq!(
+                &fs::read(&served).unwrap(),
+                expected,
+                "{file_name} must carry the bytes of the restore set that is being installed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_version_plist_the_restore_set_does_not_carry_is_left_unstaged_rather_than_created_empty() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join(BUILD_MANIFEST_FILE_NAME), b"root-manifest").unwrap();
+        fs::write(root.path().join(RESTORE_VERSION_FILE_NAME), b"restore").unwrap();
+
+        let overlay = tempdir().unwrap();
+        let staged = stage_source_version_plists(root.path(), overlay.path()).unwrap();
+        assert_eq!(staged, vec![overlay.path().join(RESTORE_VERSION_FILE_NAME)]);
+        assert!(
+            !overlay.path().join(SYSTEM_VERSION_FILE_NAME).exists(),
+            "staging an empty stand-in is the defect: the provider must be left to refuse it by name"
+        );
+    }
+
+    #[test]
+    fn the_served_bundle_keeps_framework_symlinks_a_mirrored_copy_loses() {
+        use crate::ramrod::{BootabilityBundleSource, BundleMemberKind};
+
+        let root = tempdir().unwrap();
+        fs::write(root.path().join(BUILD_MANIFEST_FILE_NAME), b"root-manifest").unwrap();
+        let bundle = write_bootability_bundle(&root.path().join(BUNDLE_ROOT_DIR));
+
+        let located = locate_bootability_bundle_source(root.path())
+            .unwrap()
+            .expect("a bundle at the root resolves without any search");
+        let source = BootabilityBundleSource::discover(vec![located]).unwrap();
+        let members = source.members().unwrap();
+        let current = members
+            .iter()
+            .find(|member| member.relative == "BootabilityBrain.framework/Versions/Current")
+            .expect("the framework version link is a member of the archive");
+        assert!(
+            matches!(&current.kind, BundleMemberKind::Symlink { target } if target == "A"),
+            "{:?}",
+            current.kind
+        );
+
+        let overlay = create_overlay_root().unwrap();
+        let mirrored = mirror_located_directory(
+            root.path(),
+            &bundle.canonicalize().unwrap(),
+            Path::new(BUNDLE_ROOT_DIR),
+            overlay.path(),
+        )
+        .unwrap();
+        let staged = mirrored
+            .join("Restore")
+            .join("Bootability")
+            .join("BootabilityBrain.framework")
+            .join("Versions")
+            .join("Current");
+        assert!(
+            fs::symlink_metadata(&staged).unwrap().file_type().is_dir(),
+            "the mirror resolves the framework's own link into a directory, so a bundle served from the staged copy is not the bundle the guest was sent to unpack"
+        );
+    }
+
     #[test]
     fn matching_manifest_is_global_source() {
         let root = tempdir().unwrap();
@@ -8422,6 +8853,67 @@ mod tests {
                     .canonicalize()
                     .unwrap()
             )
+        );
+    }
+
+    #[derive(Default)]
+    struct RoundtripRecorder {
+        lines: Vec<String>,
+    }
+
+    impl crate::restore::RestoreReporter for RoundtripRecorder {
+        fn event(&mut self, event: crate::restore::RestoreEvent<'_>) {
+            self.lines.push(event.line.to_string());
+        }
+    }
+
+    fn reported_lines_for_one_session(armed: bool) -> Vec<String> {
+        let recorder = Arc::new(Mutex::new(RoundtripRecorder::default()));
+        let reporter: crate::restore::SharedReporter = recorder.clone();
+        let device = crate::usbmux::link::tests::Device::new();
+        let mut link = MuxLink::new(device);
+        if armed {
+            link = link.with_roundtrip_meter(mux_roundtrip_meter(reporter, LineBudget::new(8)));
+        }
+        link.negotiate(VersionRequest::resync(), Duration::from_millis(50))
+            .unwrap();
+        let port = link.open(62078, Duration::from_millis(200)).unwrap();
+        link.write(port, &[0x5Au8; 4096], Duration::from_millis(200))
+            .unwrap();
+        link.close(port).unwrap();
+        let lines = recorder.lock().unwrap().lines.clone();
+        lines
+    }
+
+    #[test]
+    fn the_armed_mux_link_reports_the_send_side_roundtrip_summary() {
+        let lines = reported_lines_for_one_session(true);
+        let summary = lines
+            .iter()
+            .find(|line| line.starts_with(crate::usbmux::ROUNDTRIP_TAG))
+            .unwrap_or_else(|| panic!("the armed meter reported nothing; lines were {lines:?}"));
+        for field in [
+            "sent_bytes=4096",
+            "peer_win=",
+            "ack_n=",
+            "inwait_shut_n=",
+            "inwait_open_n=",
+            "blocked_n=",
+            "bytes_per_sec=",
+        ] {
+            assert!(
+                summary.contains(field),
+                "the summary must carry {field}: {summary}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mux_link_left_on_the_default_meter_reports_nothing_at_all() {
+        let lines = reported_lines_for_one_session(false);
+        assert!(
+            lines.is_empty(),
+            "the default meter has no sink, so it reports nothing: {lines:?}"
         );
     }
 }

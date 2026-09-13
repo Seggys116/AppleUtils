@@ -196,7 +196,12 @@ fn render_system_cards(frame: &mut Frame, area: Rect, app: &mut App) {
         app.recovery.model.system_cursor = 0;
     }
     let cursor = app.recovery.model.system_cursor;
-    let [header, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+    let [header, body, control] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
     let visible = visible_card_count(body).min(systems.len()).max(1);
     app.recovery.model.device_page_rows = visible;
     let start = scroll_start(systems.len(), cursor, visible);
@@ -231,6 +236,7 @@ fn render_system_cards(frame: &mut Frame, area: Rect, app: &mut App) {
         }
     }
     render_list_scrollbar(frame, &rects, systems.len(), visible, cursor);
+    render_local_policy_signing(frame, control, app);
 }
 
 fn render_pick_mode(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -267,7 +273,13 @@ fn render_mode_cards(frame: &mut Frame, area: Rect, app: &mut App) {
         app.recovery.model.mode_cursor = 0;
     }
     let cursor = app.recovery.model.mode_cursor;
-    let [header, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+    let [header, body, control] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+    render_local_policy_signing(frame, control, app);
     let system = app
         .recovery
         .model
@@ -295,6 +307,41 @@ fn render_mode_cards(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+fn render_local_policy_signing(frame: &mut Frame, area: Rect, app: &mut App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let enabled = app.recovery.model.sign_recovery_os_local_policy;
+    let key = crate::restore::SIGNING_OPT_IN_KEY;
+    let title = crate::recovery_model::local_policy_signing_title(enabled);
+    let sentence = format!(
+        "{key}  {title}  ·  {}",
+        crate::recovery_model::local_policy_signing_detail(enabled)
+    );
+    let text = if sentence.chars().count() <= usize::from(area.width) {
+        sentence
+    } else {
+        format!(
+            "{key}  {}",
+            crate::recovery_model::local_policy_signing_short(enabled)
+        )
+    };
+    let style = if enabled {
+        theme::fail().add_modifier(Modifier::BOLD)
+    } else {
+        theme::mute()
+    };
+    app.recovery.model.hits.local_policy_signing = area;
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            ui::truncate_middle(&text, area.width),
+            style,
+        )))
+        .alignment(Alignment::Center),
+        area,
+    );
+}
+
 fn render_pick_device(frame: &mut Frame, area: Rect, app: &mut App) {
     let connected: Vec<usize> = app
         .recovery
@@ -313,6 +360,9 @@ fn render_pick_device(frame: &mut Frame, area: Rect, app: &mut App) {
         app.recovery.model.device_cursor = connected[0];
     }
 
+    let [area, control] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+    render_local_policy_signing(frame, control, app);
     let cursor = app.recovery.model.device_cursor;
     let visible = visible_card_count(area).min(connected.len()).max(1);
     app.recovery.model.device_page_rows = visible;
@@ -568,6 +618,21 @@ mod tests {
         RestoreProgress, SizeRange,
     };
 
+    fn press_signing_key(app: &mut App) {
+        use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        let mut event = KeyEvent::new(
+            KeyCode::Char(
+                crate::restore::SIGNING_OPT_IN_KEY
+                    .chars()
+                    .next()
+                    .expect("the opt in key is one character"),
+            ),
+            KeyModifiers::NONE,
+        );
+        event.kind = KeyEventKind::Press;
+        app.handle_event(Event::Key(event));
+    }
+
     fn boards(classes: &[&str]) -> Vec<CompatibleSystem> {
         classes
             .iter()
@@ -726,6 +791,82 @@ mod tests {
         assert!(text.contains("Wipe the Mac and install"), "{text}");
         assert!(text.contains("Mac mini (M1, 2020)"), "{text}");
         assert_eq!(app.recovery.model.step(), RecoveryStep::PickMode);
+    }
+
+    #[test]
+    fn the_signing_control_is_on_every_screen_a_restore_is_set_up_from() {
+        let mut app = App::new();
+        app.screen = Screen::Recovery;
+        app.recovery.model.requests.clear();
+
+        app.recovery
+            .model
+            .apply_event(RecoveryEvent::DeviceDiscovered(RecoveryDevice {
+                id: "dev-1".into(),
+                title: "Mac mini".into(),
+                detail: "j274ap".into(),
+                connection: "usb".into(),
+                state: DeviceState::Available,
+                connected: true,
+            }));
+        assert_eq!(app.recovery.model.step(), RecoveryStep::PickDevice);
+        let text = render_text(&mut app, 100, 32);
+        assert!(text.contains("LocalPolicy signing off"), "{text}");
+        assert!(
+            text.contains("Apple is not contacted"),
+            "the off state says plainly that nothing is sent: {text}"
+        );
+
+        press_signing_key(&mut app);
+        assert!(
+            app.recovery.model.sign_recovery_os_local_policy,
+            "the key arms the opt in"
+        );
+        let text = render_text(&mut app, 100, 32);
+        assert!(text.contains("LocalPolicy signing armed"), "{text}");
+        assert!(
+            text.contains("ECID, chip and board"),
+            "the armed state names what is sent to Apple: {text}"
+        );
+        assert!(
+            text.contains("gs.apple.com"),
+            "the armed state names where it is sent: {text}"
+        );
+
+        app.recovery
+            .model
+            .apply_event(RecoveryEvent::CompatibleBoards {
+                systems: boards(&["j274ap", "j293ap"]),
+                product_version: None,
+                product_build: None,
+            });
+        assert_eq!(app.recovery.model.step(), RecoveryStep::PickSystem);
+        let text = render_text(&mut app, 100, 32);
+        assert!(text.contains("LocalPolicy signing armed"), "{text}");
+        press_signing_key(&mut app);
+        assert!(
+            !app.recovery.model.sign_recovery_os_local_policy,
+            "the same key disarms it from the system screen"
+        );
+
+        app.recovery
+            .model
+            .apply_event(RecoveryEvent::SystemSelected {
+                class: "j274ap".into(),
+            });
+        app.recovery
+            .model
+            .apply_event(RecoveryEvent::CompatibleModes {
+                modes: vec![RestoreMode::Update, RestoreMode::Erase],
+            });
+        assert_eq!(app.recovery.model.step(), RecoveryStep::PickMode);
+        let text = render_text(&mut app, 100, 32);
+        assert!(text.contains("LocalPolicy signing off"), "{text}");
+        press_signing_key(&mut app);
+        assert!(
+            app.recovery.model.sign_recovery_os_local_policy,
+            "the same key arms it from the mode screen"
+        );
     }
 
     #[test]

@@ -64,18 +64,25 @@ fn main() -> io::Result<()> {
         }
     }
 
+    let sign_recovery_os_local_policy = args
+        .iter()
+        .any(|arg| arg == apple_utils::restore::SIGNING_OPT_IN_FLAG);
+
     let mut terminal = ratatui::init();
     execute!(stdout(), EnableBracketedPaste, EnableMouseCapture)?;
     let _guard = TerminalGuard;
-    let result = run(&mut terminal);
+    let result = run(&mut terminal, sign_recovery_os_local_policy);
     drop(_guard);
     result
 }
 
-fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
+fn run(terminal: &mut DefaultTerminal, sign_recovery_os_local_policy: bool) -> io::Result<()> {
     let recovery = RecoveryRuntime::from_service(AppleRecoveryService::production());
     let mut app =
         App::with_banner_order_and_recovery(apple_utils::banner::BannerOrder::shuffled(), recovery);
+    if sign_recovery_os_local_policy {
+        app.recovery.set_local_policy_signing(true);
+    }
     app.glyph_pack = apple_utils::ui::detect_pack();
     apple_utils::ui::set_pack(app.glyph_pack);
     loop {

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::apfs_image::{
     APFS_INCOMPAT_SEALED_VOLUME, APFS_VOL_ROLE_DATA, APFS_VOL_ROLE_PREBOOT, APFS_VOL_ROLE_SYSTEM,
-    NX_MAGIC, fletcher64_seal, fletcher64_valid, parse_gpt,
+    GptPartition, NX_MAGIC, fletcher64_seal, fletcher64_valid, parse_gpt,
 };
 use crate::apfs_verify::{
     self, APFS_MAGIC, BlockSource, OBJ_TYPE_MASK, ROOT_SNAPSHOT_PREFIX, TYPE_BTREE,
@@ -37,7 +37,6 @@ const ZERO_VGID: [u8; 16] = [0u8; 16];
 pub enum CheckStatus {
     Pass,
     Fail,
-    NotApplicable,
 }
 
 impl CheckStatus {
@@ -45,7 +44,6 @@ impl CheckStatus {
         match self {
             Self::Pass => "PASS",
             Self::Fail => "FAIL",
-            Self::NotApplicable => "N/A",
         }
     }
 }
@@ -84,6 +82,7 @@ pub struct SweepReport {
     pub block_size: u32,
     pub block_count: u64,
     pub findings: Vec<Finding>,
+    snapshot_creates: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -207,7 +206,7 @@ fn open_repair(path: &Path) -> Result<Opened, String> {
         let Ok(table) = parse_gpt(&prefix, gpt_bs) else {
             continue;
         };
-        let mut chosen = None;
+        let mut candidates = Vec::new();
         for part in &table.partitions {
             let (start, _) = part.byte_range(gpt_bs);
             let mut probe = vec![0u8; 4096];
@@ -215,21 +214,26 @@ fn open_repair(path: &Path) -> Result<Opened, String> {
                 continue;
             }
             let nx = u32_at(&probe, 0x20) == NX_MAGIC;
-            if part.is_apple_apfs() || nx {
-                chosen = Some((start, probe, nx));
-                if nx {
-                    break;
-                }
+            if !(part.is_apple_apfs() || nx) {
+                continue;
             }
+            let block_count = if nx {
+                geometry_of(&probe).map(|(_, count)| count).unwrap_or(0)
+            } else {
+                plausible_geometry(&probe).1
+            };
+            candidates.push((part, nx, block_count, start, probe));
         }
-        let Some((start, probe, nx)) = chosen else {
+        let Some(index) = pick_repair_container(&candidates) else {
             continue;
         };
-        let (block_size, block_count) = if nx {
-            geometry_of(&probe)?
+        let (_, nx, _, start, probe) = &candidates[index];
+        let (block_size, block_count) = if *nx {
+            geometry_of(probe)?
         } else {
-            plausible_geometry(&probe)
+            plausible_geometry(probe)
         };
+        let start = *start;
         return Ok(Opened {
             disc,
             backend: if qcow { "qcow2".into() } else { "gpt".into() },
@@ -252,6 +256,16 @@ fn geometry_of(block: &[u8]) -> Result<(u32, u64), String> {
         return Err(format!("implausible APFS block count {block_count}"));
     }
     Ok((block_size, block_count))
+}
+
+fn pick_repair_container(candidates: &[(&GptPartition, bool, u64, u64, Vec<u8>)]) -> Option<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .max_by_key(|(index, (part, nx, count, _, _))| {
+            (part.apfs_container_rank(), *nx, *count, *index)
+        })
+        .map(|(index, _)| index)
 }
 
 fn plausible_geometry(block: &[u8]) -> (u32, u64) {
@@ -284,17 +298,13 @@ fn finding(
     }
 }
 
-fn skipped(
-    id: impl Into<String>,
-    summary: impl Into<String>,
-    detail: impl Into<String>,
-) -> Finding {
+fn adopt(item: repair_volume::VolumeFinding) -> Finding {
     Finding {
-        id: id.into(),
-        status: CheckStatus::NotApplicable,
-        summary: summary.into(),
-        detail: detail.into(),
-        repairable: false,
+        id: item.id,
+        status: item.status,
+        summary: item.summary,
+        detail: item.detail,
+        repairable: item.repairable,
     }
 }
 
@@ -519,6 +529,16 @@ struct VolIdentity {
     vgid: [u8; 16],
 }
 
+struct CustomBootExempt {
+    declared: u64,
+    meta_empty: bool,
+    names_empty: bool,
+    has_named_root: bool,
+    sealed_flag: bool,
+    integrity_oid: u64,
+    verified: bool,
+}
+
 fn identity_of(paddr: u64, apsb: &[u8]) -> VolIdentity {
     VolIdentity {
         paddr,
@@ -536,10 +556,12 @@ fn volume_group_finding(volumes: &[VolIdentity]) -> Finding {
         .iter()
         .find(|volume| volume.role == APFS_VOL_ROLE_DATA);
     match (system, data) {
-        (None, _) => skipped(
+        (None, _) => finding(
             "volume-group",
+            true,
             "no system volume to pair",
             format!("volumes={}", volumes.len()),
+            false,
         ),
         (Some(system), None) => finding(
             "volume-group",
@@ -589,10 +611,12 @@ fn preboot_finding(volumes: &[VolIdentity]) -> Finding {
         .iter()
         .any(|volume| volume.role == APFS_VOL_ROLE_PREBOOT);
     if !has_system {
-        skipped(
+        finding(
             "preboot",
+            true,
             "no system volume to require a preboot volume",
             format!("volumes={}", volumes.len()),
+            false,
         )
     } else if has_preboot {
         finding(
@@ -636,23 +660,40 @@ fn unverifiable(id: impl Into<String>, snap: &SnapState, what: &str) -> Finding 
     }
 }
 
-fn root_to_xid_finding(paddr: u64, role: u16, root_to_xid: u64, snap: &SnapState) -> Finding {
+fn root_to_xid_finding(
+    paddr: u64,
+    role: u16,
+    root_to_xid: u64,
+    snap: &SnapState,
+    snapshot_creates: &mut BTreeSet<String>,
+) -> Finding {
     if !expects_system_protection(role) {
-        return skipped(
+        return finding(
             format!("root-to-xid:{paddr}"),
-            "volume is not a system volume",
+            true,
+            "not a system volume; apfs_root_to_xid is unused for boot",
             format!("root_to_xid={root_to_xid}"),
+            false,
         );
     }
     if !snap.trustworthy {
         return unverifiable(format!("root-to-xid:{paddr}"), snap, "apfs_root_to_xid");
     }
     match named_root_snapshot_xid(snap) {
-        None => skipped(
-            format!("root-to-xid:{paddr}"),
-            "no named root snapshot to root the live volume at",
-            format!("root_to_xid={root_to_xid}"),
-        ),
+        None => {
+            let id = format!("root-to-xid:{paddr}");
+            let create = snap_may_create_root_snapshot(true, snap);
+            if create {
+                snapshot_creates.insert(id.clone());
+            }
+            finding(
+                id,
+                false,
+                "no named root snapshot to root the live volume at",
+                format!("root_to_xid={root_to_xid}"),
+                create,
+            )
+        }
         Some(xid) if root_to_xid == xid => finding(
             format!("root-to-xid:{paddr}"),
             true,
@@ -708,7 +749,12 @@ fn mint_group_id(system_uuid: &[u8; 16], data_uuid: &[u8; 16]) -> [u8; 16] {
     group
 }
 
-fn volume_findings(paddr: u64, apsb: &[u8], snap: &SnapState) -> Vec<Finding> {
+fn volume_findings(
+    paddr: u64,
+    apsb: &[u8],
+    snap: &SnapState,
+    snapshot_creates: &mut BTreeSet<String>,
+) -> Vec<Finding> {
     let mut out = Vec::new();
     let role = volume_role(apsb);
     let system = expects_system_protection(role);
@@ -732,7 +778,7 @@ fn volume_findings(paddr: u64, apsb: &[u8], snap: &SnapState) -> Vec<Finding> {
             "apfs_num_snapshots",
         ));
     } else {
-        volume_snapshot_count_finding(&mut out, paddr, system, snap);
+        volume_snapshot_count_finding(&mut out, paddr, system, snap, snapshot_creates);
     }
 
     if !snap.trustworthy {
@@ -742,18 +788,31 @@ fn volume_findings(paddr: u64, apsb: &[u8], snap: &SnapState) -> Vec<Finding> {
             "the snapshot name index",
         ));
     } else {
-        volume_snapshot_names_finding(&mut out, paddr, system, snap);
+        volume_snapshot_names_finding(&mut out, paddr, system, snap, snapshot_creates);
     }
 
-    volume_seal_and_blessing_findings(&mut out, paddr, apsb, system, snap);
+    volume_seal_and_blessing_findings(&mut out, paddr, apsb, system, snap, snapshot_creates);
 
     out.push(root_to_xid_finding(
         paddr,
         role,
         volume_root_to_xid(apsb),
         snap,
+        snapshot_creates,
     ));
     out
+}
+
+fn snap_needs_root_snapshot(system: bool, snap: &SnapState) -> bool {
+    system
+        && snap.trustworthy
+        && snap.metadata.is_empty()
+        && snap.declared == 0
+        && named_root_snapshot_xid(snap).is_none()
+}
+
+fn snap_may_create_root_snapshot(system: bool, snap: &SnapState) -> bool {
+    system && !(snap.metadata.is_empty() && snap.declared != 0)
 }
 
 fn volume_snapshot_count_finding(
@@ -761,46 +820,50 @@ fn volume_snapshot_count_finding(
     paddr: u64,
     system: bool,
     snap: &SnapState,
+    snapshot_creates: &mut BTreeSet<String>,
 ) {
-    let count_ok = snap.declared == snap.metadata.len() as u64;
-    if count_ok && snap.declared == 0 && snap.metadata.is_empty() {
-        if system {
-            out.push(finding(
-                format!("snapshot-count:{paddr}"),
-                false,
-                "system volume has no snapshots",
-                format!("declared=0 tree=0 paddr={}", snap.tree_paddr),
-                false,
-            ));
-        } else {
-            out.push(skipped(
-                format!("snapshot-count:{paddr}"),
-                "volume has no snapshots",
-                format!("declared=0 tree=0 paddr={}", snap.tree_paddr),
-            ));
-        }
-    } else {
+    let actual = snap.metadata.len() as u64;
+    let count_ok = snap.declared == actual;
+    let detail = format!(
+        "declared={} tree={} paddr={}",
+        snap.declared, actual, snap.tree_paddr
+    );
+    if snap_needs_root_snapshot(system, snap) {
+        let id = format!("snapshot-count:{paddr}");
+        snapshot_creates.insert(id.clone());
         out.push(finding(
-            format!("snapshot-count:{paddr}"),
-            count_ok,
-            if count_ok {
-                format!("snapshot count matches {} records", snap.declared)
-            } else {
-                format!(
-                    "volume records {} snapshots, tree has {}",
-                    snap.declared,
-                    snap.metadata.len()
-                )
-            },
-            format!(
-                "declared={} tree={} paddr={}",
-                snap.declared,
-                snap.metadata.len(),
-                snap.tree_paddr
-            ),
+            id,
+            false,
+            "system volume has no snapshots",
+            detail,
             true,
         ));
+        return;
     }
+    if count_ok && actual == 0 {
+        out.push(finding(
+            format!("snapshot-count:{paddr}"),
+            true,
+            "volume has no snapshots; none required",
+            detail,
+            false,
+        ));
+        return;
+    }
+    out.push(finding(
+        format!("snapshot-count:{paddr}"),
+        count_ok,
+        if count_ok {
+            format!("snapshot count matches {} records", snap.declared)
+        } else {
+            format!(
+                "volume records {} snapshots, tree has {}",
+                snap.declared, actual
+            )
+        },
+        detail,
+        true,
+    ));
 }
 
 fn volume_snapshot_names_finding(
@@ -808,6 +871,7 @@ fn volume_snapshot_names_finding(
     paddr: u64,
     system: bool,
     snap: &SnapState,
+    snapshot_creates: &mut BTreeSet<String>,
 ) {
     let mut names_ok = true;
     for (xid, name) in &snap.metadata {
@@ -823,7 +887,17 @@ fn volume_snapshot_names_finding(
         }
     }
     if snap.metadata.is_empty() && snap.names.is_empty() {
-        if system {
+        if snap_needs_root_snapshot(system, snap) {
+            let id = format!("snapshot-names:{paddr}");
+            snapshot_creates.insert(id.clone());
+            out.push(finding(
+                id,
+                false,
+                "system volume has no snapshot name index",
+                "metadata=0 names=0".to_string(),
+                true,
+            ));
+        } else if system {
             out.push(finding(
                 format!("snapshot-names:{paddr}"),
                 false,
@@ -832,10 +906,12 @@ fn volume_snapshot_names_finding(
                 false,
             ));
         } else {
-            out.push(skipped(
+            out.push(finding(
                 format!("snapshot-names:{paddr}"),
+                true,
                 "no snapshot records to index",
                 "metadata=0 names=0".to_string(),
+                false,
             ));
         }
     } else {
@@ -863,6 +939,7 @@ fn volume_seal_and_blessing_findings(
     apsb: &[u8],
     system: bool,
     snap: &SnapState,
+    snapshot_creates: &mut BTreeSet<String>,
 ) {
     let incompat = if apsb.len() >= APSB_INCOMPAT_OFFSET + 8 {
         u64_at(apsb, APSB_INCOMPAT_OFFSET)
@@ -877,21 +954,17 @@ fn volume_seal_and_blessing_findings(
     };
     let seal_ok = sealed_flag == (integrity_oid != 0);
     if seal_ok && !sealed_flag {
-        if system {
-            out.push(finding(
-                format!("volume-seal:{paddr}"),
-                false,
-                "system volume is not sealed",
-                format!("flag={sealed_flag} integrity_meta_oid={integrity_oid}"),
-                false,
-            ));
-        } else {
-            out.push(skipped(
-                format!("volume-seal:{paddr}"),
-                "volume is not sealed",
-                format!("flag={sealed_flag} integrity_meta_oid={integrity_oid}"),
-            ));
-        }
+        out.push(finding(
+            format!("volume-seal:{paddr}"),
+            true,
+            if system {
+                "seal is not required for root mount (unauthenticated root)"
+            } else {
+                "volume is not sealed"
+            },
+            format!("flag={sealed_flag} integrity_meta_oid={integrity_oid}"),
+            false,
+        ));
     } else {
         out.push(finding(
             format!("volume-seal:{paddr}"),
@@ -923,52 +996,77 @@ fn volume_seal_and_blessing_findings(
         .filter(|(name, _)| name.starts_with(ROOT_SNAPSHOT_PREFIX))
         .map(|(name, _)| name.as_str())
         .collect();
-    let blessing_ok = if !sealed_flag && root_names.is_empty() {
-        true
-    } else if sealed_flag && integrity_oid != 0 {
-        !root_names.is_empty()
-            && root_names.iter().all(|name| {
-                snap.names
-                    .iter()
-                    .any(|(n, xid)| n == name && snap.metadata.iter().any(|(x, _)| x == xid))
-            })
-    } else {
-        root_names.iter().all(|name| {
-            snap.names
-                .iter()
-                .find(|(n, _)| n == name)
-                .is_some_and(|(_, xid)| snap.metadata.iter().any(|(x, n)| n == *name && x == xid))
-        })
-    };
-    if !sealed_flag && root_names.is_empty() {
-        if system {
+    if root_names.is_empty() {
+        let sealed = sealed_flag && integrity_oid != 0;
+        if snap_may_create_root_snapshot(system, snap) {
+            let id = format!("blessing:{paddr}");
+            snapshot_creates.insert(id.clone());
+            out.push(finding(
+                id,
+                false,
+                if sealed {
+                    "sealed root snapshot is not in the name index"
+                } else {
+                    "system volume has no blessed root snapshot"
+                },
+                "root_snapshots=0".to_string(),
+                true,
+            ));
+        } else if system {
             out.push(finding(
                 format!("blessing:{paddr}"),
                 false,
-                "system volume has no blessed root snapshot",
+                if sealed {
+                    "sealed root snapshot is not in the name index"
+                } else {
+                    "system volume has no blessed root snapshot"
+                },
+                "root_snapshots=0".to_string(),
+                false,
+            ));
+        } else if sealed {
+            out.push(finding(
+                format!("blessing:{paddr}"),
+                false,
+                "sealed root snapshot is not in the name index",
                 "root_snapshots=0".to_string(),
                 false,
             ));
         } else {
-            out.push(skipped(
+            out.push(finding(
                 format!("blessing:{paddr}"),
-                "no sealed root snapshot to bless",
+                true,
+                "no blessed root snapshot; none required",
                 "root_snapshots=0".to_string(),
+                false,
             ));
         }
-    } else {
-        out.push(finding(
-            format!("blessing:{paddr}"),
-            blessing_ok,
-            if blessing_ok {
-                "boot snapshot blessing is consistent"
-            } else {
-                "blessed root snapshot is missing or inconsistent"
-            },
-            format!("root_snapshots={}", root_names.len()),
-            false,
-        ));
+        return;
     }
+    let blessing_ok = root_names.iter().all(|name| {
+        snap.names
+            .iter()
+            .find(|(n, _)| n == name)
+            .is_some_and(|(_, xid)| snap.metadata.iter().any(|(x, n)| n == *name && x == xid))
+    });
+    out.push(finding(
+        format!("blessing:{paddr}"),
+        blessing_ok,
+        if blessing_ok {
+            "boot snapshot blessing is consistent"
+        } else {
+            "blessed root snapshot is missing or inconsistent"
+        },
+        format!("root_snapshots={}", root_names.len()),
+        false,
+    ));
+}
+
+fn macos_product_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "macos" | "mac os x" | "os x"
+    )
 }
 
 fn custom_boot_pair(plist_bytes: &[u8], system_boot: &[u8], preboot_boot: &[u8]) -> bool {
@@ -977,12 +1075,13 @@ fn custom_boot_pair(plist_bytes: &[u8], system_boot: &[u8], preboot_boot: &[u8])
     else {
         return false;
     };
-    ["ProductName"].iter().all(|key| {
-        info.get(key)
-            .and_then(plist::Value::as_string)
-            .is_some_and(|value| !value.is_empty())
-    }) && !system_boot.is_empty()
-        && system_boot == preboot_boot
+    let Some(product) = info.get("ProductName").and_then(plist::Value::as_string) else {
+        return false;
+    };
+    if product.is_empty() || macos_product_name(product) {
+        return false;
+    }
+    !system_boot.is_empty() && system_boot == preboot_boot
 }
 
 fn custom_boot_groups(opened: &mut Opened) -> BTreeSet<[u8; 16]> {
@@ -1073,6 +1172,45 @@ fn custom_boot_groups(opened: &mut Opened) -> BTreeSet<[u8; 16]> {
         }
     }
     groups
+}
+
+fn apply_custom_boot_pass(findings: &mut [Finding], exempt: &BTreeMap<u64, CustomBootExempt>) {
+    for item in findings.iter_mut() {
+        if !item.failed() {
+            continue;
+        }
+        let Some((kind, rest)) = item.id.split_once(':') else {
+            continue;
+        };
+        let Ok(paddr) = rest.parse::<u64>() else {
+            continue;
+        };
+        let Some(info) = exempt.get(&paddr) else {
+            continue;
+        };
+        let rewrite = match kind {
+            "snapshot-count" => info.verified && info.declared == 0 && info.meta_empty,
+            "snapshot-names" => info.verified && info.meta_empty && info.names_empty,
+            "blessing" | "root-to-xid" => info.verified && !info.has_named_root,
+            "volume-seal" => !info.sealed_flag && info.integrity_oid == 0,
+            _ => false,
+        };
+        if !rewrite {
+            continue;
+        }
+        let (summary, detail) = if kind == "volume-seal" {
+            (
+                "custom boot system does not require a macOS seal",
+                "System and Preboot carry matching custom boot objects and a valid system version plist",
+            )
+        } else {
+            (
+                "custom boot system does not require a macOS root snapshot",
+                "Matching System and Preboot custom boot objects are present; no macOS root snapshot is required",
+            )
+        };
+        *item = finding(item.id.clone(), true, summary, detail, false);
+    }
 }
 
 pub fn sweep(path: &Path) -> Result<SweepReport, String> {
@@ -1208,6 +1346,7 @@ pub fn sweep(path: &Path) -> Result<SweepReport, String> {
 
     let omap_paddr = u64_at(&mounted, 0xA0);
     let mut omap_ok = false;
+    let mut omap_writable_leaf = false;
     let mut omap_entries = Vec::new();
     if omap_paddr != 0 && omap_paddr < opened.block_count {
         objects.insert(omap_paddr);
@@ -1241,6 +1380,7 @@ pub fn sweep(path: &Path) -> Result<SweepReport, String> {
                             ));
                         }
                     }
+                    omap_writable_leaf = crate::repair_writer::btree::is_leaf_node(&node);
                     omap_entries = collect_omap_tree(&mut opened, tree).unwrap_or_default();
                     for (_, _, paddr) in &omap_entries {
                         if *paddr != 0 && *paddr < opened.block_count {
@@ -1307,37 +1447,32 @@ pub fn sweep(path: &Path) -> Result<SweepReport, String> {
 
     let custom_groups = custom_boot_groups(&mut opened);
     let mut volume_root_ok = false;
-    let mut custom_boot_exempt: BTreeSet<u64> = BTreeSet::new();
+    let mut custom_boot_exempt: BTreeMap<u64, CustomBootExempt> = BTreeMap::new();
+    let mut snapshot_creates = BTreeSet::new();
     for (paddr, apsb) in &volumes {
         let snap = volume_snap_state(&mut opened, apsb);
-        let mut checks = volume_findings(*paddr, apsb, &snap);
+        let checks = volume_findings(*paddr, apsb, &snap, &mut snapshot_creates);
         if volume_role(apsb) == APFS_VOL_ROLE_SYSTEM
             && custom_groups.contains(&volume_group_id(apsb))
             && u64_at(apsb, APSB_INTEGRITY_META_OFFSET) == 0
         {
-            custom_boot_exempt.insert(*paddr);
-            for check in &mut checks {
-                if check.id == format!("volume-seal:{paddr}") {
-                    *check = skipped(
-                        check.id.clone(),
-                        "custom boot system does not require a macOS seal",
-                        "System and Preboot carry matching custom boot objects and a valid system version plist",
-                    );
-                }
-                if snap.declared == 0
-                    && snap.metadata.is_empty()
-                    && snap.names.is_empty()
-                    && ["snapshot-count", "snapshot-names", "blessing"]
-                        .iter()
-                        .any(|kind| check.id == format!("{kind}:{paddr}"))
-                {
-                    *check = skipped(
-                        check.id.clone(),
-                        "custom boot system does not require a macOS root snapshot",
-                        "Matching System and Preboot custom boot objects are present; no snapshot is declared",
-                    );
-                }
-            }
+            let incompat = if apsb.len() >= APSB_INCOMPAT_OFFSET + 8 {
+                u64_at(apsb, APSB_INCOMPAT_OFFSET)
+            } else {
+                0
+            };
+            custom_boot_exempt.insert(
+                *paddr,
+                CustomBootExempt {
+                    declared: snap.declared,
+                    meta_empty: snap.metadata.is_empty(),
+                    names_empty: snap.names.is_empty(),
+                    has_named_root: named_root_snapshot_xid(&snap).is_some(),
+                    sealed_flag: incompat & APFS_INCOMPAT_SEALED_VOLUME != 0,
+                    integrity_oid: u64_at(apsb, APSB_INTEGRITY_META_OFFSET),
+                    verified: snap.trustworthy,
+                },
+            );
         }
         findings.extend(checks);
         let fs_oid = if apsb.len() >= 0x90 {
@@ -1373,53 +1508,36 @@ pub fn sweep(path: &Path) -> Result<SweepReport, String> {
     ));
 
     if let Some(seals) = try_read_seals(&mut opened) {
+        snapshot_creates.clear();
         for volume in &seals.volumes {
-            if !custom_boot_exempt.contains(&volume.paddr) {
-                for rigorous in [
-                    repair_volume::check_snapshot_count(volume),
-                    repair_volume::check_snapshot_names(volume),
-                    repair_volume::check_root_to_xid(volume),
-                ] {
-                    findings.retain(|item| item.id != rigorous.id);
-                    findings.push(Finding {
-                        id: rigorous.id,
-                        status: rigorous.status,
-                        summary: rigorous.summary,
-                        detail: rigorous.detail,
-                        repairable: rigorous.repairable,
-                    });
+            for rigorous in [
+                repair_volume::check_snapshot_count(volume),
+                repair_volume::check_snapshot_names(volume),
+                repair_volume::check_root_to_xid(volume),
+                repair_volume::check_blessing(volume),
+                repair_volume::check_volume_seal(volume),
+            ] {
+                if rigorous.create_root_snapshot && rigorous.repairable {
+                    snapshot_creates.insert(rigorous.id.clone());
                 }
+                findings.retain(|item| item.id != rigorous.id);
+                findings.push(adopt(rigorous));
             }
-            if let Some(seal) = &volume.seal {
-                if seal.broken {
-                    let id = format!("volume-seal:{}", volume.paddr);
-                    findings.retain(|item| item.id != id);
-                    findings.push(finding(
-                        id,
-                        false,
-                        "volume seal is recorded broken",
-                        format!("broken_xid={}", seal.broken_xid),
-                        false,
-                    ));
-                }
-                let expected = seal.root_snapshot_name();
-                let blessed = volume.snapshots.xid_for_name(&expected).is_some();
-                let id = format!("blessing:{}", volume.paddr);
-                findings.retain(|item| item.id != id);
-                findings.push(finding(
-                    id,
-                    blessed,
-                    if blessed {
-                        "boot snapshot blessing matches the seal"
-                    } else {
-                        "blessed root snapshot does not match the seal"
-                    },
-                    expected,
-                    false,
-                ));
+            if let Some(info) = custom_boot_exempt.get_mut(&volume.paddr) {
+                info.declared = volume.snapshots.declared_count;
+                info.meta_empty = volume.snapshots.snapshots.is_empty();
+                info.names_empty = volume.snapshots.names.is_empty();
+                info.has_named_root =
+                    repair_volume::named_root_snapshot_xid(&volume.snapshots).is_some();
+                info.sealed_flag = volume.sealed
+                    || volume.incompatible_features & APFS_INCOMPAT_SEALED_VOLUME != 0;
+                info.integrity_oid = volume.integrity_meta_oid;
+                info.verified = true;
             }
         }
     }
+
+    apply_custom_boot_pass(&mut findings, &custom_boot_exempt);
 
     let mut by_id: BTreeMap<String, Finding> = BTreeMap::new();
     for item in findings {
@@ -1427,6 +1545,20 @@ pub fn sweep(path: &Path) -> Result<SweepReport, String> {
     }
     let mut findings: Vec<Finding> = by_id.into_values().collect();
     findings.sort_by(|a, b| a.id.cmp(&b.id));
+
+    if !omap_writable_leaf {
+        for item in &mut findings {
+            if snapshot_creates.contains(&item.id) {
+                item.repairable = false;
+            }
+        }
+        snapshot_creates.clear();
+    }
+    snapshot_creates.retain(|id| {
+        findings
+            .iter()
+            .any(|item| item.id == *id && item.failed() && item.repairable)
+    });
 
     let _ = objects.len().min(MAX_WALK);
     let _ = seen_checksum.len();
@@ -1438,6 +1570,7 @@ pub fn sweep(path: &Path) -> Result<SweepReport, String> {
         block_size: opened.block_size,
         block_count: opened.block_count,
         findings,
+        snapshot_creates,
     })
 }
 
@@ -1467,6 +1600,18 @@ pub fn repair_paths(report: &SweepReport) -> Vec<RepairPath> {
             (
                 "restore NXSB magic on the container superblock".into(),
                 "write NXSB magic and reseal".into(),
+            )
+        } else if creates_root_snapshot(report, finding) {
+            (
+                format!(
+                    "create the root system snapshot on volume {}",
+                    finding
+                        .id
+                        .split_once(':')
+                        .map(|(_, paddr)| paddr)
+                        .unwrap_or(&finding.id)
+                ),
+                "write SNAP_METADATA + SNAP_NAME + frozen superblock, set apfs_num_snapshots and apfs_root_to_xid, and emit a checkpoint".into(),
             )
         } else if finding.id.starts_with("snapshot-count:") {
             (
@@ -1508,6 +1653,10 @@ pub fn repair_paths(report: &SweepReport) -> Vec<RepairPath> {
     }
     paths.sort_by(|a, b| a.id.cmp(&b.id));
     paths
+}
+
+fn creates_root_snapshot(report: &SweepReport, finding: &Finding) -> bool {
+    finding.failed() && finding.repairable && report.snapshot_creates.contains(&finding.id)
 }
 
 pub fn format_dump(report: &SweepReport) -> String {
@@ -1626,6 +1775,9 @@ fn apply_one(opened: &mut Opened, id: &str) -> Result<(), String> {
     }
     if let Some(paddr) = id.strip_prefix("snapshot-count:") {
         let paddr: u64 = paddr.parse().map_err(|_| format!("bad repair id {id}"))?;
+        if system_has_empty_snapshots(opened, paddr)? {
+            return apply_missing_root_snapshot(opened, paddr);
+        }
         let mut block = read_block(opened, paddr)?;
         let count = if let Some(volume) = rigorous_volume_seal(opened, paddr) {
             volume.snapshots.snapshots.len() as u64
@@ -1652,6 +1804,20 @@ fn apply_one(opened: &mut Opened, id: &str) -> Result<(), String> {
             &block,
         )?;
         return Ok(());
+    }
+    if let Some(paddr) = id.strip_prefix("snapshot-names:") {
+        let paddr: u64 = paddr.parse().map_err(|_| format!("bad repair id {id}"))?;
+        if system_has_empty_snapshot_indexes(opened, paddr)? {
+            return apply_missing_root_snapshot(opened, paddr);
+        }
+        return Err(format!("finding {id} is not repairable"));
+    }
+    if let Some(paddr) = id.strip_prefix("blessing:") {
+        let paddr: u64 = paddr.parse().map_err(|_| format!("bad repair id {id}"))?;
+        if system_missing_named_root(opened, paddr)? {
+            return apply_missing_root_snapshot(opened, paddr);
+        }
+        return Err(format!("finding {id} is not repairable"));
     }
     if let Some(paddr) = id.strip_prefix("volume-seal:") {
         let paddr: u64 = paddr.parse().map_err(|_| format!("bad repair id {id}"))?;
@@ -1686,6 +1852,9 @@ fn apply_one(opened: &mut Opened, id: &str) -> Result<(), String> {
     }
     if let Some(paddr) = id.strip_prefix("root-to-xid:") {
         let paddr: u64 = paddr.parse().map_err(|_| format!("bad repair id {id}"))?;
+        if system_missing_named_root(opened, paddr)? {
+            return apply_missing_root_snapshot(opened, paddr);
+        }
         let mut block = read_block(opened, paddr)?;
         if volume_role(&block) != APFS_VOL_ROLE_SYSTEM {
             return Err(format!(
@@ -1729,6 +1898,70 @@ fn apply_one(opened: &mut Opened, id: &str) -> Result<(), String> {
         return Ok(());
     }
     Err(format!("unknown repair id {id}"))
+}
+
+fn apply_missing_root_snapshot(opened: &mut Opened, paddr: u64) -> Result<(), String> {
+    crate::repair_snapshot::apply_missing_root_snapshot(
+        opened.disc.as_mut(),
+        opened.container_offset,
+        opened.block_size,
+        opened.block_count,
+        paddr,
+    )
+}
+
+fn system_volume_snap(
+    opened: &mut Opened,
+    paddr: u64,
+) -> Result<Option<(SnapState, Option<apfs_verify::VolumeSealReport>)>, String> {
+    let block = read_block(opened, paddr)?;
+    if volume_role(&block) != APFS_VOL_ROLE_SYSTEM {
+        return Ok(None);
+    }
+    let rigorous = rigorous_volume_seal(opened, paddr);
+    let snap = volume_snap_state(opened, &block);
+    Ok(Some((snap, rigorous)))
+}
+
+fn system_has_empty_snapshots(opened: &mut Opened, paddr: u64) -> Result<bool, String> {
+    let Some((snap, rigorous)) = system_volume_snap(opened, paddr)? else {
+        return Ok(false);
+    };
+    if let Some(volume) = rigorous {
+        return Ok(repair_volume::volume_needs_root_snapshot(&volume));
+    }
+    Ok(snap_needs_root_snapshot(true, &snap))
+}
+
+fn system_has_empty_snapshot_indexes(opened: &mut Opened, paddr: u64) -> Result<bool, String> {
+    let Some((snap, rigorous)) = system_volume_snap(opened, paddr)? else {
+        return Ok(false);
+    };
+    if let Some(volume) = rigorous {
+        return Ok(
+            repair_volume::volume_needs_root_snapshot(&volume) && volume.snapshots.names.is_empty()
+        );
+    }
+    if !snap.trustworthy {
+        return Ok(false);
+    }
+    Ok(snap_needs_root_snapshot(true, &snap) && snap.names.is_empty())
+}
+
+fn system_missing_named_root(opened: &mut Opened, paddr: u64) -> Result<bool, String> {
+    let Some((snap, rigorous)) = system_volume_snap(opened, paddr)? else {
+        return Ok(false);
+    };
+    if let Some(volume) = rigorous {
+        return Ok(
+            repair_volume::named_root_snapshot_xid(&volume.snapshots).is_none()
+                && repair_volume::may_create_root_snapshot(&volume),
+        );
+    }
+    if !snap.trustworthy {
+        return Ok(false);
+    }
+    Ok(named_root_snapshot_xid(&snap).is_none() && snap_may_create_root_snapshot(true, &snap))
 }
 
 fn apply_volume_group(opened: &mut Opened) -> Result<(), String> {
@@ -1965,14 +2198,6 @@ fn dump_passes(dump: &str, id: &str) -> bool {
 }
 
 #[cfg(test)]
-fn dump_na(dump: &str, id: &str) -> bool {
-    dump.lines().any(|line| {
-        let toks: Vec<&str> = line.split_whitespace().collect();
-        toks.contains(&"N/A") && toks.contains(&id)
-    })
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use super::{
@@ -2013,6 +2238,10 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.contains("findings:"));
         assert!(first.contains("PASS"));
+        assert!(
+            !first.contains("N/A"),
+            "format_dump must never emit N/A:\n{first}"
+        );
         assert!(dump_passes(&first, "container-magic"));
         assert!(dump_passes(&first, "checksum:0"));
         assert!(dump_passes(
@@ -2020,25 +2249,25 @@ mod tests {
             &format!("volume-magic:{FIXTURE_VOL_APSB_PADDR}")
         ));
         assert!(
-            dump_na(&first, &format!("snapshot-count:{FIXTURE_VOL_APSB_PADDR}")),
+            dump_passes(&first, &format!("snapshot-count:{FIXTURE_VOL_APSB_PADDR}")),
             "{first}"
         );
         assert!(
-            dump_na(&first, &format!("volume-seal:{FIXTURE_VOL_APSB_PADDR}")),
+            dump_passes(&first, &format!("volume-seal:{FIXTURE_VOL_APSB_PADDR}")),
             "{first}"
         );
         assert!(
-            dump_na(&first, &format!("blessing:{FIXTURE_VOL_APSB_PADDR}")),
+            dump_passes(&first, &format!("blessing:{FIXTURE_VOL_APSB_PADDR}")),
             "{first}"
         );
         assert!(
-            dump_na(&first, &format!("snapshot-names:{FIXTURE_VOL_APSB_PADDR}")),
+            dump_passes(&first, &format!("snapshot-names:{FIXTURE_VOL_APSB_PADDR}")),
             "{first}"
         );
-        assert!(dump_na(&first, "volume-group"), "{first}");
-        assert!(dump_na(&first, "preboot"), "{first}");
+        assert!(dump_passes(&first, "volume-group"), "{first}");
+        assert!(dump_passes(&first, "preboot"), "{first}");
         assert!(
-            dump_na(&first, &format!("root-to-xid:{FIXTURE_VOL_APSB_PADDR}")),
+            dump_passes(&first, &format!("root-to-xid:{FIXTURE_VOL_APSB_PADDR}")),
             "{first}"
         );
     }
@@ -2059,6 +2288,21 @@ mod tests {
             b"boot object",
             b"boot object"
         ));
+        let asahi = br#"<?xml version="1.0"?><plist version="1.0"><dict><key>ProductName</key><string>Asahi Linux</string></dict></plist>"#;
+        assert!(custom_boot_pair(asahi, b"boot object", b"boot object"));
+        let macos = br#"<?xml version="1.0"?><plist version="1.0"><dict><key>ProductName</key><string>macOS</string></dict></plist>"#;
+        assert!(
+            !custom_boot_pair(macos, b"boot object", b"boot object"),
+            "a leftover macOS restore must not count as custom boot"
+        );
+        let macos_case = br#"<?xml version="1.0"?><plist version="1.0"><dict><key>ProductName</key><string>Mac OS X</string></dict></plist>"#;
+        assert!(!custom_boot_pair(
+            macos_case,
+            b"boot object",
+            b"boot object"
+        ));
+        let os_x = br#"<?xml version="1.0"?><plist version="1.0"><dict><key>ProductName</key><string>OS X</string></dict></plist>"#;
+        assert!(!custom_boot_pair(os_x, b"boot object", b"boot object"));
     }
 
     #[test]
@@ -2242,11 +2486,15 @@ mod tests {
         let after = format_dump(&sweep(&image).unwrap());
         assert!(!dump_fails(&after, &count_id), "{after}");
         assert!(!dump_fails(&after, &seal_id), "{after}");
-        assert!(dump_na(&after, &seal_id), "{after}");
-        assert!(dump_na(
+        assert!(dump_passes(&after, &seal_id), "{after}");
+        assert!(dump_passes(
             &after,
             &format!("blessing:{FIXTURE_VOL_APSB_PADDR}")
         ));
+        assert!(
+            !after.contains("N/A"),
+            "format_dump must never emit N/A:\n{after}"
+        );
     }
 
     #[test]
@@ -2264,7 +2512,7 @@ mod tests {
         apply(&image, std::slice::from_ref(&seal_id)).unwrap();
         let after = sweep(&image).unwrap();
         let item = finding(&after, &seal_id);
-        assert!(item.failed(), "SYSTEM stays unsealed: {item:?}");
+        assert!(item.passed(), "unsealed SYSTEM is valid: {item:?}");
         assert!(!item.repairable, "must not invent a seal: {item:?}");
         assert!(!repair_paths(&after).iter().any(|path| path.id == seal_id));
     }
@@ -2287,27 +2535,54 @@ mod tests {
     }
 
     #[test]
-    fn system_volume_unsealed_without_snapshots_fails_and_is_not_repairable() {
+    fn system_volume_unsealed_without_snapshots_fails_snapshot_checks_and_does_not_invent_a_seal() {
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("disk.img");
         apfs_fixture::write_fixture(&image, ImageWrap::RawGpt).unwrap();
         inject_volume_role(&image, FIXTURE_VOL_APSB_PADDR, APFS_VOL_ROLE_SYSTEM).unwrap();
         let report = sweep(&image).unwrap();
+        let dump = format_dump(&report);
+        assert!(
+            !dump.contains("N/A"),
+            "format_dump must never emit N/A:\n{dump}"
+        );
         for id in [
             format!("snapshot-count:{FIXTURE_VOL_APSB_PADDR}"),
             format!("snapshot-names:{FIXTURE_VOL_APSB_PADDR}"),
-            format!("volume-seal:{FIXTURE_VOL_APSB_PADDR}"),
             format!("blessing:{FIXTURE_VOL_APSB_PADDR}"),
+            format!("root-to-xid:{FIXTURE_VOL_APSB_PADDR}"),
         ] {
             let item = finding(&report, &id);
             assert!(item.failed(), "{id}: {item:?}");
-            assert!(!item.repairable, "{id} must not invent a seal or snapshot");
+            assert!(
+                item.repairable,
+                "{id} should create the root system snapshot: {item:?}"
+            );
         }
+        let seal = finding(&report, &format!("volume-seal:{FIXTURE_VOL_APSB_PADDR}"));
+        assert!(seal.passed(), "unsealed SYSTEM is valid: {seal:?}");
+        assert!(!seal.repairable, "must not invent a seal: {seal:?}");
         let paths = repair_paths(&report);
         assert!(
             !paths.iter().any(|path| path.id.starts_with("volume-seal:")),
             "unsealed SYSTEM without integrity metadata must not queue a seal write: {paths:?}"
         );
+        for id in [
+            format!("snapshot-count:{FIXTURE_VOL_APSB_PADDR}"),
+            format!("snapshot-names:{FIXTURE_VOL_APSB_PADDR}"),
+            format!("blessing:{FIXTURE_VOL_APSB_PADDR}"),
+            format!("root-to-xid:{FIXTURE_VOL_APSB_PADDR}"),
+        ] {
+            let path = paths
+                .iter()
+                .find(|path| path.id == id)
+                .unwrap_or_else(|| panic!("missing repair path {id}: {paths:?}"));
+            assert!(
+                path.label.contains("create the root system snapshot")
+                    || path.detail.contains("SNAP_METADATA"),
+                "{id} should describe snapshot creation: {path:?}"
+            );
+        }
         let vg = finding(&report, "volume-group");
         assert!(vg.failed(), "{vg:?}");
         assert!(!vg.repairable);
@@ -2315,10 +2590,6 @@ mod tests {
         let preboot = finding(&report, "preboot");
         assert!(preboot.failed(), "{preboot:?}");
         assert!(!preboot.repairable);
-        assert_eq!(
-            finding(&report, &format!("root-to-xid:{FIXTURE_VOL_APSB_PADDR}")).status,
-            CheckStatus::NotApplicable
-        );
     }
 
     #[test]
@@ -2329,7 +2600,7 @@ mod tests {
             uuid: [1; 16],
             vgid: ZERO_VGID,
         }]);
-        assert_eq!(none.status, CheckStatus::NotApplicable);
+        assert!(none.passed());
         assert!(!none.repairable);
 
         let no_data = volume_group_finding(&[VolIdentity {
@@ -2814,5 +3085,65 @@ mod tests {
             DECLARED_SNAPSHOTS,
             "a refused repair must not have touched apfs_num_snapshots"
         );
+    }
+
+    #[test]
+    fn system_empty_tree_with_nonzero_declared_count_syncs_count_not_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("disk.img");
+        apfs_fixture::write_fixture(&image, ImageWrap::RawGpt).unwrap();
+        inject_volume_role(&image, FIXTURE_VOL_APSB_PADDR, APFS_VOL_ROLE_SYSTEM).unwrap();
+        inject_snapshot_count_fault(&image, FIXTURE_VOL_APSB_PADDR).unwrap();
+
+        let count_id = format!("snapshot-count:{FIXTURE_VOL_APSB_PADDR}");
+        let before = sweep(&image).unwrap();
+        let item = finding(&before, &count_id);
+        assert!(item.failed(), "{item:?}");
+        assert!(item.repairable, "{item:?}");
+        assert!(
+            !before.snapshot_creates.contains(&count_id),
+            "declared/tree mismatch must not queue snapshot creation"
+        );
+        let path = repair_paths(&before)
+            .into_iter()
+            .find(|path| path.id == count_id)
+            .expect("count repair path");
+        assert!(
+            path.label.contains("sync snapshot count"),
+            "expected count sync, got {path:?}"
+        );
+
+        apply(&image, std::slice::from_ref(&count_id)).unwrap();
+        let after = sweep(&image).unwrap();
+        let item = finding(&after, &count_id);
+        assert!(
+            item.summary.contains("has no snapshots") || item.passed(),
+            "count should match the empty tree after sync: {item:?}"
+        );
+        let mut opened = open_repair(&image).unwrap();
+        let apsb = read_block(&mut opened, FIXTURE_VOL_APSB_PADDR).unwrap();
+        assert_eq!(u64_at(&apsb, APSB_NUM_SNAPSHOTS_OFFSET), 0);
+        assert_eq!(u64_at(&apsb, APSB_SNAP_TREE_OFFSET), 0);
+    }
+
+    #[test]
+    fn pick_repair_container_uses_candidate_index_on_tied_rank() {
+        fn part(unique: u8, first_lba: u64) -> GptPartition {
+            GptPartition {
+                type_guid: crate::apfs_image::APPLE_APFS_TYPE_GUID,
+                unique_guid: [unique; 16],
+                first_lba,
+                last_lba: first_lba + 10,
+                attributes: 0,
+                name: "Apple_APFS".into(),
+            }
+        }
+        let first = part(1, 40);
+        let second = part(2, 80);
+        let candidates = [
+            (&first, true, 64u64, 40u64 * 4096, vec![0u8; 16]),
+            (&second, true, 64, 80 * 4096, vec![0u8; 16]),
+        ];
+        assert_eq!(pick_repair_container(&candidates), Some(1));
     }
 }

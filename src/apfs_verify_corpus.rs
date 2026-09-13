@@ -430,14 +430,13 @@ mod tests {
         let mut fixture = Fixture::load("fixtures/apfs-corpus-single-volume.blocks");
         let superblock = mounted_superblock(&fixture);
         fixture.edit(superblock, |block| {
-            block[0xB4..0xB8].copy_from_slice(&2u32.to_le_bytes());
+            block[0xB4..0xB8].copy_from_slice(&101u32.to_le_bytes());
         });
         assert_eq!(
             fixture.verify(),
-            Err(VerifyError::FieldMismatch {
+            Err(VerifyError::FieldOutOfRange {
                 what: "nx_max_file_systems",
-                expected: 1,
-                observed: 2,
+                observed: 101,
             })
         );
     }

@@ -1,4 +1,5 @@
 pub mod driver;
+pub mod local_policy;
 pub mod mux;
 pub mod options;
 pub mod phases;
@@ -11,7 +12,26 @@ pub mod seal_server;
 pub mod thread_class;
 
 pub use driver::{
-    PayloadProgress, RestoreBootContext, RestoreOutcome, run_ramrod_restore_over_mux,
+    PayloadProgress, RestoreBootContext, RestoreOutcome, local_policy_signer_for_plan,
+    run_ramrod_restore_over_mux,
+};
+pub use local_policy::{
+    BindingReport, CurlSigningTransport, IdentityRefusal, InputRefusal, KEY_AP_BOARD_ID,
+    KEY_AP_CHIP_ID, KEY_AP_ECID, KEY_AP_IMG4_TICKET_REQUESTED, KEY_AP_LOCAL_BOOT,
+    KEY_AP_LOCAL_POLICY, KEY_AP_NEXT_STAGE_IM4M_HASH, KEY_AP_PRODUCTION_MODE,
+    KEY_AP_RECOVERY_OS_POLICY_NONCE_HASH, KEY_AP_SECURITY_DOMAIN, KEY_AP_SECURITY_MODE,
+    KEY_AP_VOLUME_UUID, KEY_RESPONSE_AP_IMG4_TICKET, LocalPolicyCensus, LocalPolicyIdentity,
+    NEXT_STAGE_IM4M_HASH_TAG, POLICY_HASH_BYTES, PersonalizedLocalPolicy,
+    RECOVERY_OS_LOCAL_POLICY_DATA_TYPE, RECOVERY_OS_LOCAL_POLICY_IM4P,
+    RECOVERY_OS_LOCAL_POLICY_IM4P_SHA384, RECOVERY_OS_POLICY_NONCE_TAG,
+    RecoveryOsLocalPolicyInputs, RecoveryOsLocalPolicyRequest, RecoveryOsLocalPolicySigner,
+    ResponseRefusal, SIGNING_ENVELOPE_VERSION_INFO, SIGNING_OPT_IN_FLAG, SIGNING_OPT_IN_KEY,
+    SIGNING_SERVER_CONTENT_TYPE, SIGNING_SERVER_DEFAULT_BASE_URL,
+    SIGNING_SERVER_MAX_RESPONSE_BYTES, SIGNING_SERVER_REQUEST_PATH, SigningEnvelope,
+    SigningRefusal, SigningServerSigner, SigningTransport, VOLUME_UUID_BYTES, VOLUME_UUID_TAG,
+    binding_report, encode_signing_server_body, next_stage_im4m_hash,
+    parse_signing_server_response, personalize, signing_server_body, signing_server_signer,
+    volume_uuid_bytes,
 };
 pub use mux::{
     ClaimedMuxTransport, ClaimedMuxTransportMetadata, HostDetachDisposition, HostDetachOutcome,
