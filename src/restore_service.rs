@@ -8881,8 +8881,7 @@ mod tests {
         link.write(port, &[0x5Au8; 4096], Duration::from_millis(200))
             .unwrap();
         link.close(port).unwrap();
-        let lines = recorder.lock().unwrap().lines.clone();
-        lines
+        recorder.lock().unwrap().lines.clone()
     }
 
     #[test]

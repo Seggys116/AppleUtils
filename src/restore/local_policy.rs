@@ -722,40 +722,44 @@ const RESPONSE_TOKEN_REQUEST_STRING: &str = "REQUEST_STRING";
 
 pub const SIGNING_SERVER_MAX_RESPONSE_BYTES: usize = 0x19000;
 
-fn sysctl_string(name: &str) -> Option<String> {
-    let key = std::ffi::CString::new(name).ok()?;
-    let mut length: libc::size_t = 0;
-    // Safety: NUL-terminated name; first call is size-only with a null buffer.
-    let sized = unsafe {
-        libc::sysctlbyname(
-            key.as_ptr(),
-            std::ptr::null_mut(),
-            &raw mut length,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if sized != 0 || length == 0 {
-        return None;
+const DEVICE_TREE_MODEL: &str = "/sys/firmware/devicetree/base/model";
+const DMI_PRODUCT_NAME: &str = "/sys/devices/virtual/dmi/id/product_name";
+
+fn c_chars_to_string(buf: &[libc::c_char]) -> Option<String> {
+    let bytes = buf
+        .iter()
+        .map(|c| *c as u8)
+        .take_while(|byte| *byte != 0)
+        .collect::<Vec<_>>();
+    if bytes.is_empty() {
+        None
+    } else {
+        String::from_utf8(bytes).ok()
     }
-    let mut buffer = vec![0u8; length];
-    let read = unsafe {
-        libc::sysctlbyname(
-            key.as_ptr(),
-            buffer.as_mut_ptr().cast(),
-            &raw mut length,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if read != 0 {
-        return None;
+}
+
+fn host_uname() -> Option<libc::utsname> {
+    let mut name = unsafe { std::mem::zeroed() };
+    // Safety: uname writes NUL-terminated fields into the provided utsname.
+    let rc = unsafe { libc::uname(&raw mut name) };
+    if rc == 0 { Some(name) } else { None }
+}
+
+fn first_nonempty_text(path: &str) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let trimmed = text.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
-    buffer.truncate(length);
-    while buffer.last() == Some(&0) {
-        buffer.pop();
-    }
-    String::from_utf8(buffer).ok()
+}
+
+fn host_hardware(machine: Option<String>) -> Option<String> {
+    first_nonempty_text(DEVICE_TREE_MODEL)
+        .or_else(|| first_nonempty_text(DMI_PRODUCT_NAME))
+        .or(machine)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -767,13 +771,13 @@ pub struct SigningEnvelope {
 
 impl SigningEnvelope {
     pub fn for_this_host(version_info: &str, uuid: Option<String>) -> Result<Self, String> {
-        let os_version = sysctl_string("kern.osversion")
-            .ok_or_else(|| String::from("kern.osversion could not be read"))?;
-        let hardware = sysctl_string("hw.product")
-            .or_else(|| sysctl_string("hw.machine"))
-            .ok_or_else(|| String::from("neither hw.product nor hw.machine could be read"))?;
+        let name = host_uname().ok_or_else(|| String::from("uname could not be read"))?;
+        let os_version = c_chars_to_string(&name.release)
+            .ok_or_else(|| String::from("the kernel release could not be read"))?;
+        let hardware = host_hardware(c_chars_to_string(&name.machine))
+            .ok_or_else(|| String::from("the host hardware name could not be read"))?;
         Ok(Self {
-            host_platform_info: format!("mac/{os_version}/{hardware}"),
+            host_platform_info: format!("{}/{os_version}/{hardware}", std::env::consts::OS),
             version_info: version_info.to_string(),
             uuid,
         })
@@ -1787,8 +1791,20 @@ mod tests {
 
     #[test]
     fn the_armed_signer_is_built_from_this_host_without_issuing_anything() {
+        let envelope = SigningEnvelope::for_this_host("probe", None)
+            .expect("this host can name itself through uname");
+        let rest = envelope
+            .host_platform_info
+            .strip_prefix(&format!("{}/", std::env::consts::OS))
+            .unwrap_or("");
+        let (release, hardware) = rest.split_once('/').unwrap_or(("", ""));
+        assert!(
+            !release.is_empty() && !hardware.is_empty(),
+            "the envelope is platform/release/hardware: {}",
+            envelope.host_platform_info
+        );
         let signer = signing_server_signer(Some("SESSION-UUID".to_string()))
-            .expect("this host can read kern.osversion and its hardware name");
+            .expect("this host can name itself through uname");
         assert_eq!(signer.source(), "curl");
         assert!(
             SIGNING_ENVELOPE_VERSION_INFO.starts_with(env!("CARGO_PKG_NAME")),

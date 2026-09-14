@@ -448,10 +448,13 @@ mod tests {
     #[test]
     fn write_object_stamps_a_verifiable_checksum() {
         let mut image = open();
-        let mut disc = session(&mut image);
-        let body = vec![0xABu8; disc.block_size() as usize - OBJ_PHYS_BYTES];
-        write_object(&mut disc, LAYOUT.free_from, 0x999, 5, 0x0D, 0, &body).expect("write object");
-        drop(disc);
+        let body = {
+            let mut disc = session(&mut image);
+            let body = vec![0xABu8; disc.block_size() as usize - OBJ_PHYS_BYTES];
+            write_object(&mut disc, LAYOUT.free_from, 0x999, 5, 0x0D, 0, &body)
+                .expect("write object");
+            body
+        };
 
         let start = LAYOUT.free_from as usize * BLOCK_SIZE as usize;
         let block = &image.bytes[start..start + BLOCK_SIZE as usize];

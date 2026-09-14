@@ -319,32 +319,32 @@ fn create_root_system_snapshot(
             .iter()
             .any(|snapshot| snapshot.xid == xid && snapshot.name == choice.name)
     });
-    if let Some(xid) = name_xid {
-        if metadata_present {
-            if volume.root_to_xid == xid {
-                return Ok(SnapshotOutcome {
-                    name: choice.name,
-                    name_source: choice.source,
-                    already_present: true,
-                    written: false,
-                    xid,
-                    tree_paddr: volume.snapshots.tree_paddr,
-                    tree_created: false,
-                    volume_paddr: 0,
-                    snapshot_superblock_paddr: 0,
-                    superblock_paddr: 0,
-                });
-            }
-            return root_live_volume_at_existing_snapshot(
-                disc,
-                container,
-                volume,
-                ephemeral_objects,
-                choice.name,
-                choice.source,
+    if let Some(xid) = name_xid
+        && metadata_present
+    {
+        if volume.root_to_xid == xid {
+            return Ok(SnapshotOutcome {
+                name: choice.name,
+                name_source: choice.source,
+                already_present: true,
+                written: false,
                 xid,
-            );
+                tree_paddr: volume.snapshots.tree_paddr,
+                tree_created: false,
+                volume_paddr: 0,
+                snapshot_superblock_paddr: 0,
+                superblock_paddr: 0,
+            });
         }
+        return root_live_volume_at_existing_snapshot(
+            disc,
+            container,
+            volume,
+            ephemeral_objects,
+            choice.name,
+            choice.source,
+            xid,
+        );
     }
 
     let block_size = disc.block_size() as usize;

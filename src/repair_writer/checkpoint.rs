@@ -599,13 +599,13 @@ pub(crate) mod kernel_checks {
                         got: cpm_paddr,
                     });
                 }
-                if cpm_size == 0 || cpm_size as usize % block_size != 0 {
+                if cpm_size == 0 || !(cpm_size as usize).is_multiple_of(block_size) {
                     return Err(LoadFailure::MappingSize {
                         oid: cpm_oid,
                         size: cpm_size,
                     });
                 }
-                let blocks = (u64::from(cpm_size) + block_size as u64 - 1) / block_size as u64;
+                let blocks = u64::from(cpm_size).div_ceil(block_size as u64);
                 let offset = if cursor >= data_index {
                     cursor - data_index
                 } else {
@@ -852,10 +852,15 @@ mod tests {
     fn a_write_made_before_the_checkpoint_is_visible_after_it() {
         let mut image = open();
         let before = {
-            let mut disc = session(&mut image);
-            crate::repair_writer::spaceman::allocate(&mut disc, LAYOUT.spaceman, INITIAL_XID + 1)
+            {
+                let mut disc = session(&mut image);
+                crate::repair_writer::spaceman::allocate(
+                    &mut disc,
+                    LAYOUT.spaceman,
+                    INITIAL_XID + 1,
+                )
                 .expect("allocate");
-            drop(disc);
+            }
             let before = verify(&image);
             let mut disc = session(&mut image);
             append_checkpoint(

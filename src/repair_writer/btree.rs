@@ -5,7 +5,7 @@ use crate::apfs_verify::{u16_at, u32_at, u64_at};
 use super::disc::{DiscError, RepairSession};
 use super::object::{self, OBJ_PHYS_BYTES, ReadModifyWriteError, XID_OFFSET};
 
-const FLAGS_OFFSET: usize = OBJ_PHYS_BYTES + 0x00;
+const FLAGS_OFFSET: usize = OBJ_PHYS_BYTES; // btn_flags at +0x00
 const NKEYS_OFFSET: usize = OBJ_PHYS_BYTES + 0x04;
 const TOC_OFF_OFFSET: usize = OBJ_PHYS_BYTES + 0x08;
 const TOC_LEN_OFFSET: usize = OBJ_PHYS_BYTES + 0x0A;

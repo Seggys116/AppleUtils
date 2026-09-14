@@ -432,10 +432,11 @@ mod tests {
         let mut image = open();
         let before = image.bytes.clone();
         let (paddr, original_bitmap, original_cib, original_sm) = {
-            let mut disc = session(&mut image);
-            let mut private = PrivateSpaceman::load(&mut disc, LAYOUT.spaceman).expect("load");
-            let paddr = private.allocate(INITIAL_XID + 1).expect("allocate");
-            drop(disc);
+            let paddr = {
+                let mut disc = session(&mut image);
+                let mut private = PrivateSpaceman::load(&mut disc, LAYOUT.spaceman).expect("load");
+                private.allocate(INITIAL_XID + 1).expect("allocate")
+            };
             let bitmap_at = LAYOUT.bitmap as usize * BLOCK_SIZE as usize;
             let cib_at = LAYOUT.cib as usize * BLOCK_SIZE as usize;
             let sm_at = LAYOUT.spaceman as usize * BLOCK_SIZE as usize;
