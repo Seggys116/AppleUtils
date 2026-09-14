@@ -523,10 +523,6 @@ pub enum VerifyError {
         expected: u64,
         observed: u64,
     },
-    AddressOutsideInternalPool {
-        paddr: u64,
-        what: &'static str,
-    },
 }
 
 impl fmt::Display for VerifyError {
@@ -637,10 +633,6 @@ impl fmt::Display for VerifyError {
                 expected,
                 observed,
             } => write!(f, "{what} is {observed}, but {expected} was expected"),
-            Self::AddressOutsideInternalPool { paddr, what } => write!(
-                f,
-                "block {paddr} holds the {what} but is outside the space manager's internal pool"
-            ),
         }
     }
 }
@@ -2102,8 +2094,8 @@ impl Verifier<'_> {
                 observed: cib_addr_offset as u64,
             });
         }
-        let in_internal_pool = |paddr: u64| paddr >= ip_base && paddr - ip_base < ip_block_count;
-
+        // Apple copy-on-writes CIBs, CABs, and chunk bitmaps into the general pool
+        // when the internal pool is busy; location is not a mount invariant.
         let cib_addrs: Vec<u64> = if cab_count == 0 {
             (0..cib_count)
                 .map(|index| u64_at(sm, cib_addr_offset + index * 8))
@@ -2126,12 +2118,6 @@ impl Verifier<'_> {
             let mut addrs = Vec::with_capacity(cib_count);
             for cab_index in 0..cab_count {
                 let cab_paddr = u64_at(sm, cib_addr_offset + cab_index * 8);
-                if !in_internal_pool(cab_paddr) {
-                    return Err(VerifyError::AddressOutsideInternalPool {
-                        paddr: cab_paddr,
-                        what: "chunk-info address block",
-                    });
-                }
                 let cab = self.read_expecting(
                     cab_paddr,
                     Some(cab_paddr),
@@ -2185,12 +2171,6 @@ impl Verifier<'_> {
         let mut covered = 0u64;
         let mut seen_chunks = 0u64;
         for (cib_index, &cib_paddr) in cib_addrs.iter().enumerate() {
-            if !in_internal_pool(cib_paddr) {
-                return Err(VerifyError::AddressOutsideInternalPool {
-                    paddr: cib_paddr,
-                    what: "chunk info block",
-                });
-            }
             let cib = self.read_expecting(
                 cib_paddr,
                 Some(cib_paddr),
@@ -2242,12 +2222,6 @@ impl Verifier<'_> {
                 let bitmap = if bitmap_addr == 0 {
                     None
                 } else {
-                    if !in_internal_pool(bitmap_addr) {
-                        return Err(VerifyError::AddressOutsideInternalPool {
-                            paddr: bitmap_addr,
-                            what: "allocation bitmap",
-                        });
-                    }
                     let bitmap = self.read_raw(bitmap_addr)?;
                     self.note(bitmap_addr, "allocation bitmap");
                     Some(bitmap)

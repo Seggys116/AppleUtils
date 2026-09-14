@@ -142,6 +142,17 @@ mod tests {
             edit(&mut self.blocks[slot].1);
         }
 
+        fn put(&mut self, paddr: u64, bytes: Vec<u8>) {
+            assert_eq!(bytes.len(), self.block_size);
+            match self
+                .blocks
+                .binary_search_by_key(&paddr, |(index, _)| *index)
+            {
+                Ok(slot) => self.blocks[slot].1 = bytes,
+                Err(slot) => self.blocks.insert(slot, (paddr, bytes)),
+            }
+        }
+
         fn verify(&mut self) -> Result<apfs_verify::VerifiedContainer, VerifyError> {
             apfs_verify::verify_container(self)
         }
@@ -216,6 +227,82 @@ mod tests {
         }
         best.expect("a captured container must carry a mountable checkpoint")
             .1
+    }
+
+    const CHUNK_INFO_BYTES: usize = 32;
+
+    fn relocate_first_cib(fixture: &mut Fixture, mark_allocated: bool) -> (u64, u64) {
+        let superblock = mounted_superblock(fixture);
+        let spaceman = mounted_spaceman_paddr(fixture, superblock);
+        let sm = fixture.block(spaceman).to_vec();
+        let ip_base = u64_at(&sm, 0xB0);
+        let ip_block_count = u64_at(&sm, 0x98);
+        let cib_addr_offset = u32_at(&sm, 0x50) as usize;
+        let old_cib = u64_at(&sm, cib_addr_offset);
+        assert!(
+            old_cib >= ip_base && old_cib - ip_base < ip_block_count,
+            "the corpus CIB must start inside the internal pool so the move is a real one"
+        );
+        let cib = fixture.block(old_cib).to_vec();
+        let chunks = u32_at(&cib, 0x24) as usize;
+
+        let mut dest = None;
+        let mut bitmap_paddr = 0;
+        let mut bit = 0;
+        let mut chunk_slot = 0;
+        for slot in 0..chunks {
+            let at = 0x28 + slot * CHUNK_INFO_BYTES;
+            let chunk_addr = u64_at(&cib, at + 8);
+            let chunk_blocks = u32_at(&cib, at + 16) as usize;
+            let bitmap_addr = u64_at(&cib, at + 24);
+            if bitmap_addr == 0 {
+                continue;
+            }
+            let bitmap = fixture.block(bitmap_addr);
+            for b in 0..chunk_blocks {
+                let paddr = chunk_addr + b as u64;
+                let allocated = bitmap[b >> 3] >> (b & 7) & 1 == 1;
+                if allocated {
+                    continue;
+                }
+                if paddr >= ip_base && paddr - ip_base < ip_block_count {
+                    continue;
+                }
+                dest = Some(paddr);
+                bitmap_paddr = bitmap_addr;
+                bit = b;
+                chunk_slot = slot;
+                break;
+            }
+            if dest.is_some() {
+                break;
+            }
+        }
+        let dest = dest.expect("corpus must have a free block outside the internal pool");
+
+        let mut moved = cib;
+        moved[0x08..0x10].copy_from_slice(&dest.to_le_bytes());
+        if mark_allocated {
+            let at = 0x28 + chunk_slot * CHUNK_INFO_BYTES;
+            let free = u32_at(&moved, at + 20);
+            moved[at + 20..at + 24].copy_from_slice(&(free - 1).to_le_bytes());
+        }
+        reseal(&mut moved);
+        fixture.put(dest, moved);
+
+        fixture.edit(spaceman, |block| {
+            block[cib_addr_offset..cib_addr_offset + 8].copy_from_slice(&dest.to_le_bytes());
+            if mark_allocated {
+                let free = u64_at(block, 0x48);
+                block[0x48..0x50].copy_from_slice(&(free - 1).to_le_bytes());
+            }
+        });
+        if mark_allocated {
+            fixture.edit_leave_checksum_wrong(bitmap_paddr, |block| {
+                block[bit >> 3] |= 1 << (bit & 7);
+            });
+        }
+        (old_cib, dest)
     }
 
     fn mounted_spaceman_paddr(fixture: &Fixture, superblock: u64) -> u64 {
@@ -477,6 +564,38 @@ mod tests {
                 what: "sm_dev[SD_MAIN].addr_offset",
                 expected: real_addr_offset as u64,
                 observed: (real_addr_offset - 6) as u64,
+            })
+        );
+    }
+
+    #[test]
+    fn a_chunk_info_block_outside_the_internal_pool_still_verifies_if_allocated() {
+        let mut fixture = Fixture::load("fixtures/apfs-corpus-single-volume.blocks");
+        let (old_cib, dest) = relocate_first_cib(&mut fixture, true);
+        let superblock = mounted_superblock(&fixture);
+        let spaceman = mounted_spaceman_paddr(&fixture, superblock);
+        let ip_base = u64_at(fixture.block(spaceman), 0xB0);
+        let ip_block_count = u64_at(fixture.block(spaceman), 0x98);
+        assert!(
+            dest < ip_base || dest - ip_base >= ip_block_count,
+            "dest={dest} still sits in the pool [{ip_base}, {})",
+            ip_base + ip_block_count
+        );
+        assert_ne!(old_cib, dest);
+        fixture
+            .verify()
+            .expect("a CIB outside the internal pool must still verify when it is allocated");
+    }
+
+    #[test]
+    fn a_chunk_info_block_outside_the_internal_pool_must_still_be_allocated() {
+        let mut fixture = Fixture::load("fixtures/apfs-corpus-single-volume.blocks");
+        let (_old_cib, dest) = relocate_first_cib(&mut fixture, false);
+        assert_eq!(
+            fixture.verify(),
+            Err(VerifyError::BlockNotAllocated {
+                paddr: dest,
+                what: "chunk info block",
             })
         );
     }
