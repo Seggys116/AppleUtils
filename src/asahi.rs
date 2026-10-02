@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{App, AsahiAction, AsahiSource, AsahiStep, Screen};
-use crate::asahi_ops::{SLIDER_MAX_GB, SLIDER_MIN_GB};
+use crate::asahi_ops::{KernelConsole, SLIDER_MAX_GB, SLIDER_MIN_GB};
 use crate::theme;
 use crate::ui;
 
@@ -19,6 +19,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     match app.asahi_step {
         AsahiStep::Menu => render_menu(frame, area, app),
         AsahiStep::Size => render_size(frame, area, app),
+        AsahiStep::Console => render_console(frame, area, app),
         AsahiStep::WaitFile => {
             let title = match app.asahi_action {
                 AsahiAction::Update => "existing disc",
@@ -85,6 +86,22 @@ fn render_menu(frame: &mut Frame, area: Rect, app: &mut App) {
                 action.name(),
                 action.blurb(),
                 i == app.asahi_action_cursor,
+            );
+        }
+    }
+}
+
+fn render_console(frame: &mut Frame, area: Rect, app: &mut App) {
+    let rects = stacked_cards::<2>(area);
+    app.hits.asahi_console = rects;
+    for (i, (mode, rect)) in KernelConsole::ALL.iter().zip(rects).enumerate() {
+        if rect.width > 0 && rect.height > 0 {
+            ui::render_choice_card(
+                frame,
+                rect,
+                mode.name(),
+                mode.blurb(),
+                i == app.asahi_console_cursor,
             );
         }
     }

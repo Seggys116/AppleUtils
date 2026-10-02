@@ -192,6 +192,7 @@ enum AsahiJobEvent {
 pub enum AsahiStep {
     Menu,
     Size,
+    Console,
     WaitFile,
     Source,
     Flavor,
@@ -209,6 +210,7 @@ impl AsahiStep {
         match self {
             AsahiStep::Menu => "MENU",
             AsahiStep::Size => "SIZE",
+            AsahiStep::Console => "BOOT",
             AsahiStep::WaitFile => "FILE",
             AsahiStep::Source => "SOURCE",
             AsahiStep::Flavor => "OS",
@@ -268,6 +270,7 @@ pub struct HitMap {
     pub cards: [Rect; 4],
     pub asahi_actions: [Rect; 2],
     pub asahi_sources: [Rect; 2],
+    pub asahi_console: [Rect; 2],
     pub asahi_flavors: [Rect; 8],
     pub asahi_slider: Rect,
     pub explorer_volume_rows: Vec<Rect>,
@@ -298,6 +301,13 @@ impl HitMap {
     pub fn asahi_source_at(&self, col: u16, row: u16) -> Option<usize> {
         let pos = Position::new(col, row);
         self.asahi_sources
+            .iter()
+            .position(|rect| rect.width > 0 && rect.height > 0 && rect.contains(pos))
+    }
+
+    pub fn asahi_console_at(&self, col: u16, row: u16) -> Option<usize> {
+        let pos = Position::new(col, row);
+        self.asahi_console
             .iter()
             .position(|rect| rect.width > 0 && rect.height > 0 && rect.contains(pos))
     }
@@ -390,6 +400,8 @@ pub struct App {
     pub asahi_flavor_cursor: usize,
     pub asahi_os_query: String,
     pub asahi_size_gb: u32,
+    pub asahi_kernel_console: crate::asahi_ops::KernelConsole,
+    pub asahi_console_cursor: usize,
     pub asahi_confirmed: String,
     pub asahi_kernel: String,
     pub asahi_m1n1: String,
@@ -478,6 +490,8 @@ impl App {
             asahi_flavor_cursor: 0,
             asahi_os_query: String::new(),
             asahi_size_gb: crate::asahi_ops::SLIDER_DEFAULT_GB,
+            asahi_kernel_console: crate::asahi_ops::KernelConsole::default(),
+            asahi_console_cursor: 0,
             asahi_confirmed: String::new(),
             asahi_kernel: String::new(),
             asahi_m1n1: String::new(),
@@ -2286,8 +2300,43 @@ impl App {
                     false
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
+                    self.asahi_step = AsahiStep::Console;
+                    false
+                }
+                _ => false,
+            },
+            AsahiStep::Console => match key.code {
+                KeyCode::Char('q') => true,
+                KeyCode::Esc => {
+                    self.asahi_step = AsahiStep::Size;
+                    false
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.asahi_console_cursor = 1 - self.asahi_console_cursor;
+                    self.asahi_lock_cursor_from_keys();
+                    false
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.asahi_console_cursor = 1 - self.asahi_console_cursor;
+                    self.asahi_lock_cursor_from_keys();
+                    false
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    self.asahi_kernel_console =
+                        crate::asahi_ops::KernelConsole::ALL[self.asahi_console_cursor];
                     self.enter_file_picker();
                     self.asahi_step = AsahiStep::WaitFile;
+                    false
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    let n = c.to_digit(10).unwrap() as usize;
+                    if (1..=crate::asahi_ops::KernelConsole::ALL.len()).contains(&n) {
+                        self.asahi_console_cursor = n - 1;
+                        self.asahi_kernel_console =
+                            crate::asahi_ops::KernelConsole::ALL[self.asahi_console_cursor];
+                        self.enter_file_picker();
+                        self.asahi_step = AsahiStep::WaitFile;
+                    }
                     false
                 }
                 _ => false,
@@ -2301,7 +2350,7 @@ impl App {
                     KeyCode::Esc => {
                         self.clear_path_input();
                         self.asahi_step = match self.asahi_action {
-                            AsahiAction::Install => AsahiStep::Size,
+                            AsahiAction::Install => AsahiStep::Console,
                             AsahiAction::Update => AsahiStep::Menu,
                         };
                         false
@@ -2536,7 +2585,11 @@ impl App {
         self.asahi_error = None;
         self.asahi_status.clear();
         match self.asahi_action {
-            AsahiAction::Install => self.asahi_step = AsahiStep::Size,
+            AsahiAction::Install => {
+                self.asahi_console_cursor = 0;
+                self.asahi_kernel_console = crate::asahi_ops::KernelConsole::default();
+                self.asahi_step = AsahiStep::Size;
+            }
             AsahiAction::Update => {
                 self.enter_file_picker();
                 self.asahi_step = AsahiStep::WaitFile;
@@ -2547,6 +2600,7 @@ impl App {
     fn asahi_card_index_at(&self, col: u16, row: u16) -> Option<usize> {
         match self.asahi_step {
             AsahiStep::Menu => self.hits.asahi_action_at(col, row),
+            AsahiStep::Console => self.hits.asahi_console_at(col, row),
             AsahiStep::Source => self.hits.asahi_source_at(col, row),
             AsahiStep::Flavor => self
                 .hits
@@ -2576,6 +2630,7 @@ impl App {
         }
         match self.asahi_step {
             AsahiStep::Menu => self.asahi_action_cursor = index,
+            AsahiStep::Console => self.asahi_console_cursor = index,
             AsahiStep::Source => self.asahi_source_cursor = index,
             AsahiStep::Flavor => self.asahi_flavor_cursor = index,
             _ => {}
@@ -2585,7 +2640,7 @@ impl App {
     fn asahi_hover(&mut self, col: u16, row: u16, dragging: bool) {
         self.asahi_pointer = Some((col, row));
         match self.asahi_step {
-            AsahiStep::Menu | AsahiStep::Source | AsahiStep::Flavor => {
+            AsahiStep::Menu | AsahiStep::Source | AsahiStep::Flavor | AsahiStep::Console => {
                 if let Some(index) = self.asahi_card_index_at(col, row) {
                     self.asahi_apply_hover_index(index);
                 }
@@ -2623,6 +2678,14 @@ impl App {
                     self.asahi_action_cursor = index;
                     self.asahi_action = AsahiAction::ALL[index];
                     self.asahi_enter_action();
+                }
+            }
+            AsahiStep::Console => {
+                if let Some(index) = self.hits.asahi_console_at(col, row) {
+                    self.asahi_console_cursor = index;
+                    self.asahi_kernel_console = crate::asahi_ops::KernelConsole::ALL[index];
+                    self.enter_file_picker();
+                    self.asahi_step = AsahiStep::WaitFile;
                 }
             }
             AsahiStep::Source => {
@@ -2986,6 +3049,7 @@ impl App {
             os_name,
             injected_artifacts: self.asahi_injected_artifacts.clone(),
             injected_metadata: self.asahi_injected_metadata.clone(),
+            kernel_console: self.asahi_kernel_console,
         }
     }
 
@@ -3065,6 +3129,7 @@ struct AsahiWorkPlan {
     os_name: String,
     injected_artifacts: Option<crate::asahi_ops::Artifacts>,
     injected_metadata: Option<String>,
+    kernel_console: crate::asahi_ops::KernelConsole,
 }
 
 fn execute_asahi_work(
@@ -3256,12 +3321,15 @@ fn execute_asahi_work(
             }
             AsahiAction::Install => {
                 progress("writing disc", Some(0.0));
-                let report = asahi_ops::create_qcow2_disc_with_progress(
+                let report = asahi_ops::create_qcow2_disc_with_options(
                     &plan.dest,
                     &artifacts,
                     plan.size_bytes,
                     &next_object,
                     &plan.os_name,
+                    &asahi_ops::DiscOptions {
+                        kernel_console: plan.kernel_console,
+                    },
                     |fraction| progress("writing disc", Some(fraction)),
                 )
                 .map_err(|e| e.to_string())?;
@@ -3689,6 +3757,18 @@ mod tests {
         assert_eq!(app.asahi_size_gb, asahi_ops::SLIDER_MAX_GB);
 
         press(&mut app, KeyCode::Enter);
+        assert_eq!(app.asahi_step, AsahiStep::Console);
+        assert_eq!(app.asahi_console_cursor, 0);
+        assert_eq!(app.asahi_kernel_console, asahi_ops::KernelConsole::Normal);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.asahi_kernel_console, asahi_ops::KernelConsole::Normal);
+        assert_eq!(app.asahi_step, AsahiStep::WaitFile);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.asahi_step, AsahiStep::Console);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.asahi_console_cursor, 1);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.asahi_kernel_console, asahi_ops::KernelConsole::Verbose);
         assert_eq!(app.asahi_step, AsahiStep::WaitFile);
         app.clip.file = None;
         app.path_input.clear();
@@ -3797,6 +3877,8 @@ mod tests {
         assert_eq!(app.asahi_action, AsahiAction::Install);
         assert_eq!(app.asahi_step, AsahiStep::Size);
         press(&mut app, KeyCode::Enter);
+        assert_eq!(app.asahi_step, AsahiStep::Console);
+        press(&mut app, KeyCode::Enter);
         assert_eq!(app.asahi_step, AsahiStep::WaitFile);
 
         app.clip.file = None;
@@ -3896,6 +3978,8 @@ mod tests {
         let mut app = App::new();
         press(&mut app, KeyCode::Char('4'));
         press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.asahi_step, AsahiStep::Console);
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.asahi_step, AsahiStep::WaitFile);
         type_chars(&mut app, &folder_s);
@@ -4263,6 +4347,8 @@ mod tests {
         press(&mut app, KeyCode::Char('2'));
         assert_eq!(app.asahi_step, AsahiStep::Size);
         press(&mut app, KeyCode::Enter);
+        assert_eq!(app.asahi_step, AsahiStep::Console);
+        press(&mut app, KeyCode::Enter);
         assert_eq!(app.asahi_step, AsahiStep::WaitFile);
         app.asahi_injected_artifacts = Some(tiny_artifacts(b"-new"));
         app.asahi_output_path = Some(out.clone());
@@ -4285,6 +4371,8 @@ mod tests {
         let mut app = App::new();
         press(&mut app, KeyCode::Char('4'));
         press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.asahi_step, AsahiStep::Console);
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.asahi_step, AsahiStep::WaitFile);
         let dir = tempfile::tempdir().unwrap();
@@ -4337,6 +4425,7 @@ mod tests {
     fn asahi_flavor_list(app: &mut App) {
         press(app, KeyCode::Char('4'));
         press(app, KeyCode::Char('2'));
+        press(app, KeyCode::Enter);
         press(app, KeyCode::Enter);
         app.asahi_output_path = Some(tempfile::tempdir().unwrap().path().join("asahi.qcow2"));
         press(app, KeyCode::Enter);
@@ -4429,6 +4518,7 @@ mod tests {
         let mut app = App::new();
         press(&mut app, KeyCode::Char('4'));
         press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Enter);
         let dir = tempfile::tempdir().unwrap();
         app.asahi_output_path = Some(dir.path().join("asahi.qcow2"));

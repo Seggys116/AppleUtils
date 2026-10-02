@@ -10,8 +10,8 @@ use super::codec::{self, CodecError, PlistFormat};
 use super::dial::{Clock, DialError, DialPlan, GuestDialer, dial_until};
 use super::message::{
     self, DataRequest, DeviceMessage, DeviceType, KEY_CHECKPOINT_ERROR, KEY_LOG, KEY_MSG_TYPE,
-    KEY_QUERY_KEY, KEY_QUERY_VALUE, KEY_RESTORE_OPTIONS, KEY_RESTORE_PROTOCOL_VERSION, KEY_TYPE,
-    MsgType, OptionsError, QueryKey, Request, RestoreOptions,
+    KEY_QUERY_KEY, KEY_RESTORE_OPTIONS, KEY_RESTORE_PROTOCOL_VERSION, KEY_TYPE, MsgType,
+    OptionsError, QueryKey, Request, RestoreOptions,
 };
 use super::provider::{
     BulkOutcome, BulkTransferService, ProviderError, RestoreDataProvider, SessionObserver,
@@ -317,9 +317,10 @@ impl<T: Read + Write> RamrodClient<T> {
         body.insert(KEY_QUERY_KEY.to_string(), Value::String(key.to_string()));
         self.send(&Value::Dictionary(body))?;
 
+        // restored keys the reply by the query key itself, and sends it empty when it cannot answer.
         let reply = self.receive_reply(Request::QueryValue)?;
         reply
-            .get(KEY_QUERY_VALUE)
+            .get(key)
             .cloned()
             .ok_or_else(|| RamrodError::ValueNotAvailable {
                 key: key.to_string(),
@@ -1442,13 +1443,14 @@ mod tests {
 
     #[test]
     fn query_value_sends_the_key_and_returns_the_answer() {
-        let reply = dict(vec![
-            (KEY_QUERY_VALUE, Value::String("F4GXXXXXXXXX".into())),
-            (KEY_RESULT, Value::String(RESULT_SUCCESS.into())),
-        ]);
+        let reply = dict(vec![("SerialNumber", Value::String("F4GXXXXXXXXX".into()))]);
         let mut client = RamrodClient::new(ScriptedTransport::new(&[reply]));
         let value = client.query_value(QueryKey::SerialNumber).unwrap();
-        assert_eq!(value.as_string(), Some("F4GXXXXXXXXX"));
+        assert_eq!(
+            value.as_string(),
+            Some("F4GXXXXXXXXX"),
+            "restored keys its value-query reply by the query key itself"
+        );
 
         let written = client.into_inner().written();
         let body = written[0].as_dictionary().unwrap();
@@ -1459,6 +1461,32 @@ mod tests {
         assert_eq!(
             body.get(KEY_QUERY_KEY).unwrap().as_string(),
             Some("SerialNumber")
+        );
+    }
+
+    #[test]
+    fn the_hardware_info_query_returns_the_dictionary_restored_keyed_by_hardware_info() {
+        let mut info = Dictionary::new();
+        info.insert("ChipID".into(), Value::Integer(0xfe00_u64.into()));
+        info.insert("BoardID".into(), Value::Integer(0x20_u64.into()));
+        info.insert(
+            "UniqueChipID".into(),
+            Value::Integer(0x0123_4567_89ab_cdef_u64.into()),
+        );
+        let reply = dict(vec![("HardwareInfo", Value::Dictionary(info.clone()))]);
+        let mut client = RamrodClient::new(ScriptedTransport::new(&[reply]));
+        let value = client.query_value(QueryKey::HardwareInfo).unwrap();
+        assert_eq!(value.as_dictionary(), Some(&info));
+
+        let written = client.into_inner().written();
+        let body = written[0].as_dictionary().unwrap();
+        assert_eq!(
+            body.get(KEY_REQUEST).unwrap().as_string(),
+            Some("QueryValue")
+        );
+        assert_eq!(
+            body.get(KEY_QUERY_KEY).unwrap().as_string(),
+            Some("HardwareInfo")
         );
     }
 

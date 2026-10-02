@@ -137,6 +137,40 @@ pub struct FirmwareRequirements {
     pub installer_data_partitions: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KernelConsole {
+    #[default]
+    Normal,
+    Verbose,
+}
+
+impl KernelConsole {
+    pub const ALL: [KernelConsole; 2] = [KernelConsole::Normal, KernelConsole::Verbose];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal boot",
+            Self::Verbose => "Verbose boot",
+        }
+    }
+
+    pub fn blurb(self) -> &'static str {
+        match self {
+            Self::Verbose => {
+                "Full kernel log on the display and the serial console. Removes quiet/rhgb and adds loglevel=7 console=tty0 console=ttySAC0."
+            }
+            Self::Normal => {
+                "Boot exactly as the distribution ships it: splash, quiet kernel, no serial console."
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiscOptions {
+    pub kernel_console: KernelConsole,
+}
+
 impl From<&ResolvedLatest> for FirmwareRequirements {
     fn from(resolved: &ResolvedLatest) -> Self {
         Self {
@@ -762,6 +796,126 @@ fn build_stage1(m1n1: &[u8], efi_uuid: &str, next_object: &str) -> Result<Vec<u8
     out.extend_from_slice(format!("chainload={efi_uuid};{next_object}\n").as_bytes());
     out.extend_from_slice(&[0; 4]);
     Ok(out)
+}
+
+/// Magics the m1n1 payload scanner recognises: a devicetree header, then the
+/// boot stage as a gzip or xz container or an arm64 image (magic at 0x38).
+const FDT_MAGIC: [u8; 4] = [0xd0, 0x0d, 0xfe, 0xed];
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+const XZ_MAGIC: [u8; 6] = [0xfd, b'7', b'z', b'X', b'Z', 0x00];
+const ARM64_IMAGE_MAGIC: [u8; 4] = [b'A', b'R', b'M', 0x64];
+const ARM64_IMAGE_MAGIC_OFFSET: usize = 0x38;
+
+/// How the chainloaded stage encodes the image it boots after its devicetrees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainloadKernel {
+    Gzip,
+    Xz,
+    Image,
+}
+
+/// What a chainload target carries after its own m1n1 image, counted so a
+/// refusal can name what was found instead of what was required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainloadPayload {
+    pub devicetrees: usize,
+    pub devicetree_offset: usize,
+    pub kernel_offset: usize,
+    pub kernel: ChainloadKernel,
+}
+
+/// Length of the well formed devicetree starting at `at`, if one starts there.
+/// Every field the header declares must lie inside the length it declares, so
+/// the four magic bytes appearing in unrelated data do not read as a tree.
+fn fdt_length_at(image: &[u8], at: usize) -> Option<usize> {
+    let header = image.get(at..at + 40)?;
+    if header[..4] != FDT_MAGIC {
+        return None;
+    }
+    let field = |i: usize| u32::from_be_bytes(header[i..i + 4].try_into().unwrap()) as usize;
+    let total = field(4);
+    let version = field(20);
+    let last_compatible = field(24);
+    if !(16..=17).contains(&version) || !(16..=version).contains(&last_compatible) {
+        return None;
+    }
+    if total < 40 || image.len() - at < total {
+        return None;
+    }
+    if field(8).checked_add(field(36))? > total
+        || field(12).checked_add(field(32))? > total
+        || field(16) > total
+    {
+        return None;
+    }
+    Some(total)
+}
+
+/// Longest run of devicetrees laid end to end in `image`, as the offset the run
+/// starts at, the offset it ends at, and how many trees it holds.
+fn devicetree_run(image: &[u8]) -> Option<(usize, usize, usize)> {
+    let mut best: Option<(usize, usize, usize)> = None;
+    let mut at = 0usize;
+    while at + 40 <= image.len() {
+        let Some(first) = fdt_length_at(image, at) else {
+            at += 1;
+            continue;
+        };
+        let mut end = at + first;
+        let mut count = 1usize;
+        while let Some(next) = fdt_length_at(image, end) {
+            end += next;
+            count += 1;
+        }
+        if best.is_none_or(|(_, _, seen)| count > seen) {
+            best = Some((at, end, count));
+        }
+        at = end;
+    }
+    best
+}
+
+/// Check that `image` is a stage the chainload can hand control to: an m1n1 raw
+/// boot image carrying its own appended payload. m1n1 boots what is appended to
+/// it and opens its proxy when nothing is, so a chainload target with no
+/// payload boots nothing and waits for a host that a disc boot never has.
+pub fn validate_chainload_payload(name: &str, image: &[u8]) -> Result<ChainloadPayload, OpsError> {
+    if image.len() < 2048 || !contains_bytes(image, b"##m1n1_ver##") {
+        return Err(err(format!(
+            "chainload target {name} is not an m1n1 raw boot image, {} bytes",
+            image.len()
+        )));
+    }
+    let Some((offset, end, devicetrees)) = devicetree_run(image) else {
+        return Err(err(format!(
+            "chainload target {name} carries no appended devicetree across {} bytes, so the stage \
+             it chainloads into has nothing to boot",
+            image.len()
+        )));
+    };
+    let tail = &image[end..];
+    let kernel = if tail.starts_with(&GZIP_MAGIC) {
+        ChainloadKernel::Gzip
+    } else if tail.starts_with(&XZ_MAGIC) {
+        ChainloadKernel::Xz
+    } else if tail
+        .get(ARM64_IMAGE_MAGIC_OFFSET..ARM64_IMAGE_MAGIC_OFFSET + ARM64_IMAGE_MAGIC.len())
+        .is_some_and(|magic| magic == ARM64_IMAGE_MAGIC)
+    {
+        ChainloadKernel::Image
+    } else {
+        return Err(err(format!(
+            "chainload target {name} carries {devicetrees} appended devicetree(s) at {offset:#x} \
+             but no kernel payload follows them at {end:#x}, where {} bytes remain",
+            tail.len()
+        )));
+    };
+    Ok(ChainloadPayload {
+        devicetrees,
+        devicetree_offset: offset,
+        kernel_offset: end,
+        kernel,
+    })
 }
 
 pub fn fetch_installer_stage1() -> Result<Vec<u8>, OpsError> {
@@ -1433,6 +1587,17 @@ fn efi_payloads(
         files.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
         files.push((name.into(), bytes));
     }
+    if !files
+        .iter()
+        .any(|(existing, bytes)| existing.eq_ignore_ascii_case(next_object) && !bytes.is_empty())
+    {
+        return Err(err(format!(
+            "stage one is configured to chainload {next_object} but nothing supplies it: the \
+             loaded artifacts carry no stage two and the package contributed no EFI file at that \
+             path, across {} EFI files",
+            files.len()
+        )));
+    }
     Ok(files)
 }
 
@@ -1607,20 +1772,78 @@ fn write_root_at(
     }
 }
 
+fn prepare_ext4_console(
+    source: &mut (impl Read + Write + Seek),
+    options: &DiscOptions,
+) -> Result<(), OpsError> {
+    crate::asahi_boot_metadata::normalize_ext4_environment(source).map_err(err)?;
+    if options.kernel_console == KernelConsole::Verbose {
+        crate::asahi_boot_metadata::enable_verbose_kernel(source).map_err(err)?;
+    }
+    Ok(())
+}
+
+fn prepare_ext4_path(path: &Path, options: &DiscOptions) -> Result<(), OpsError> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    prepare_ext4_console(&mut file, options)
+}
+
+fn prepared_ext4_bytes(bytes: &[u8], options: &DiscOptions) -> Result<Option<Vec<u8>>, OpsError> {
+    if bytes.len() < 2048 {
+        return Ok(None);
+    }
+    let magic = u16::from_le_bytes(
+        bytes
+            .get(0x438..0x43A)
+            .ok_or_else(|| err("truncated filesystem superblock"))?
+            .try_into()
+            .unwrap(),
+    );
+    if magic != 0xEF53 {
+        return Ok(None);
+    }
+    let mut data = bytes.to_vec();
+    prepare_ext4_console(&mut std::io::Cursor::new(&mut data), options)?;
+    Ok(Some(data))
+}
+
 fn copy_payloads_into(
     path: &Path,
     report: &DiscReport,
     artifacts: &Artifacts,
+    options: &DiscOptions,
 ) -> Result<(), OpsError> {
-    copy_payloads_into_progress(path, report, artifacts, |_| {})
+    copy_payloads_into_progress(path, report, artifacts, options, |_| {})
 }
 
 fn copy_payloads_into_progress(
     path: &Path,
     report: &DiscReport,
     artifacts: &Artifacts,
+    options: &DiscOptions,
     mut on_progress: impl FnMut(f64),
 ) -> Result<(), OpsError> {
+    if let Some(root) = &artifacts.root_path {
+        prepare_ext4_path(root, options)?;
+    }
+    if let Some(boot) = &artifacts.boot_path {
+        prepare_ext4_path(boot, options)?;
+    }
+    let patched_root = if artifacts.root_path.is_none() {
+        prepared_ext4_bytes(&artifacts.root_fs, options)?
+    } else {
+        None
+    };
+    let patched_boot = if artifacts.boot_path.is_none() {
+        prepared_ext4_bytes(&artifacts.boot_fs, options)?
+    } else {
+        None
+    };
+    let root_bytes = patched_root.as_deref().unwrap_or(&artifacts.root_fs);
+    let boot_bytes = patched_boot.as_deref().unwrap_or(&artifacts.boot_fs);
     let root_len = artifacts.root_len()?;
     let boot_len = artifacts.boot_len().unwrap_or(0);
     let total = root_len.saturating_add(boot_len).max(1);
@@ -1637,11 +1860,7 @@ fn copy_payloads_into_progress(
                 },
             )?;
         } else {
-            write_root_at(
-                &mut *img,
-                report.linux_lba * u64::from(report.sector_size),
-                artifacts,
-            )?;
+            img.write_at(report.linux_lba * u64::from(report.sector_size), root_bytes)?;
         }
         done += root_len;
         on_progress(done as f64 / total as f64);
@@ -1661,11 +1880,8 @@ fn copy_payloads_into_progress(
         done += boot_len;
         on_progress(done as f64 / total as f64);
     }
-    if artifacts.boot_path.is_none() && !artifacts.boot_fs.is_empty() {
-        img.write_at(
-            report.boot_lba * u64::from(report.sector_size),
-            &artifacts.boot_fs,
-        )?;
+    if artifacts.boot_path.is_none() && !boot_bytes.is_empty() {
+        img.write_at(report.boot_lba * u64::from(report.sector_size), boot_bytes)?;
     }
     Ok(())
 }
@@ -1677,7 +1893,15 @@ pub fn create_qcow2_disc(
     next_object: &str,
     os_name: &str,
 ) -> Result<DiscReport, OpsError> {
-    create_qcow2_disc_with_progress(path, artifacts, disc_size, next_object, os_name, |_| {})
+    create_qcow2_disc_with_options(
+        path,
+        artifacts,
+        disc_size,
+        next_object,
+        os_name,
+        &DiscOptions::default(),
+        |_| {},
+    )
 }
 
 pub fn create_qcow2_disc_with_progress(
@@ -1686,6 +1910,26 @@ pub fn create_qcow2_disc_with_progress(
     disc_size: u64,
     next_object: &str,
     os_name: &str,
+    on_progress: impl FnMut(f64),
+) -> Result<DiscReport, OpsError> {
+    create_qcow2_disc_with_options(
+        path,
+        artifacts,
+        disc_size,
+        next_object,
+        os_name,
+        &DiscOptions::default(),
+        on_progress,
+    )
+}
+
+pub fn create_qcow2_disc_with_options(
+    path: &Path,
+    artifacts: &Artifacts,
+    disc_size: u64,
+    next_object: &str,
+    os_name: &str,
+    options: &DiscOptions,
     mut on_progress: impl FnMut(f64),
 ) -> Result<DiscReport, OpsError> {
     let size = disc_size.max(min_disc_bytes());
@@ -1694,7 +1938,7 @@ pub fn create_qcow2_disc_with_progress(
     on_progress(0.06);
     write_qcow2(path, image.size, &image.to_qcow2_ranges())?;
     on_progress(0.12);
-    copy_payloads_into_progress(path, &report, artifacts, |p| {
+    copy_payloads_into_progress(path, &report, artifacts, options, |p| {
         on_progress(0.12 + 0.88 * p.clamp(0.0, 1.0));
     })?;
     on_progress(1.0);
@@ -1709,6 +1953,24 @@ pub fn install_raw_disc(
     next_object: &str,
     os_name: &str,
 ) -> Result<DiscReport, OpsError> {
+    install_raw_disc_with_options(
+        path,
+        artifacts,
+        disc_size,
+        next_object,
+        os_name,
+        &DiscOptions::default(),
+    )
+}
+
+pub fn install_raw_disc_with_options(
+    path: &Path,
+    artifacts: &Artifacts,
+    disc_size: u64,
+    next_object: &str,
+    os_name: &str,
+    options: &DiscOptions,
+) -> Result<DiscReport, OpsError> {
     let size = disc_size.max(min_disc_bytes());
     let (image, mut report) = compose_disk(artifacts, size, next_object, os_name)?;
     let mut file = File::create(path)?;
@@ -1718,7 +1980,7 @@ pub fn install_raw_disc(
         file.write_all(&data)?;
     }
     drop(file);
-    copy_payloads_into(path, &report, artifacts)?;
+    copy_payloads_into(path, &report, artifacts, options)?;
     report.path = path.display().to_string();
     Ok(report)
 }
@@ -2857,6 +3119,60 @@ fn normalize_boot_metadata(artifacts: &mut Artifacts) -> Result<(), OpsError> {
     Ok(())
 }
 
+/// Smallest devicetree the payload scanner accepts: one root node carrying a
+/// `compatible` value, with the reservation block, structure block and string
+/// block all inside the length the header declares.
+#[cfg(test)]
+pub(crate) fn minimal_devicetree() -> Vec<u8> {
+    let mut structure = Vec::new();
+    structure.extend_from_slice(&1u32.to_be_bytes());
+    structure.extend_from_slice(&[0; 4]);
+    structure.extend_from_slice(&3u32.to_be_bytes());
+    structure.extend_from_slice(&11u32.to_be_bytes());
+    structure.extend_from_slice(&0u32.to_be_bytes());
+    structure.extend_from_slice(b"apple,test\0\0");
+    structure.extend_from_slice(&2u32.to_be_bytes());
+    structure.extend_from_slice(&9u32.to_be_bytes());
+    let strings: &[u8] = b"compatible\0";
+    let struct_at = 56u32;
+    let strings_at = struct_at + structure.len() as u32;
+    let total = strings_at + strings.len() as u32;
+    let mut out = Vec::new();
+    out.extend_from_slice(&FDT_MAGIC);
+    out.extend_from_slice(&total.to_be_bytes());
+    out.extend_from_slice(&struct_at.to_be_bytes());
+    out.extend_from_slice(&strings_at.to_be_bytes());
+    out.extend_from_slice(&40u32.to_be_bytes());
+    out.extend_from_slice(&17u32.to_be_bytes());
+    out.extend_from_slice(&16u32.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&(strings.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(structure.len() as u32).to_be_bytes());
+    out.extend_from_slice(&[0; 16]);
+    out.extend_from_slice(&structure);
+    out.extend_from_slice(strings);
+    out
+}
+
+/// Stage two shaped the way a chainload target is shaped: an m1n1 raw boot
+/// image, the devicetrees appended to it, then the image it boots.
+#[cfg(test)]
+pub(crate) fn chainload_payload_fixture() -> Vec<u8> {
+    let mut bytes = vec![0u8; 2048];
+    bytes[..12].copy_from_slice(b"##m1n1_ver##");
+    bytes.extend_from_slice(&minimal_devicetree());
+    let mut kernel = vec![0u8; 64];
+    kernel[ARM64_IMAGE_MAGIC_OFFSET..ARM64_IMAGE_MAGIC_OFFSET + ARM64_IMAGE_MAGIC.len()]
+        .copy_from_slice(&ARM64_IMAGE_MAGIC);
+    bytes.extend_from_slice(&kernel);
+    bytes
+}
+
+/// Package member holding the stage one chainload target; the ESP lives under `esp/`.
+fn stage2_member(resolved: &ResolvedLatest) -> String {
+    format!("esp/{}", resolved.next_object)
+}
+
 fn extract_package_artifacts(
     package: &[u8],
     resolved: &ResolvedLatest,
@@ -2873,12 +3189,16 @@ fn extract_package_artifacts_unbound(
     resolved: &ResolvedLatest,
 ) -> Result<Artifacts, OpsError> {
     if let Some(root) = zip_file(package, &resolved.root_image) {
-        let kernel = zip_file(package, &resolved.kernel_image)
-            .or_else(|| zip_file(package, "esp/m1n1/boot.bin"))
-            .unwrap_or_default();
-        let m1n1 = zip_file(package, "esp/m1n1/boot.bin")
-            .or_else(|| zip_file(package, &resolved.boot_object))
-            .unwrap_or_else(|| kernel.clone());
+        let stage2 = stage2_member(resolved);
+        let m1n1 = zip_file(package, &stage2).ok_or_else(|| {
+            err(format!(
+                "Asahi package supplies no chainload payload at {stage2}, which is where stage one \
+                 is configured to chainload {}",
+                resolved.next_object
+            ))
+        })?;
+        validate_chainload_payload(&stage2, &m1n1)?;
+        let kernel = zip_file(package, &resolved.kernel_image).unwrap_or_default();
         let mut artifacts = Artifacts::memory(
             if kernel.is_empty() {
                 m1n1.clone()
@@ -2993,9 +3313,18 @@ fn extract_package_from_path_parts_unbound(
         None
     };
     const SMALL: u64 = 32 * MB;
-    let m1n1 = zip_read_named_capped(package, &members, "esp/m1n1/boot.bin", SMALL)
-        .or_else(|| zip_read_named_capped(package, &members, &resolved.boot_object, SMALL))
-        .unwrap_or_default();
+    let stage2 = stage2_member(resolved);
+    let m1n1 = zip_read_named_capped(package, &members, &stage2, SMALL).ok_or_else(|| {
+        err(format!(
+            "Asahi package supplies no readable chainload payload at {stage2}, which is where \
+             stage one is configured to chainload {}; the package names {} members and a stage two \
+             is read only up to {} bytes",
+            resolved.next_object,
+            members.len(),
+            SMALL
+        ))
+    })?;
+    validate_chainload_payload(&stage2, &m1n1)?;
     let boot_dest = workdir.join("boot.img");
     let (kernel, boot_path) = if zip_find(&members, &resolved.kernel_image).is_some() {
         zip_extract_cached_progress(
@@ -3016,7 +3345,6 @@ fn extract_package_from_path_parts_unbound(
         }
     } else {
         let kernel = zip_read_named_capped(package, &members, &resolved.kernel_image, SMALL)
-            .or_else(|| zip_read_named_capped(package, &members, "esp/m1n1/boot.bin", SMALL))
             .unwrap_or_else(|| m1n1.clone());
         (kernel, None)
     };
@@ -3593,6 +3921,84 @@ mod tests {
     }
 
     #[test]
+    fn chainload_payload_is_accepted_with_its_devicetree_run_counted() {
+        let payload = chainload_payload_fixture();
+        let found = validate_chainload_payload("m1n1/boot.bin", &payload).unwrap();
+        assert_eq!(found.devicetrees, 1);
+        assert_eq!(found.devicetree_offset, 2048);
+        assert_eq!(found.kernel, ChainloadKernel::Image);
+        assert_eq!(found.kernel_offset, 2048 + minimal_devicetree().len());
+
+        let mut three = vec![0u8; 2048];
+        three[..12].copy_from_slice(b"##m1n1_ver##");
+        for _ in 0..3 {
+            three.extend_from_slice(&minimal_devicetree());
+        }
+        three.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00]);
+        let run = validate_chainload_payload("m1n1/boot.bin", &three).unwrap();
+        assert_eq!(run.devicetrees, 3);
+        assert_eq!(run.kernel, ChainloadKernel::Gzip);
+        assert_eq!(run.kernel_offset, 2048 + 3 * minimal_devicetree().len());
+    }
+
+    #[test]
+    fn chainload_payload_refusal_names_a_stage_two_that_boots_nothing() {
+        let bare = stage1_fixture(b"bare");
+        let refusal = validate_chainload_payload("m1n1/boot.bin", &bare)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("m1n1/boot.bin"), "{refusal}");
+        assert!(refusal.contains("no appended devicetree"), "{refusal}");
+
+        let not_m1n1 = vec![0x5A; 4096];
+        let refusal = validate_chainload_payload("m1n1/boot.bin", &not_m1n1)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("not an m1n1 raw boot image"), "{refusal}");
+
+        let mut trees_only = vec![0u8; 2048];
+        trees_only[..12].copy_from_slice(b"##m1n1_ver##");
+        trees_only.extend_from_slice(&minimal_devicetree());
+        let refusal = validate_chainload_payload("m1n1/boot.bin", &trees_only)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("no kernel payload"), "{refusal}");
+        assert!(refusal.contains("1 appended devicetree"), "{refusal}");
+    }
+
+    #[test]
+    fn efi_payloads_refuse_when_nothing_supplies_the_chainload_target() {
+        let artifacts = Artifacts::memory(Vec::new(), Vec::new(), Vec::new());
+        let refusal = efi_payloads(&artifacts, "m1n1/boot.bin", None)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("chainload m1n1/boot.bin"), "{refusal}");
+    }
+
+    #[test]
+    fn a_package_without_a_stage_two_is_refused_by_the_member_it_lacks() {
+        let data = parse_installer_data(sample_metadata()).unwrap();
+        let refusal = load_artifacts_for_os(&data, "", |_| {
+            Ok(stored_zip(&[("root.img", b"ROOT"), ("boot.img", b"BOOT")]))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(refusal.contains("esp/m1n1/boot.bin"), "{refusal}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("package.zip");
+        std::fs::write(
+            &zip,
+            stored_zip(&[("root.img", b"ROOT"), ("boot.img", b"BOOT")]),
+        )
+        .unwrap();
+        let refusal = load_artifacts_from_package_file(&data, "", &zip, &dir.path().join("work"))
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("esp/m1n1/boot.bin"), "{refusal}");
+    }
+
+    #[test]
     fn stage_one_configuration_is_terminated_and_keeps_code_intact() {
         let code = stage1_fixture(b"code");
         let object = build_stage1(&code, "uuid", "m1n1/boot.bin").unwrap();
@@ -3662,6 +4068,14 @@ mod tests {
                 .contains("verified Apple OS firmware identity")
         );
         assert_eq!(std::fs::read(path).unwrap(), b"preserve existing disk");
+    }
+
+    #[test]
+    fn disc_options_default_to_the_packaged_normal_boot() {
+        assert_eq!(DiscOptions::default().kernel_console, KernelConsole::Normal);
+        assert_eq!(KernelConsole::default(), KernelConsole::Normal);
+        assert_eq!(KernelConsole::ALL[0].name(), "Normal boot");
+        assert_eq!(KernelConsole::ALL[1].name(), "Verbose boot");
     }
 
     fn artifacts(tag: &[u8]) -> Artifacts {
@@ -3792,12 +4206,13 @@ mod tests {
             resolve_os(&data, "server").unwrap().package_url,
             "https://example.test/os/fedora-server.zip"
         );
+        let stage2 = chainload_payload_fixture();
         let kde = load_artifacts_for_os(&data, "kde", |url| {
             assert!(url.ends_with("fedora-kde.zip"));
             Ok(stored_zip(&[
                 ("root.img", b"KDE-ROOT"),
                 ("boot.img", b"KDE-BOOT"),
-                ("esp/m1n1/boot.bin", b"KDE-M1N1"),
+                ("esp/m1n1/boot.bin", stage2.as_slice()),
                 ("esp/EFI/BOOT/BOOTAA64.EFI", b"GRUB"),
                 ("esp/vendor/long filename.txt", b"asset"),
             ]))
@@ -3823,9 +4238,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let zip = dir.path().join("package.zip");
         let boot = vec![0x71; 33 * MB as usize];
+        let stage2 = chainload_payload_fixture();
         std::fs::write(
             &zip,
-            deflated_zip(&[("boot.img", &boot), ("esp/m1n1/boot.bin", b"stage2")]),
+            deflated_zip(&[
+                ("boot.img", &boot),
+                ("esp/m1n1/boot.bin", stage2.as_slice()),
+            ]),
         )
         .unwrap();
         let data = parse_installer_data(sample_metadata()).unwrap();
@@ -3836,7 +4255,7 @@ mod tests {
         assert_eq!(artifacts.boot_len().unwrap(), boot.len() as u64);
         assert_eq!(std::fs::read(artifacts.boot_path.unwrap()).unwrap(), boot);
         assert!(artifacts.kernel.is_empty());
-        assert_eq!(artifacts.m1n1, b"stage2");
+        assert_eq!(artifacts.m1n1, stage2);
     }
 
     #[test]
@@ -3873,7 +4292,7 @@ mod tests {
             stored_zip(&[
                 ("root.img", b"ZIP-ROOT-BYTES"),
                 ("boot.img", b"ZIP-BOOT"),
-                ("esp/m1n1/boot.bin", b"ZIP-M1N1"),
+                ("esp/m1n1/boot.bin", chainload_payload_fixture().as_slice()),
             ]),
         )
         .unwrap();
@@ -3887,7 +4306,7 @@ mod tests {
             b"ZIP-ROOT-BYTES"
         );
         assert_eq!(extracted.kernel, b"ZIP-BOOT");
-        assert_eq!(extracted.m1n1, b"ZIP-M1N1");
+        assert_eq!(extracted.m1n1, chainload_payload_fixture());
     }
 
     #[test]
@@ -4074,7 +4493,7 @@ mod tests {
         let zip = stored_zip(&[
             ("root.img", b"PKG-ROOT"),
             ("boot.img", b"PKG-BOOT"),
-            ("esp/m1n1/boot.bin", b"PKG-M1N1"),
+            ("esp/m1n1/boot.bin", chainload_payload_fixture().as_slice()),
         ]);
         let arts = load_artifacts_custom(&data, kernel.clone(), m1n1.clone(), |_| Ok(zip.clone()))
             .unwrap();
@@ -4151,7 +4570,7 @@ mod tests {
         let zip = deflated_zip(&[
             ("root.img", b"ROOT-deflated"),
             ("boot.img", b"PKG-BOOT"),
-            ("esp/m1n1/boot.bin", b"PKG-M1N1"),
+            ("esp/m1n1/boot.bin", chainload_payload_fixture().as_slice()),
         ]);
         assert_eq!(
             zip_file(&zip, "root.img").as_deref(),

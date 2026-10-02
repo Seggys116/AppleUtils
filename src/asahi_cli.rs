@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 type LoadedArtifacts = (Artifacts, String, String, Option<ProvisionedFirmware>);
 
 use crate::asahi_ops::{
-    self, Artifacts, create_qcow2_disc, install_raw_disc, list_installable_flavors, min_disc_bytes,
-    parse_installer_data, parse_size_arg, resolve_os, update_disc, validate_disc,
+    self, Artifacts, DiscOptions, KernelConsole, create_qcow2_disc_with_options,
+    install_raw_disc_with_options, list_installable_flavors, min_disc_bytes, parse_installer_data,
+    parse_size_arg, resolve_os, update_disc, validate_disc,
 };
 
 pub fn run(args: &[String]) -> Result<String, String> {
@@ -27,8 +28,16 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 .ok_or_else(|| "create requires --output PATH".to_string())?;
             let (arts, next, os_name, _firmware) = opts.artifacts(true)?;
             let size = opts.size.unwrap_or_else(min_disc_bytes);
-            let report =
-                create_qcow2_disc(&out, &arts, size, &next, &os_name).map_err(|e| e.to_string())?;
+            let report = create_qcow2_disc_with_options(
+                &out,
+                &arts,
+                size,
+                &next,
+                &os_name,
+                &opts.disc_options(),
+                |_| {},
+            )
+            .map_err(|e| e.to_string())?;
             let info = validate_disc(&out).map_err(|e| e.to_string())?;
             Ok(format!(
                 "created {}\nos={os_name}\n{}",
@@ -44,8 +53,15 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 .ok_or_else(|| "install requires --output PATH".to_string())?;
             let (arts, next, os_name, _firmware) = opts.artifacts(true)?;
             let size = opts.size.unwrap_or_else(min_disc_bytes);
-            let report =
-                install_raw_disc(&dest, &arts, size, &next, &os_name).map_err(|e| e.to_string())?;
+            let report = install_raw_disc_with_options(
+                &dest,
+                &arts,
+                size,
+                &next,
+                &os_name,
+                &opts.disc_options(),
+            )
+            .map_err(|e| e.to_string())?;
             let info = validate_disc(&dest).map_err(|e| e.to_string())?;
             Ok(format!(
                 "installed {}\nos={os_name}\n{}",
@@ -83,11 +99,11 @@ pub fn run(args: &[String]) -> Result<String, String> {
 
 fn usage() -> String {
     "apple-utils asahi flavors [--metadata FILE]\n\
-     apple-utils asahi create --output DISC.qcow2 --latest [--os FLAVOR] [--size 32G] [--workdir DIR]\n\
-     apple-utils asahi create --output DISC.qcow2 --package ZIP [--os FLAVOR] [--size 32G] [--workdir DIR]\n\
-     apple-utils asahi create --output DISC.qcow2 --kernel FILE --m1n1 FILE --root FILE [--size 8G]\n\
-     apple-utils asahi install --output DEST --latest [--os FLAVOR] [--size 32G]\n\
-     apple-utils asahi install --output DEST --kernel FILE --m1n1 FILE --root FILE [--size 8G]\n\
+     apple-utils asahi create --output DISC.qcow2 --latest [--os FLAVOR] [--size 32G] [--workdir DIR] [--normal-boot|--verbose-boot]\n\
+     apple-utils asahi create --output DISC.qcow2 --package ZIP [--os FLAVOR] [--size 32G] [--workdir DIR] [--normal-boot|--verbose-boot]\n\
+     apple-utils asahi create --output DISC.qcow2 --kernel FILE --m1n1 FILE --root FILE [--size 8G] [--normal-boot|--verbose-boot]\n\
+     apple-utils asahi install --output DEST --latest [--os FLAVOR] [--size 32G] [--normal-boot|--verbose-boot]\n\
+     apple-utils asahi install --output DEST --kernel FILE --m1n1 FILE --root FILE [--size 8G] [--normal-boot|--verbose-boot]\n\
      apple-utils asahi update DISC.qcow2 --kernel FILE --m1n1 FILE [--root FILE]\n\
      apple-utils asahi validate DISC.qcow2\n\
      Package firmware provisioning requires --target-board BOARD --target-chip ID --ipsw FILE; --target-calibration DIR supplies target calibration and --expert enables official expert catalog entries. The official installer is downloaded when no local installer archive is supplied; IPSW files must be supplied locally; --installer-archive FILE [--installer-source-uri URI] and --ipsw FILE supply local archives.\n\
@@ -117,6 +133,7 @@ struct CliOpts {
     ipsw: Option<PathBuf>,
     target_calibration: Option<PathBuf>,
     requires_als_calibration: Option<bool>,
+    kernel_console: Option<KernelConsole>,
 }
 
 impl CliOpts {
@@ -181,6 +198,20 @@ impl CliOpts {
                             }
                         });
                     i += 2;
+                }
+                "--verbose-boot" => {
+                    if opts.kernel_console == Some(KernelConsole::Normal) {
+                        return Err("cannot combine --verbose-boot with --normal-boot".into());
+                    }
+                    opts.kernel_console = Some(KernelConsole::Verbose);
+                    i += 1;
+                }
+                "--normal-boot" => {
+                    if opts.kernel_console == Some(KernelConsole::Verbose) {
+                        return Err("cannot combine --verbose-boot with --normal-boot".into());
+                    }
+                    opts.kernel_console = Some(KernelConsole::Normal);
+                    i += 1;
                 }
                 "--output" | "-o" => {
                     opts.output = Some(PathBuf::from(need(args, i + 1, "--output")?));
@@ -365,6 +396,12 @@ impl CliOpts {
         self.workdir.clone().unwrap_or_else(|| {
             std::env::temp_dir().join(format!("apple-utils-asahi-{}", std::process::id()))
         })
+    }
+
+    fn disc_options(&self) -> DiscOptions {
+        DiscOptions {
+            kernel_console: self.kernel_console.unwrap_or_default(),
+        }
     }
 
     fn installer_json(&self) -> Result<String, String> {
@@ -563,6 +600,28 @@ mod tests {
         assert!(CliOpts::parse(&["--requires-als-calibration".into(), "unknown".into()]).is_err());
         assert!(CliOpts::parse(&["--target-chip".into(), "0x100000000".into()]).is_err());
         assert!(!CliOpts::default().provisioning_requested());
+        assert_eq!(
+            CliOpts::parse(&["--verbose-boot".into()])
+                .unwrap()
+                .kernel_console,
+            Some(KernelConsole::Verbose)
+        );
+        assert_eq!(
+            CliOpts::parse(&["--normal-boot".into()])
+                .unwrap()
+                .kernel_console,
+            Some(KernelConsole::Normal)
+        );
+        assert!(
+            CliOpts::parse(&["--verbose-boot".into(), "--normal-boot".into()])
+                .err()
+                .unwrap()
+                .contains("cannot combine")
+        );
+        assert_eq!(
+            CliOpts::default().disc_options().kernel_console,
+            KernelConsole::Normal
+        );
     }
     #[test]
     fn headless_create_then_validate_round_trips() {
@@ -673,7 +732,10 @@ mod tests {
             crate::asahi_ops::make_stored_zip(&[
                 ("root.img", b"MIN-ROOT"),
                 ("boot.img", b"MIN-BOOT"),
-                ("esp/m1n1/boot.bin", b"MIN-M1N1"),
+                (
+                    "esp/m1n1/boot.bin",
+                    crate::asahi_ops::chainload_payload_fixture().as_slice(),
+                ),
             ]),
         )
         .unwrap();

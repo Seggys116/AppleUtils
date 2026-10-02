@@ -19,9 +19,9 @@ use crate::ramrod::{
 };
 
 use super::local_policy::{
-    LocalPolicyCensus, LocalPolicyIdentity, RecoveryOsLocalPolicyInputs,
-    RecoveryOsLocalPolicyRequest, RecoveryOsLocalPolicySigner, SigningRefusal,
-    next_stage_im4m_hash, personalize,
+    DeviceHardwareInfo, IdentityRefusal, LocalPolicyCensus, LocalPolicyIdentity,
+    LocalPolicyIdentitySource, RecoveryOsLocalPolicyInputs, RecoveryOsLocalPolicyRequest,
+    RecoveryOsLocalPolicySigner, SigningRefusal, next_stage_im4m_hash, personalize,
 };
 use super::plan::{FdrTrustDigest, hex_digest};
 use super::report::{MUX_PREFIX, SharedReporter, lock, report};
@@ -2777,9 +2777,45 @@ pub struct RestoreAnswers {
     pub fdr: FdrTrustProvider,
     pub local_policy_signer: Option<Arc<dyn RecoveryOsLocalPolicySigner>>,
     pub local_policy_census: LocalPolicyCensus,
+    pub device_hardware_info: DeviceHardwareInfo,
     pub port: u16,
     pub armed_at_secs: f64,
     pub reporter: SharedReporter,
+}
+
+fn identity_source_field(source: Option<LocalPolicyIdentitySource>) -> String {
+    source.map_or_else(String::new, |source| {
+        format!(" identity_source={}", source.label())
+    })
+}
+
+fn root_ticket_trace(
+    ticket: Option<&[u8]>,
+    refusal: Option<&IdentityRefusal>,
+    device: &LocalPolicyIdentity,
+) -> String {
+    let Some(ticket) = ticket else {
+        return "root_ticket=unserved".to_string();
+    };
+    let mut out = format!(
+        "root_ticket={} root_ticket_bytes={} root_ticket_sha384={}",
+        refusal.map_or("unread", IdentityRefusal::name),
+        ticket.len(),
+        hex_digest(&next_stage_im4m_hash(ticket)),
+    );
+    if let Some(IdentityRefusal::NotPersonalisable { chip, board, .. }) = refusal {
+        let agreement = |named: Option<u64>, stated: u32| match named {
+            Some(named) if named == u64::from(stated) => format!("0x{named:x}/agrees"),
+            Some(named) => format!("0x{named:x}/differs"),
+            None => "absent".to_string(),
+        };
+        out.push_str(&format!(
+            " root_ticket_chip={} root_ticket_board={}",
+            agreement(*chip, device.chip_id),
+            agreement(*board, device.board_id),
+        ));
+    }
+    out
 }
 
 impl RestoreAnswers {
@@ -2882,16 +2918,18 @@ impl RestoreAnswers {
     }
 
     fn answer_recovery_os_local_policy(&mut self, request: &DataRequest) -> plist::Dictionary {
-        let identity = match self.resolve_local_policy_identity(request) {
-            Some(identity) => identity,
-            None => return self.serve_globally_signed_local_policy(request),
+        let (identity, identity_source) = match self.resolve_local_policy_identity(request) {
+            Some(resolved) => resolved,
+            None => return self.serve_globally_signed_local_policy(request, None),
         };
+        let source = identity_source.label();
+        let known = Some(identity_source);
         let inputs = match RecoveryOsLocalPolicyInputs::read(&request.arguments) {
             Ok(inputs) => inputs,
             Err(refusal) => {
                 let count = self.local_policy_census.record(refusal.name());
                 let line = format!(
-                    "{MUX_PREFIX} result={} port={} at={:.3}s type={:?} async={} count={count} {} args=[{}] meaning=\"LocalPolicy arguments unreadable\" detail=\"{refusal}\"",
+                    "{MUX_PREFIX} result={} port={} at={:.3}s type={:?} async={} count={count} identity_source={source} {} args=[{}] meaning=\"LocalPolicy arguments unreadable\" detail=\"{refusal}\"",
                     refusal.name(),
                     self.port,
                     self.armed_at_secs,
@@ -2901,7 +2939,7 @@ impl RestoreAnswers {
                     describe_dictionary_entries(&request.arguments),
                 );
                 report(&self.reporter, refusal.name(), &line);
-                return self.serve_globally_signed_local_policy(request);
+                return self.serve_globally_signed_local_policy(request, known);
             }
         };
         let personalization = RecoveryOsLocalPolicyRequest::new(identity, inputs);
@@ -2909,7 +2947,7 @@ impl RestoreAnswers {
             let refusal = SigningRefusal::ServiceAbsent;
             let count = self.local_policy_census.record(refusal.name());
             let line = format!(
-                "{MUX_PREFIX} result={} port={} at={:.3}s type={:?} async={} count={count} {} meaning=\"LocalPolicy request built, signing service absent\" detail=\"{refusal}\"",
+                "{MUX_PREFIX} result={} port={} at={:.3}s type={:?} async={} count={count} identity_source={source} {} meaning=\"LocalPolicy request built, signing service absent\" detail=\"{refusal}\"",
                 refusal.name(),
                 self.port,
                 self.armed_at_secs,
@@ -2918,12 +2956,12 @@ impl RestoreAnswers {
                 personalization.trace_fields(),
             );
             report(&self.reporter, refusal.name(), &line);
-            return self.serve_globally_signed_local_policy(request);
+            return self.serve_globally_signed_local_policy(request, known);
         };
         match personalize(signer.as_ref(), &personalization) {
             Ok(policy) => {
                 let line = format!(
-                    "{MUX_PREFIX} result=recovery-os-local-policy-personalized port={} at={:.3}s type={:?} async={} source={} bytes={} manifest_bytes={} manifest_sha384={} payload_sha384={} {} {} key={KEY_AP_LOCAL_POLICY} meaning=\"Apple-signed LocalPolicy stitched over lpol\" detail=\"bound_ fields are the returned IM4M vs the request; not-carried is reported, not refused\"",
+                    "{MUX_PREFIX} result=recovery-os-local-policy-personalized port={} at={:.3}s type={:?} async={} source={} identity_source={source} bytes={} manifest_bytes={} manifest_sha384={} payload_sha384={} {} {} key={KEY_AP_LOCAL_POLICY} meaning=\"Apple-signed LocalPolicy stitched over lpol\" detail=\"bound_ fields are the returned IM4M vs the request; not-carried is reported, not refused\"",
                     self.port,
                     self.armed_at_secs,
                     request.data_type,
@@ -2951,7 +2989,7 @@ impl RestoreAnswers {
             Err(refusal) => {
                 let count = self.local_policy_census.record(refusal.name());
                 let line = format!(
-                    "{MUX_PREFIX} result={} port={} at={:.3}s type={:?} async={} count={count} {} meaning=\"LocalPolicy personalisation refused\" detail=\"{refusal}\"",
+                    "{MUX_PREFIX} result={} port={} at={:.3}s type={:?} async={} count={count} identity_source={source} {} meaning=\"LocalPolicy personalisation refused\" detail=\"{refusal}\"",
                     refusal.name(),
                     self.port,
                     self.armed_at_secs,
@@ -2960,7 +2998,7 @@ impl RestoreAnswers {
                     personalization.trace_fields(),
                 );
                 report(&self.reporter, refusal.name(), &line);
-                self.serve_globally_signed_local_policy(request)
+                self.serve_globally_signed_local_policy(request, known)
             }
         }
     }
@@ -2968,68 +3006,151 @@ impl RestoreAnswers {
     fn resolve_local_policy_identity(
         &mut self,
         request: &DataRequest,
-    ) -> Option<LocalPolicyIdentity> {
-        let Some(ticket) = self.tickets.served_os_root_ticket().map(<[u8]>::to_vec) else {
-            let name = "recovery-os-local-policy-root-ticket-unserved";
-            let count = self.local_policy_census.record(name);
-            let line = format!(
-                "{MUX_PREFIX} result={name} port={} at={:.3}s type={:?} async={} count={count} meaning=\"LocalPolicy reached with no served OS root ticket\" detail=\"no RootTicket, RootTicketData or ApTicket request was answered before checkpoint 0x1616\"",
-                self.port, self.armed_at_secs, request.data_type, request.asynchronous,
-            );
-            report(&self.reporter, name, &line);
-            return None;
+    ) -> Option<(LocalPolicyIdentity, LocalPolicyIdentitySource)> {
+        let ticket = self.tickets.served_os_root_ticket().map(<[u8]>::to_vec);
+        let ticket_refusal = match ticket.as_deref() {
+            Some(bytes) => match LocalPolicyIdentity::from_root_ticket(bytes) {
+                Ok(identity) => {
+                    let source = LocalPolicyIdentitySource::ServedRootTicket;
+                    let line = format!(
+                        "{MUX_PREFIX} result=recovery-os-local-policy-identity-resolved port={} at={:.3}s type={:?} identity_source={} {} root_ticket_bytes={} root_ticket_sha384={} meaning=\"served OS root ticket names a part\" detail=\"\"",
+                        self.port,
+                        self.armed_at_secs,
+                        request.data_type,
+                        source.label(),
+                        identity.trace_fields(),
+                        bytes.len(),
+                        hex_digest(&next_stage_im4m_hash(bytes)),
+                    );
+                    report(
+                        &self.reporter,
+                        "recovery-os-local-policy-identity-resolved",
+                        &line,
+                    );
+                    return Some((identity, source));
+                }
+                Err(refusal) => Some(refusal),
+            },
+            None => None,
         };
-        match LocalPolicyIdentity::from_root_ticket(&ticket) {
+        // The device's statement stands in only for a ticket that names no part, or for no
+        // ticket at all. A ticket that names a part but cannot be read is refused by name.
+        if let Some(refusal) = ticket_refusal.as_deref()
+            && !matches!(refusal, IdentityRefusal::NotPersonalisable { .. })
+        {
+            self.report_root_ticket_refusal(request, ticket.as_deref(), Some(refusal));
+            return None;
+        }
+        let ticket_state = if ticket.is_some() {
+            "the served OS root ticket names no part"
+        } else {
+            "no OS root ticket was served"
+        };
+        match self.device_hardware_info.identity() {
             Ok(identity) => {
+                let source = LocalPolicyIdentitySource::DeviceHardwareInfo;
                 let line = format!(
-                    "{MUX_PREFIX} result=recovery-os-local-policy-identity-resolved port={} at={:.3}s type={:?} {} root_ticket_bytes={} root_ticket_sha384={} meaning=\"served OS root ticket names a part\" detail=\"\"",
+                    "{MUX_PREFIX} result=recovery-os-local-policy-identity-resolved port={} at={:.3}s type={:?} identity_source={} {} {} meaning=\"{ticket_state}, so the part is the one the device stated in its QueryValue HardwareInfo reply before StartRestore\" detail=\"{}\"",
                     self.port,
                     self.armed_at_secs,
                     request.data_type,
+                    source.label(),
                     identity.trace_fields(),
-                    ticket.len(),
-                    hex_digest(&next_stage_im4m_hash(&ticket)),
+                    root_ticket_trace(ticket.as_deref(), ticket_refusal.as_deref(), &identity),
+                    ticket_refusal.as_deref().map_or_else(
+                        || "no OS root ticket was served".to_string(),
+                        ToString::to_string
+                    ),
                 );
                 report(
                     &self.reporter,
                     "recovery-os-local-policy-identity-resolved",
                     &line,
                 );
-                Some(identity)
+                Some((identity, source))
             }
-            Err(refusal) => {
-                let count = self.local_policy_census.record(refusal.name());
+            Err(device_refusal) => {
+                self.report_root_ticket_refusal(
+                    request,
+                    ticket.as_deref(),
+                    ticket_refusal.as_deref(),
+                );
+                let count = self.local_policy_census.record(device_refusal.name());
                 let line = format!(
-                    "{MUX_PREFIX} result={} port={} at={:.3}s type={:?} async={} count={count} root_ticket_bytes={} root_ticket_sha384={} meaning=\"identity declined of the bytes and not of the target\" detail=\"{refusal}\"",
-                    refusal.name(),
+                    "{MUX_PREFIX} result={} port={} at={:.3}s type={:?} async={} count={count} identity_source={} {} meaning=\"{ticket_state}, and the device's own statement of its identity could not stand in for it\" detail=\"{device_refusal}\"",
+                    device_refusal.name(),
                     self.port,
                     self.armed_at_secs,
                     request.data_type,
                     request.asynchronous,
-                    ticket.len(),
-                    hex_digest(&next_stage_im4m_hash(&ticket)),
+                    LocalPolicyIdentitySource::DeviceHardwareInfo.label(),
+                    self.device_hardware_info.trace_fields(),
                 );
-                report(&self.reporter, refusal.name(), &line);
+                report(&self.reporter, device_refusal.name(), &line);
                 None
             }
         }
     }
 
-    fn serve_globally_signed_local_policy(&self, request: &DataRequest) -> plist::Dictionary {
-        let manifest = match self.tickets.recovery_os_manifest() {
-            Ok(manifest) => manifest,
-            Err(error) => return self.decline_recovery_os_local_policy(request, &error),
+    fn report_root_ticket_refusal(
+        &mut self,
+        request: &DataRequest,
+        ticket: Option<&[u8]>,
+        refusal: Option<&IdentityRefusal>,
+    ) {
+        let (Some(ticket), Some(refusal)) = (ticket, refusal) else {
+            let name = "recovery-os-local-policy-root-ticket-unserved";
+            let count = self.local_policy_census.record(name);
+            let line = format!(
+                "{MUX_PREFIX} result={name} port={} at={:.3}s type={:?} async={} count={count} identity_source={} meaning=\"LocalPolicy reached with no served OS root ticket\" detail=\"no RootTicket, RootTicketData or ApTicket request was answered before checkpoint 0x1616\"",
+                self.port,
+                self.armed_at_secs,
+                request.data_type,
+                request.asynchronous,
+                LocalPolicyIdentitySource::ServedRootTicket.label(),
+            );
+            report(&self.reporter, name, &line);
+            return;
         };
-        let image = match wrap_image4(&RECOVERY_OS_LOCAL_POLICY_IM4P, &manifest.bytes) {
-            Ok(image) => image,
-            Err(error) => return self.decline_recovery_os_local_policy(request, &error),
-        };
+        let count = self.local_policy_census.record(refusal.name());
         let line = format!(
-            "{MUX_PREFIX} result=recovery-os-local-policy-global-signed port={} at={:.3}s type={:?} async={} variant=\"{}\" bytes={} payload_sha384={} manifest_sha384={} key={KEY_AP_LOCAL_POLICY} args=[{}] meaning=\"LocalPolicy stitched from the board's global recovery OS IM4M\" detail=\"DEVIATION FROM A REAL DEVICE: the guest asked for a PERSONALISATION and this is GLOBAL SIGNING; a global IM4M carries no Ap,RecoveryOSPolicyNonceHash so the policy is unbound; expect bootpolicy_store_recoveryos_policy() failed: 20 (corrupt policy)\"",
+            "{MUX_PREFIX} result={} port={} at={:.3}s type={:?} async={} count={count} identity_source={} root_ticket_bytes={} root_ticket_sha384={} meaning=\"identity declined of the bytes and not of the target\" detail=\"{refusal}\"",
+            refusal.name(),
             self.port,
             self.armed_at_secs,
             request.data_type,
             request.asynchronous,
+            LocalPolicyIdentitySource::ServedRootTicket.label(),
+            ticket.len(),
+            hex_digest(&next_stage_im4m_hash(ticket)),
+        );
+        report(&self.reporter, refusal.name(), &line);
+    }
+
+    fn serve_globally_signed_local_policy(
+        &self,
+        request: &DataRequest,
+        identity_source: Option<LocalPolicyIdentitySource>,
+    ) -> plist::Dictionary {
+        let manifest = match self.tickets.recovery_os_manifest() {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                return self.decline_recovery_os_local_policy(request, identity_source, &error);
+            }
+        };
+        let image = match wrap_image4(&RECOVERY_OS_LOCAL_POLICY_IM4P, &manifest.bytes) {
+            Ok(image) => image,
+            Err(error) => {
+                return self.decline_recovery_os_local_policy(request, identity_source, &error);
+            }
+        };
+        let line = format!(
+            "{MUX_PREFIX} result=recovery-os-local-policy-global-signed port={} at={:.3}s type={:?} async={}{} variant=\"{}\" bytes={} payload_sha384={} manifest_sha384={} key={KEY_AP_LOCAL_POLICY} args=[{}] meaning=\"LocalPolicy stitched from the board's global recovery OS IM4M\" detail=\"DEVIATION FROM A REAL DEVICE: the guest asked for a PERSONALISATION and this is GLOBAL SIGNING; a global IM4M carries no Ap,RecoveryOSPolicyNonceHash so the policy is unbound; expect bootpolicy_store_recoveryos_policy() failed: 20 (corrupt policy)\"",
+            self.port,
+            self.armed_at_secs,
+            request.data_type,
+            request.asynchronous,
+            identity_source_field(identity_source),
             manifest.variant,
             image.len(),
             hex_digest(&RECOVERY_OS_LOCAL_POLICY_IM4P_SHA384),
@@ -3049,14 +3170,16 @@ impl RestoreAnswers {
     fn decline_recovery_os_local_policy(
         &self,
         request: &DataRequest,
+        identity_source: Option<LocalPolicyIdentitySource>,
         reason: &str,
     ) -> plist::Dictionary {
         let line = format!(
-            "{MUX_PREFIX} result=recovery-os-local-policy-unsigned port={} at={:.3}s type={:?} async={} args=[{}] meaning=\"LocalPolicy global-signing fallback unserved\" detail=\"no {KEY_AP_LOCAL_POLICY}: {reason}\"",
+            "{MUX_PREFIX} result=recovery-os-local-policy-unsigned port={} at={:.3}s type={:?} async={}{} args=[{}] meaning=\"LocalPolicy global-signing fallback unserved\" detail=\"no {KEY_AP_LOCAL_POLICY}: {reason}\"",
             self.port,
             self.armed_at_secs,
             request.data_type,
             request.asynchronous,
+            identity_source_field(identity_source),
             describe_dictionary_entries(&request.arguments)
         );
         report(&self.reporter, "recovery-os-local-policy-unsigned", &line);
@@ -3144,9 +3267,9 @@ impl RestoreDataProvider for RestoreAnswers {
 mod tests {
     use super::{
         BuildIdentityProvider, COMPONENT_SYSTEM_VOLUME, COMPONENT_SYSTEM_VOLUME_CANONICAL_METADATA,
-        EAN_DATA_TYPE, FDR_MEMORY_COMMIT_DATA_TYPE, FDR_TRUST_DATA_TYPE, FDR_TRUST_OBJECT_TAGS,
-        FIRMWARE_UPDATER_DATA_TYPE, FUD_DATA_TYPE, FdrTrustDigest, FdrTrustProvider,
-        GlobalManifestProvider, IDENTITY_MANIFEST_KEY, KEY_AP_LOCAL_POLICY,
+        DeviceHardwareInfo, EAN_DATA_TYPE, FDR_MEMORY_COMMIT_DATA_TYPE, FDR_TRUST_DATA_TYPE,
+        FDR_TRUST_OBJECT_TAGS, FIRMWARE_UPDATER_DATA_TYPE, FUD_DATA_TYPE, FdrTrustDigest,
+        FdrTrustProvider, GlobalManifestProvider, IDENTITY_MANIFEST_KEY, KEY_AP_LOCAL_POLICY,
         KEY_BOOTED_OS_FDR_TRUST_DATA, KEY_CRYPTEX1_TICKET, KEY_EAN_IMAGE_LIST,
         KEY_FDR_MEMORY_STORE_DATA, KEY_FDR_TRUST_DATA, KEY_FIRMWARE_RESPONSE_DATA,
         KEY_FUD_IMAGE_LIST, KEY_MESSAGE_ARG_UPDATER_NAME, KEY_RECOVERY_OS_VERSION_DATA,
@@ -3629,6 +3752,7 @@ mod tests {
             fdr: test_fdr_provider(&reporter()),
             local_policy_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
+            device_hardware_info: no_hardware_info_query(),
             port: 62078,
             armed_at_secs: 0.0,
             reporter: reporter(),
@@ -3792,6 +3916,7 @@ mod tests {
             fdr: test_fdr_provider(&reporter()),
             local_policy_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
+            device_hardware_info: no_hardware_info_query(),
             port: 62078,
             armed_at_secs: 0.0,
             reporter: reporter(),
@@ -3915,6 +4040,7 @@ mod tests {
             fdr: test_fdr_provider(&reporter()),
             local_policy_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
+            device_hardware_info: no_hardware_info_query(),
             port: 62078,
             armed_at_secs: 0.0,
             reporter: reporter(),
@@ -4113,6 +4239,7 @@ mod tests {
             port: 62078,
             local_policy_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
+            device_hardware_info: no_hardware_info_query(),
             armed_at_secs: 0.0,
             reporter: Arc::clone(&trace),
         };
@@ -4317,6 +4444,7 @@ mod tests {
             fdr: test_fdr_provider(&reporter()),
             local_policy_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
+            device_hardware_info: no_hardware_info_query(),
             port: 62078,
             armed_at_secs: 0.0,
             reporter: reporter(),
@@ -4374,6 +4502,7 @@ mod tests {
             fdr: test_fdr_provider(&reporter()),
             local_policy_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
+            device_hardware_info: no_hardware_info_query(),
             port: 62078,
             armed_at_secs: 0.0,
             reporter: reporter(),
@@ -4677,6 +4806,7 @@ mod tests {
             port: 62078,
             local_policy_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
+            device_hardware_info: no_hardware_info_query(),
             armed_at_secs: 0.0,
             reporter: Arc::clone(&reporter),
         };
@@ -4763,6 +4893,7 @@ mod tests {
             port: 62078,
             local_policy_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
+            device_hardware_info: no_hardware_info_query(),
             armed_at_secs: 0.0,
             reporter: Arc::clone(&reporter),
         };
@@ -4814,6 +4945,357 @@ mod tests {
         )
     }
 
+    fn no_hardware_info_query() -> DeviceHardwareInfo {
+        DeviceHardwareInfo::Unanswered {
+            detail: "this test drives the data provider alone and sends no QueryValue".into(),
+        }
+    }
+
+    // What restored answers to QueryValue HardwareInfo on a part with this ECID, chip and
+    // board: integers for the /chosen numbers, booleans for the certificate terms.
+    fn device_hardware_info(ecid: u64, chip: u64, board: u64) -> DeviceHardwareInfo {
+        let mut info = plist::Dictionary::new();
+        info.insert("ChipID".into(), plist::Value::Integer(chip.into()));
+        info.insert("BoardID".into(), plist::Value::Integer(board.into()));
+        info.insert("UniqueChipID".into(), plist::Value::Integer(ecid.into()));
+        info.insert("SecurityDomain".into(), plist::Value::Integer(1_u64.into()));
+        info.insert("ProductionMode".into(), plist::Value::Boolean(true));
+        info.insert("SecurityMode".into(), plist::Value::Boolean(true));
+        info.insert("SupportsImage4".into(), plist::Value::Boolean(true));
+        info.insert(
+            "EffectiveProductionMode".into(),
+            plist::Value::Boolean(true),
+        );
+        info.insert("EffectiveSecurityMode".into(), plist::Value::Boolean(true));
+        DeviceHardwareInfo::Answered(info)
+    }
+
+    fn global_manifest_naming_a_board() -> Vec<u8> {
+        let mut properties = manifest_property("BORD", manifest_der(&[0x02], &[0x22]));
+        properties.extend_from_slice(&manifest_property(
+            "CHIP",
+            manifest_der(&[0x02], &[0x81, 0x03]),
+        ));
+        properties.extend_from_slice(&manifest_property("CPRO", manifest_der(&[0x01], &[0xff])));
+        properties.extend_from_slice(&manifest_property("CSEC", manifest_der(&[0x01], &[0xff])));
+        properties.extend_from_slice(&manifest_property("SDOM", manifest_der(&[0x02], &[0x01])));
+        manifest_with_manp(properties)
+    }
+
+    fn answers_with_signer(
+        dir: &std::path::Path,
+        reporter: &crate::restore::SharedReporter,
+        requests: &Arc<std::sync::Mutex<Vec<plist::Dictionary>>>,
+        device_hardware_info: DeviceHardwareInfo,
+    ) -> RestoreAnswers {
+        RestoreAnswers {
+            tickets: GlobalManifestProvider::new(
+                dir.to_path_buf(),
+                test_variants(),
+                "J274AP".to_string(),
+                false,
+                62078,
+                0.0,
+                None,
+                None,
+                None,
+                reporter,
+            ),
+            firmware: None,
+            identities: test_identity_provider(),
+            personalized: test_personalized_provider(),
+            source_boot_objects: test_source_boot_object_provider(dir),
+            fdr: test_fdr_provider(reporter),
+            port: 62078,
+            local_policy_signer: Some(Arc::new(RecordingSigner {
+                requests: Arc::clone(requests),
+            })),
+            local_policy_census: LocalPolicyCensus::default(),
+            device_hardware_info,
+            armed_at_secs: 0.0,
+            reporter: Arc::clone(reporter),
+        }
+    }
+
+    #[test]
+    fn a_global_root_ticket_is_personalised_for_the_part_the_device_stated() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = global_manifest_naming_a_board();
+        manifests_tree(dir.path(), "j274ap", &manifest, &[9]);
+        let (reporter, lines) = capturing();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut answers = answers_with_signer(
+            dir.path(),
+            &reporter,
+            &requests,
+            device_hardware_info(0x3a68_1f4c_2b9d_071b, 0x8103, 0x22),
+        );
+
+        answers
+            .supply(&data_request(DataType::RootTicket))
+            .expect("the OS root ticket is served before the LocalPolicy step");
+        answers
+            .supply(&recovery_os_local_policy_request())
+            .expect("the request is answered rather than ending the session");
+
+        let issued = requests.lock().unwrap().clone();
+        assert_eq!(
+            issued.len(),
+            1,
+            "a global root ticket plus the device's own identity reaches the signing service once"
+        );
+        let request = &issued[0];
+        assert_eq!(
+            request
+                .get("ApECID")
+                .and_then(plist::Value::as_unsigned_integer),
+            Some(0x3a68_1f4c_2b9d_071b),
+            "ApECID is the UniqueChipID the device stated: {request:?}"
+        );
+        assert_eq!(
+            request
+                .get("ApChipID")
+                .and_then(plist::Value::as_signed_integer),
+            Some(0x8103),
+            "{request:?}"
+        );
+        assert_eq!(
+            request
+                .get("ApBoardID")
+                .and_then(plist::Value::as_signed_integer),
+            Some(0x22),
+            "{request:?}"
+        );
+        assert_eq!(
+            request
+                .get("ApSecurityDomain")
+                .and_then(plist::Value::as_signed_integer),
+            Some(1),
+            "{request:?}"
+        );
+        assert_eq!(
+            request
+                .get("ApProductionMode")
+                .and_then(plist::Value::as_boolean),
+            Some(true),
+            "{request:?}"
+        );
+        assert_eq!(
+            request
+                .get("ApSecurityMode")
+                .and_then(plist::Value::as_boolean),
+            Some(true),
+            "{request:?}"
+        );
+        assert_eq!(
+            request
+                .get("Ap,NextStageIM4MHash")
+                .and_then(plist::Value::as_data),
+            Some(&[0xa5; 48][..]),
+            "{request:?}"
+        );
+        assert_eq!(
+            request
+                .get("Ap,RecoveryOSPolicyNonceHash")
+                .and_then(plist::Value::as_data),
+            Some(&[0x5a; 48][..]),
+            "{request:?}"
+        );
+
+        let lines = lines.lock().unwrap();
+        let resolved: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("result=recovery-os-local-policy-identity-resolved"))
+            .collect();
+        assert_eq!(resolved.len(), 1, "{lines:?}");
+        assert!(
+            resolved[0].contains("identity_source=device-hardware-info"),
+            "{resolved:?}"
+        );
+        assert!(
+            resolved[0].contains("ecid=0x3a681f4c2b9d071b"),
+            "{resolved:?}"
+        );
+        assert!(
+            resolved[0]
+                .contains("root_ticket=recovery-os-local-policy-identity-not-personalisable"),
+            "{resolved:?}"
+        );
+        assert!(
+            resolved[0].contains("root_ticket_chip=0x8103/agrees")
+                && resolved[0].contains("root_ticket_board=0x22/agrees"),
+            "{resolved:?}"
+        );
+        let failed: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("result=recovery-os-local-policy-signing-service-failed"))
+            .collect();
+        assert_eq!(failed.len(), 1, "{lines:?}");
+        assert!(
+            failed[0].contains("identity_source=device-hardware-info"),
+            "{failed:?}"
+        );
+        let fallback: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("result=recovery-os-local-policy-global-signed"))
+            .collect();
+        assert_eq!(fallback.len(), 1, "{lines:?}");
+        assert!(
+            fallback[0].contains("identity_source=device-hardware-info"),
+            "the fallback names the identity the refused request was built on: {fallback:?}"
+        );
+    }
+
+    #[test]
+    fn a_personalised_root_ticket_missing_csec_is_refused_by_name_and_served_globally() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut properties = manifest_property("BORD", manifest_der(&[0x02], &[0x22]));
+        properties.extend_from_slice(&manifest_property(
+            "CHIP",
+            manifest_der(&[0x02], &[0x81, 0x03]),
+        ));
+        properties.extend_from_slice(&manifest_property("CPRO", manifest_der(&[0x01], &[0xff])));
+        properties.extend_from_slice(&manifest_property(
+            "ECID",
+            manifest_der(&[0x02], &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]),
+        ));
+        properties.extend_from_slice(&manifest_property("SDOM", manifest_der(&[0x02], &[0x01])));
+        let manifest = manifest_with_manp(properties);
+        manifests_tree(dir.path(), "j274ap", &manifest, &[9]);
+        let (reporter, lines) = capturing();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut answers = answers_with_signer(
+            dir.path(),
+            &reporter,
+            &requests,
+            device_hardware_info(0x0102_0304_0506_0708, 0x8103, 0x22),
+        );
+
+        answers
+            .supply(&data_request(DataType::RootTicket))
+            .expect("the OS root ticket is served before the LocalPolicy step");
+        let body = answers
+            .supply(&recovery_os_local_policy_request())
+            .expect("the request is answered rather than ending the session");
+
+        assert_eq!(
+            answers.local_policy_census.rendered(),
+            "recovery-os-local-policy-identity-property-missing=1",
+            "a ticket that names a part but lacks CSEC is refused by name, and that refusal is the only one"
+        );
+        let lines = lines.lock().unwrap();
+        let refused: Vec<&String> = lines
+            .iter()
+            .filter(|line| {
+                line.contains("result=recovery-os-local-policy-identity-property-missing")
+            })
+            .collect();
+        assert_eq!(refused.len(), 1, "{lines:?}");
+        assert!(refused[0].contains("CSEC"), "{refused:?}");
+        assert!(
+            refused[0].contains("identity_source=served-root-ticket"),
+            "{refused:?}"
+        );
+        let fallback: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("result=recovery-os-local-policy-global-signed"))
+            .collect();
+        assert_eq!(
+            fallback.len(),
+            1,
+            "the reply is the global-signing fallback, as at HEAD: {lines:?}"
+        );
+        assert!(
+            matches!(body.get(KEY_AP_LOCAL_POLICY), Some(plist::Value::Data(_))),
+            "the global signing fallback is served"
+        );
+    }
+
+    #[test]
+    fn a_personalised_root_ticket_still_names_the_part_when_the_device_also_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = manifest_with_properties_naming_a_part();
+        manifests_tree(dir.path(), "j274ap", &manifest, &[9]);
+        let (reporter, lines) = capturing();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut answers = answers_with_signer(
+            dir.path(),
+            &reporter,
+            &requests,
+            device_hardware_info(0x0102_0304_0506_0708, 0x8103, 0x22),
+        );
+
+        answers
+            .supply(&data_request(DataType::RootTicket))
+            .expect("the OS root ticket is served before the LocalPolicy step");
+        answers
+            .supply(&recovery_os_local_policy_request())
+            .expect("the request is answered rather than ending the session");
+
+        let issued = requests.lock().unwrap().clone();
+        assert_eq!(issued.len(), 1);
+        assert_eq!(
+            issued[0]
+                .get("ApECID")
+                .and_then(plist::Value::as_unsigned_integer),
+            Some(0x1122_3344_5566_7788),
+            "a root ticket that names a part is the identity, as before: {:?}",
+            issued[0]
+        );
+        let lines = lines.lock().unwrap();
+        let resolved: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("result=recovery-os-local-policy-identity-resolved"))
+            .collect();
+        assert_eq!(resolved.len(), 1, "{lines:?}");
+        assert!(
+            resolved[0].contains("identity_source=served-root-ticket"),
+            "{resolved:?}"
+        );
+    }
+
+    #[test]
+    fn a_global_root_ticket_with_no_device_statement_records_both_refusals() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = global_manifest_naming_a_board();
+        manifests_tree(dir.path(), "j274ap", &manifest, &[9]);
+        let (reporter, lines) = capturing();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut answers =
+            answers_with_signer(dir.path(), &reporter, &requests, no_hardware_info_query());
+
+        answers
+            .supply(&data_request(DataType::RootTicket))
+            .expect("the OS root ticket is served before the LocalPolicy step");
+        let body = answers
+            .supply(&recovery_os_local_policy_request())
+            .expect("the request is answered rather than ending the session");
+
+        assert_eq!(
+            answers
+                .local_policy_census
+                .count("recovery-os-local-policy-identity-not-personalisable"),
+            1
+        );
+        assert_eq!(
+            answers
+                .local_policy_census
+                .count("recovery-os-local-policy-identity-hardware-info-unanswered"),
+            1
+        );
+        let lines = lines.lock().unwrap();
+        assert!(
+            lines.iter().any(|line| line
+                .contains("result=recovery-os-local-policy-identity-hardware-info-unanswered")
+                && line.contains("identity_source=device-hardware-info")),
+            "{lines:?}"
+        );
+        assert!(
+            matches!(body.get(KEY_AP_LOCAL_POLICY), Some(plist::Value::Data(_))),
+            "the global signing fallback is still served"
+        );
+    }
+
     #[test]
     fn a_root_ticket_that_names_no_part_refuses_the_personalisation_by_name() {
         let dir = tempfile::tempdir().unwrap();
@@ -4841,6 +5323,7 @@ mod tests {
             port: 62078,
             local_policy_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
+            device_hardware_info: no_hardware_info_query(),
             armed_at_secs: 0.0,
             reporter: Arc::clone(&reporter),
         };
@@ -4920,6 +5403,7 @@ mod tests {
             port: 62078,
             local_policy_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
+            device_hardware_info: no_hardware_info_query(),
             armed_at_secs: 0.0,
             reporter: Arc::clone(&reporter),
         };
@@ -5038,6 +5522,7 @@ mod tests {
                 requests: Arc::clone(&requests),
             })),
             local_policy_census: LocalPolicyCensus::default(),
+            device_hardware_info: no_hardware_info_query(),
             armed_at_secs: 0.0,
             reporter: Arc::clone(&reporter),
         };
@@ -5456,6 +5941,7 @@ mod tests {
             port: 62078,
             local_policy_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
+            device_hardware_info: no_hardware_info_query(),
             armed_at_secs: 0.0,
             reporter: Arc::clone(reporter),
         }
@@ -6026,6 +6512,7 @@ mod tests {
             port: 62078,
             local_policy_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
+            device_hardware_info: no_hardware_info_query(),
             armed_at_secs: 0.0,
             reporter: Arc::clone(&reporter),
         };
@@ -6072,6 +6559,7 @@ mod tests {
             fdr: test_fdr_provider(&reporter()),
             local_policy_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
+            device_hardware_info: no_hardware_info_query(),
             port: 62078,
             armed_at_secs: 0.0,
             reporter: reporter(),

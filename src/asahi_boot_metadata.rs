@@ -129,6 +129,286 @@ fn environment_without_raw_redirect(bytes: &[u8]) -> Result<Option<Vec<u8>>, Str
     Ok(Some(result))
 }
 
+const SILENCE_KEYS: &[&str] = &["quiet", "rhgb", "splash"];
+/// The upstream Apple device trees alias each board's debug UART as serial0 and select it
+/// with stdout-path, and samsung_tty numbers apple,s5l-uart ports by that alias, so the
+/// board's serial console is ttySAC0. No rate is given, so the driver keeps the one the
+/// boot firmware programmed. tty0 keeps kernel output on the display; the serial port is
+/// last so it becomes /dev/console and receives the login getty.
+const SERIAL_CONSOLE: &[&str] = &["console=tty0", "console=ttySAC0"];
+const CMDLINE_FILES: &[&str] = &[
+    "/etc/kernel/cmdline",
+    "/etc/default/grub",
+    "/grub2/grub.cfg",
+    "/grub/grub.cfg",
+    "/boot/grub2/grub.cfg",
+    "/boot/grub/grub.cfg",
+];
+const ENTRY_DIRS: &[&str] = &["/loader/entries", "/boot/loader/entries"];
+/// Bytes to write over the physical ranges they occupy, in order.
+type Replacement = (Vec<(u64, usize)>, Vec<u8>);
+
+pub(crate) fn enable_verbose_kernel<R: Read + Write + Seek>(
+    source: &mut R,
+) -> Result<bool, String> {
+    let replacements = {
+        let Some(mut image) = crate::ext4_boot::Ext4::open(&mut *source)? else {
+            return Ok(false);
+        };
+        verbose_replacements(&mut image)?
+    };
+    if replacements.is_empty() {
+        return Ok(false);
+    }
+    for (ranges, bytes) in replacements {
+        let mut at = 0;
+        for (offset, count) in ranges {
+            source
+                .seek(SeekFrom::Start(offset))
+                .map_err(|e| e.to_string())?;
+            source
+                .write_all(&bytes[at..at + count])
+                .map_err(|e| e.to_string())?;
+            at += count;
+        }
+    }
+    Ok(true)
+}
+
+fn verbose_replacements(
+    image: &mut crate::ext4_boot::Ext4<impl Read + Seek>,
+) -> Result<Vec<Replacement>, String> {
+    let mut paths: Vec<String> = CMDLINE_FILES
+        .iter()
+        .map(|path| (*path).to_string())
+        .collect();
+    for dir in ENTRY_DIRS {
+        if let Some(names) = image.files_in(dir)? {
+            for name in names {
+                if name.ends_with(".conf") {
+                    paths.push(format!("{dir}/{name}"));
+                }
+            }
+        }
+    }
+    let mut replacements = Vec::new();
+    for path in paths {
+        let Some(file) = image.file(&path)? else {
+            continue;
+        };
+        let mut refusal = None;
+        let mut chosen = None;
+        for mut output in verbose_candidates(&file.bytes)? {
+            if output.len() <= file.bytes.len() {
+                output.resize(file.bytes.len(), b' ');
+                chosen = Some(vec![(file.ranges.clone(), output)]);
+                break;
+            }
+            match image.resize_in_place(&path, output.len() as u64) {
+                Ok(Some(resize)) => {
+                    chosen = Some(vec![
+                        (resize.ranges, output),
+                        (
+                            vec![(resize.inode_offset, resize.inode.len())],
+                            resize.inode,
+                        ),
+                    ]);
+                    break;
+                }
+                Ok(None) => return Err(format!("{path} is not a regular file")),
+                Err(e) => refusal = Some(e),
+            }
+        }
+        match (chosen, refusal) {
+            (Some(writes), _) => replacements.extend(writes),
+            (None, Some(e)) => {
+                return Err(format!(
+                    "verbose kernel command line does not fit in the existing boot file: {e}"
+                ));
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(replacements)
+}
+
+/// Verbose rewrites of a boot file in order of preference: with loglevel=7, then without it
+/// for a file whose allocated blocks cannot take the longer line.
+fn verbose_candidates(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "boot console file is not UTF-8")?;
+    Ok([true, false]
+        .into_iter()
+        .filter_map(|add_loglevel| rewrite_boot_text(text, add_loglevel))
+        .map(String::into_bytes)
+        .collect())
+}
+
+fn rewrite_boot_text(text: &str, add_loglevel: bool) -> Option<String> {
+    // grub-mkconfig puts GRUB_CMDLINE_LINUX on every entry and appends
+    // GRUB_CMDLINE_LINUX_DEFAULT to the normal ones, so the console goes on the former
+    // alone and on the latter only when the file does not set the former.
+    let default_takes_console = !text
+        .lines()
+        .any(|line| line.trim_start().starts_with("GRUB_CMDLINE_LINUX="));
+    let mut changed = false;
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let (body, nl) = match line.strip_suffix('\n') {
+            Some(body) => (body, "\n"),
+            None => (line, ""),
+        };
+        let cr = body.ends_with('\r');
+        let body = body.strip_suffix('\r').unwrap_or(body);
+        if let Some(rewritten) = rewrite_boot_line(body, add_loglevel, default_takes_console) {
+            changed = true;
+            out.push_str(&rewritten);
+            if cr {
+                out.push('\r');
+            }
+            out.push_str(nl);
+        } else {
+            out.push_str(line);
+        }
+    }
+    changed.then_some(out)
+}
+
+fn rewrite_boot_line(
+    line: &str,
+    add_loglevel: bool,
+    default_takes_console: bool,
+) -> Option<String> {
+    if let Some(rewritten) = rewrite_prefixed_line(line, "options", add_loglevel) {
+        return Some(rewritten);
+    }
+    if let Some(rewritten) = rewrite_assignment(
+        line,
+        "GRUB_CMDLINE_LINUX_DEFAULT=",
+        add_loglevel,
+        default_takes_console,
+    ) {
+        return Some(rewritten);
+    }
+    if let Some(rewritten) = rewrite_assignment(line, "GRUB_CMDLINE_LINUX=", add_loglevel, true) {
+        return Some(rewritten);
+    }
+    if let Some(rewritten) = rewrite_assignment(line, "set kernelopts=", add_loglevel, true) {
+        return Some(rewritten);
+    }
+    if let Some(rewritten) = rewrite_linux_line(line, add_loglevel) {
+        return Some(rewritten);
+    }
+    if looks_like_raw_cmdline(line) {
+        return rewrite_cmdline(line, add_loglevel, true);
+    }
+    None
+}
+
+fn indent_of(line: &str) -> &str {
+    let rest = line.trim_start_matches([' ', '\t']);
+    &line[..line.len() - rest.len()]
+}
+
+fn rewrite_prefixed_line(line: &str, prefix: &str, add_loglevel: bool) -> Option<String> {
+    let indent = indent_of(line);
+    let rest = line[indent.len()..].strip_prefix(prefix)?;
+    if !rest.is_empty() && !rest.starts_with(|c: char| c.is_whitespace()) {
+        return None;
+    }
+    let rewritten = rewrite_cmdline(rest, add_loglevel, true)?;
+    Some(format!("{indent}{prefix} {rewritten}"))
+}
+
+fn rewrite_assignment(
+    line: &str,
+    key: &str,
+    add_loglevel: bool,
+    add_console: bool,
+) -> Option<String> {
+    let indent = indent_of(line);
+    let rest = line[indent.len()..].strip_prefix(key)?;
+    let (open, inner, close) =
+        if let Some(inner) = rest.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            ("\"", inner, "\"")
+        } else if let Some(inner) = rest.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+            ("'", inner, "'")
+        } else {
+            ("", rest, "")
+        };
+    let rewritten = rewrite_cmdline(inner, add_loglevel, add_console)?;
+    Some(format!("{indent}{key}{open}{rewritten}{close}"))
+}
+
+fn rewrite_linux_line(line: &str, add_loglevel: bool) -> Option<String> {
+    let indent = indent_of(line);
+    let rest = &line[indent.len()..];
+    let command = if rest.starts_with("linuxefi") {
+        "linuxefi"
+    } else if rest.starts_with("linux") {
+        "linux"
+    } else {
+        return None;
+    };
+    let after = rest.get(command.len()..)?;
+    if after.is_empty() || !after.starts_with(|c: char| c.is_whitespace()) {
+        return None;
+    }
+    let after = after.trim_start();
+    let (kernel, args) = after.split_once(|c: char| c.is_whitespace())?;
+    let rewritten = rewrite_cmdline(args, add_loglevel, true)?;
+    Some(format!("{indent}{command} {kernel} {rewritten}"))
+}
+
+fn looks_like_raw_cmdline(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && !trimmed.starts_with('#')
+        && trimmed
+            .split_whitespace()
+            .any(|token| silencer_key(token).is_some())
+}
+
+fn silencer_key(token: &str) -> Option<&str> {
+    let key = token.split_once('=').map(|(key, _)| key).unwrap_or(token);
+    SILENCE_KEYS.iter().copied().find(|name| *name == key)
+}
+
+fn rewrite_cmdline(args: &str, add_loglevel: bool, add_console: bool) -> Option<String> {
+    let tokens: Vec<&str> = args.split_whitespace().collect();
+    if tokens.is_empty() && !add_console {
+        return None;
+    }
+    let mut kept = Vec::with_capacity(tokens.len() + 1 + SERIAL_CONSOLE.len());
+    let mut removed = false;
+    let mut has_loglevel = false;
+    let mut has_console = false;
+    for token in tokens {
+        if silencer_key(token).is_some() {
+            removed = true;
+            continue;
+        }
+        if token == "debug" || token == "ignore_loglevel" || token.starts_with("loglevel=") {
+            has_loglevel = true;
+        }
+        if token.starts_with("console=") {
+            has_console = true;
+        }
+        kept.push(token);
+    }
+    let added = add_loglevel && !has_loglevel;
+    if added {
+        kept.push("loglevel=7");
+    }
+    let console_added = add_console && !has_console;
+    if console_added {
+        kept.extend_from_slice(SERIAL_CONSOLE);
+    }
+    if !removed && !added && !console_added {
+        return None;
+    }
+    Some(kept.join(" "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +523,334 @@ mod tests {
             input.extend(std::iter::repeat_n('#', 1024 - input.len()));
             assert!(environment_without_raw_redirect(input.as_bytes()).is_err());
         }
+    }
+
+    #[test]
+    fn cmdline_rewrite_strips_quiet_and_adds_loglevel() {
+        assert_eq!(
+            rewrite_cmdline("root=UUID=x ro rhgb quiet", true, true).as_deref(),
+            Some("root=UUID=x ro loglevel=7 console=tty0 console=ttySAC0")
+        );
+        assert_eq!(
+            rewrite_cmdline("root=UUID=x ro quiet", false, true).as_deref(),
+            Some("root=UUID=x ro console=tty0 console=ttySAC0")
+        );
+        assert_eq!(
+            rewrite_cmdline("root=UUID=x ro rhgb quiet", true, false).as_deref(),
+            Some("root=UUID=x ro loglevel=7")
+        );
+        assert!(
+            rewrite_cmdline(
+                "root=UUID=x ro loglevel=7 console=tty0 console=ttySAC0",
+                true,
+                true
+            )
+            .is_none()
+        );
+        assert_eq!(
+            rewrite_cmdline("root=UUID=x ro quiet console=ttyAMA0", true, true).as_deref(),
+            Some("root=UUID=x ro console=ttyAMA0 loglevel=7")
+        );
+        assert_eq!(
+            rewrite_assignment(
+                r#"GRUB_CMDLINE_LINUX_DEFAULT="rhgb quiet rootflags=subvol=root""#,
+                "GRUB_CMDLINE_LINUX_DEFAULT=",
+                true,
+                true
+            )
+            .as_deref(),
+            Some(
+                r#"GRUB_CMDLINE_LINUX_DEFAULT="rootflags=subvol=root loglevel=7 console=tty0 console=ttySAC0""#
+            )
+        );
+        assert_eq!(
+            rewrite_boot_line(
+                r#"  set kernelopts="root=UUID=x ro rootflags=subvol=root  rhgb quiet""#,
+                true,
+                false
+            )
+            .as_deref(),
+            Some(
+                r#"  set kernelopts="root=UUID=x ro rootflags=subvol=root loglevel=7 console=tty0 console=ttySAC0""#
+            )
+        );
+        assert_eq!(
+            rewrite_linux_line("\tlinux\t/vmlinuz-asahi root=UUID=x ro rhgb quiet", false)
+                .as_deref(),
+            Some("\tlinux /vmlinuz-asahi root=UUID=x ro console=tty0 console=ttySAC0")
+        );
+        assert_eq!(
+            rewrite_prefixed_line("options root=UUID=x ro rhgb quiet", "options", true).as_deref(),
+            Some("options root=UUID=x ro loglevel=7 console=tty0 console=ttySAC0")
+        );
+    }
+
+    #[test]
+    fn default_grub_carries_the_serial_console_once() {
+        let both = "GRUB_TIMEOUT=5\n\
+GRUB_CMDLINE_LINUX=\"rhgb quiet\"\n\
+GRUB_CMDLINE_LINUX_DEFAULT=\"rootflags=subvol=root quiet\"\n\
+GRUB_ENABLE_BLSCFG=true\n";
+        assert_eq!(
+            rewrite_boot_text(both, true).as_deref(),
+            Some(
+                "GRUB_TIMEOUT=5\n\
+GRUB_CMDLINE_LINUX=\"loglevel=7 console=tty0 console=ttySAC0\"\n\
+GRUB_CMDLINE_LINUX_DEFAULT=\"rootflags=subvol=root loglevel=7\"\n\
+GRUB_ENABLE_BLSCFG=true\n"
+            )
+        );
+
+        let empty_linux = "GRUB_CMDLINE_LINUX=\"\"\n\
+GRUB_CMDLINE_LINUX_DEFAULT=\"rhgb quiet rootflags=subvol=root\"\n";
+        assert_eq!(
+            rewrite_boot_text(empty_linux, true).as_deref(),
+            Some(
+                "GRUB_CMDLINE_LINUX=\"loglevel=7 console=tty0 console=ttySAC0\"\n\
+GRUB_CMDLINE_LINUX_DEFAULT=\"rootflags=subvol=root loglevel=7\"\n"
+            )
+        );
+
+        let default_only = "GRUB_CMDLINE_LINUX_DEFAULT=\"rhgb quiet rootflags=subvol=root\"\n";
+        assert_eq!(
+            rewrite_boot_text(default_only, true).as_deref(),
+            Some(
+                "GRUB_CMDLINE_LINUX_DEFAULT=\"rootflags=subvol=root loglevel=7 console=tty0 console=ttySAC0\"\n"
+            )
+        );
+    }
+
+    fn boot_console_image(cfg: &str) -> Vec<u8> {
+        let mut image = fixture("10+2");
+        fn u16w(b: &mut [u8], at: usize, value: u16) {
+            b[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        fn u32w(b: &mut [u8], at: usize, value: u32) {
+            b[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        u32w(&mut image, 4116, 16);
+        image[4128..4132].copy_from_slice(&4u32.to_le_bytes());
+        u16w(&mut image, 4132, 16);
+        image[4134] = 8;
+        image[4136..4144].copy_from_slice(b"grub.cfg");
+        // A regular file named "boot" must not make /boot/grub2/grub.cfg fail the rewrite.
+        image[4144..4148].copy_from_slice(&3u32.to_le_bytes());
+        u16w(&mut image, 4148, 976);
+        image[4150] = 4;
+        image[4152..4156].copy_from_slice(b"boot");
+        let at = 3072 + 3 * 128;
+        u16w(&mut image, at, 0x8000);
+        u32w(&mut image, at + 4, cfg.len() as u32);
+        u32w(&mut image, at + 32, 0x80000);
+        u16w(&mut image, at + 40, 0xf30a);
+        u16w(&mut image, at + 42, 1);
+        u16w(&mut image, at + 44, 4);
+        u16w(&mut image, at + 56, 1);
+        u32w(&mut image, at + 60, 6);
+        image[6144..7168].fill(b' ');
+        image[6144..6144 + cfg.len()].copy_from_slice(cfg.as_bytes());
+        image
+    }
+
+    #[test]
+    fn ext4_verbose_rewrite_keeps_file_size_and_strips_quiet() {
+        let cfg = "linux /vmlinuz root=UUID=x ro rhgb quiet\n";
+        let original = boot_console_image(cfg);
+        let mut source = std::io::Cursor::new(original.clone());
+        assert!(enable_verbose_kernel(&mut source).unwrap());
+        let output = source.into_inner();
+        assert_eq!(output.len(), original.len());
+        let text = std::str::from_utf8(&output[6144..7168]).unwrap();
+        assert!(!text.contains("quiet"));
+        assert!(!text.contains("rhgb"));
+        assert!(text.contains("loglevel=7"));
+        assert!(text.contains("linux /vmlinuz root=UUID=x ro"));
+        assert!(!enable_verbose_kernel(&mut std::io::Cursor::new(output)).unwrap());
+
+        let mut full = original.clone();
+        full[BLS_INODE + 4..BLS_INODE + 8].copy_from_slice(&1024u32.to_le_bytes());
+        let mut source = std::io::Cursor::new(full.clone());
+        let refusal = enable_verbose_kernel(&mut source).unwrap_err();
+        assert!(refusal.contains("does not fit"), "{refusal}");
+        assert!(source.into_inner() == full);
+    }
+
+    #[test]
+    fn verbose_rewrite_skips_non_directory_path_components() {
+        let original = fixture("10+2");
+        let mut source = std::io::Cursor::new(original.clone());
+        assert!(!enable_verbose_kernel(&mut source).unwrap());
+        assert_eq!(source.into_inner(), original);
+    }
+
+    #[test]
+    fn create_disc_keeps_packaged_boot_console_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let boot = dir.path().join("boot.img");
+        let cfg = "linux /vmlinuz root=UUID=x ro rhgb quiet\n";
+        let original = boot_console_image(cfg);
+        std::fs::write(&boot, &original).unwrap();
+        let mut artifacts = crate::asahi_ops::Artifacts::memory(
+            b"KERN".to_vec(),
+            b"M1N1".to_vec(),
+            b"ROOT".to_vec(),
+        );
+        artifacts.boot_path = Some(boot.clone());
+        let mut stage1 = vec![0u8; 2048];
+        stage1[..12].copy_from_slice(b"##m1n1_ver##");
+        artifacts.m1n1_stage1 = stage1;
+        crate::asahi_ops::create_qcow2_disc(
+            &dir.path().join("asahi.qcow2"),
+            &artifacts,
+            8 << 20,
+            "m1n1/boot.bin",
+            "Asahi Linux",
+        )
+        .unwrap();
+        let normal = std::fs::read(&boot).unwrap();
+        assert!(
+            normal == original,
+            "default build changed the package boot image"
+        );
+        crate::asahi_ops::create_qcow2_disc_with_options(
+            &dir.path().join("verbose.qcow2"),
+            &artifacts,
+            8 << 20,
+            "m1n1/boot.bin",
+            "Asahi Linux",
+            &crate::asahi_ops::DiscOptions {
+                kernel_console: crate::asahi_ops::KernelConsole::Verbose,
+            },
+            |_| {},
+        )
+        .unwrap();
+        let verbose = std::fs::read(&boot).unwrap();
+        let text = std::str::from_utf8(&verbose[6144..7168]).unwrap();
+        assert!(!text.contains("quiet"), "{text}");
+        assert!(!text.contains("rhgb"), "{text}");
+        assert!(text.contains("loglevel=7"), "{text}");
+    }
+
+    const FEDORA_BLS_ENTRY: &str = "title Fedora Linux Asahi Remix (7.1.6-400.asahi.fc44.aarch64+16k) 44 (Workstation Edition)\n\
+version 7.1.6-400.asahi.fc44.aarch64+16k\n\
+linux /vmlinuz-7.1.6-400.asahi.fc44.aarch64+16k\n\
+initrd /initramfs-7.1.6-400.asahi.fc44.aarch64+16k.img $tuned_initrd\n\
+options rhgb quiet root=UUID=36431cc9-a4f5-4c93-9740-ea1e09fce299 rootflags=subvol=root\n\
+grub_users $grub_users\n\
+grub_arg --unrestricted\n\
+grub_class fedora-asahi-remix\n";
+
+    const FEDORA_BLS_OPTIONS: &str =
+        "options rhgb quiet root=UUID=36431cc9-a4f5-4c93-9740-ea1e09fce299 rootflags=subvol=root";
+
+    const VERBOSE_BLS_OPTIONS: &str = "options root=UUID=36431cc9-a4f5-4c93-9740-ea1e09fce299 rootflags=subvol=root loglevel=7 console=tty0 console=ttySAC0";
+
+    const BLS_INODE: usize = 3072 + 3 * 128;
+
+    /// The boot image fixture with its one boot file holding a Fedora BLS entry and sized
+    /// to the entry, so the verbose line has to grow into the rest of its block.
+    fn bls_image(checksum_uuid: Option<[u8; 16]>) -> Vec<u8> {
+        let mut image = boot_console_image(FEDORA_BLS_ENTRY);
+        image[BLS_INODE + 4..BLS_INODE + 8]
+            .copy_from_slice(&(FEDORA_BLS_ENTRY.len() as u32).to_le_bytes());
+        if let Some(uuid) = checksum_uuid {
+            image[1024 + 101] |= 0x04;
+            image[1024 + 0x175] = 1;
+            image[1024 + 0x68..1024 + 0x78].copy_from_slice(&uuid);
+            seal_bls_inode(&mut image, uuid);
+        }
+        image
+    }
+
+    fn seal_bls_inode(image: &mut [u8], uuid: [u8; 16]) {
+        let seed = crate::crypto::crc32::crc32c_update(u32::MAX, &uuid);
+        let (checksum, _) =
+            crate::ext4_boot::inode_checksum(seed, 4, &image[BLS_INODE..BLS_INODE + 128]).unwrap();
+        image[BLS_INODE + 0x7c..BLS_INODE + 0x7e].copy_from_slice(&(checksum as u16).to_le_bytes());
+    }
+
+    fn boot_file(image: &[u8]) -> String {
+        let mut cursor = std::io::Cursor::new(image);
+        let mut ext4 = crate::ext4_boot::Ext4::open(&mut cursor).unwrap().unwrap();
+        String::from_utf8(ext4.file("/grub2/grub.cfg").unwrap().unwrap().bytes).unwrap()
+    }
+
+    fn build_with(boot: &std::path::Path, console: crate::asahi_ops::KernelConsole) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut artifacts = crate::asahi_ops::Artifacts::memory(
+            b"KERN".to_vec(),
+            b"M1N1".to_vec(),
+            b"ROOT".to_vec(),
+        );
+        artifacts.boot_path = Some(boot.to_path_buf());
+        let mut stage1 = vec![0u8; 2048];
+        stage1[..12].copy_from_slice(b"##m1n1_ver##");
+        artifacts.m1n1_stage1 = stage1;
+        crate::asahi_ops::create_qcow2_disc_with_options(
+            &dir.path().join("asahi.qcow2"),
+            &artifacts,
+            8 << 20,
+            "m1n1/boot.bin",
+            "Asahi Linux",
+            &crate::asahi_ops::DiscOptions {
+                kernel_console: console,
+            },
+            |_| {},
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn verbose_and_normal_boot_produce_expected_options_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let boot = dir.path().join("boot.img");
+        let original = bls_image(None);
+        assert_eq!(boot_file(&original), FEDORA_BLS_ENTRY);
+
+        std::fs::write(&boot, &original).unwrap();
+        build_with(&boot, crate::asahi_ops::KernelConsole::Verbose);
+        let verbose = boot_file(&std::fs::read(&boot).unwrap());
+        assert_eq!(
+            verbose,
+            FEDORA_BLS_ENTRY.replace(FEDORA_BLS_OPTIONS, VERBOSE_BLS_OPTIONS)
+        );
+
+        std::fs::write(&boot, &original).unwrap();
+        build_with(&boot, crate::asahi_ops::KernelConsole::Normal);
+        let normal = std::fs::read(&boot).unwrap();
+        assert_eq!(boot_file(&normal), FEDORA_BLS_ENTRY);
+        assert!(
+            normal == original,
+            "normal boot changed the package boot image"
+        );
+    }
+
+    #[test]
+    fn verbose_growth_reseals_checksummed_inode_and_refuses_a_bad_seal() {
+        let uuid = *b"fedora-asahi-uid";
+        let original = bls_image(Some(uuid));
+        let mut source = std::io::Cursor::new(original.clone());
+        assert!(enable_verbose_kernel(&mut source).unwrap());
+        let output = source.into_inner();
+        assert_eq!(
+            boot_file(&output),
+            FEDORA_BLS_ENTRY.replace(FEDORA_BLS_OPTIONS, VERBOSE_BLS_OPTIONS)
+        );
+        let mut resealed = output.clone();
+        seal_bls_inode(&mut resealed, uuid);
+        assert!(
+            resealed == output,
+            "grown inode does not carry its recomputed checksum"
+        );
+
+        let mut tampered = original.clone();
+        tampered[BLS_INODE + 0x7c] ^= 0xff;
+        let mut source = std::io::Cursor::new(tampered.clone());
+        let refusal = enable_verbose_kernel(&mut source).unwrap_err();
+        assert!(
+            refusal.contains("inode checksum does not verify"),
+            "{refusal}"
+        );
+        assert!(source.into_inner() == tampered);
     }
 }

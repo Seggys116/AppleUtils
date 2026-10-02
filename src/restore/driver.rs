@@ -12,14 +12,15 @@ use crate::asr_server::producer::{
 use crate::asr_server::{AsrServerConfig, PayloadObserver};
 use crate::ramrod::{
     AsrBulkTransfer, BOOT_NONCE_HASH_BYTES, BootabilityBundleSource, BootabilityBundleTransfer,
-    BootabilityRouter, DialPlan, PreparedAnswers, RestoreDataProvider, RestoreSummary, SystemClock,
-    load_build_manifest,
+    BootabilityRouter, DialPlan, PreparedAnswers, QueryKey, RestoreDataProvider, RestoreSummary,
+    SystemClock, load_build_manifest,
 };
 use crate::usbmux::{BulkTransport, is_device_gone, is_host_initiated_teardown, is_run_stopped};
 
 use super::local_policy::{
-    RecoveryOsLocalPolicySigner, SIGNING_ENVELOPE_VERSION_INFO, SIGNING_OPT_IN_FLAG,
-    SIGNING_OPT_IN_KEY, SIGNING_SERVER_DEFAULT_BASE_URL, signing_server_signer,
+    DeviceHardwareInfo, RecoveryOsLocalPolicySigner, SIGNING_ENVELOPE_VERSION_INFO,
+    SIGNING_OPT_IN_FLAG, SIGNING_OPT_IN_KEY, SIGNING_SERVER_DEFAULT_BASE_URL,
+    signing_server_signer,
 };
 use super::mux::{ClaimedMuxTransport, bring_up_mux};
 use super::options::{manifest_identity_count, resolve_restore_manifest};
@@ -520,6 +521,13 @@ pub fn run_ramrod_restore_over_mux<T: BulkTransport + Send + 'static>(
         began.elapsed().as_secs_f64()
     );
     report(&reporter, "identify-answered", &line);
+    let device_hardware_info = query_device_hardware_info(
+        &mut client,
+        port,
+        armed_at_secs,
+        began.elapsed().as_secs_f64(),
+        &reporter,
+    );
     let line = format!(
         "{MUX_PREFIX} result=restore-manifest-loaded port={port} at={armed_at_secs:.3}s source={} identities={} meaning=\"the BuildManifest the restore options are derived from was read\" detail=\"path={}\"",
         prepared.manifest_source.label(),
@@ -910,6 +918,7 @@ pub fn run_ramrod_restore_over_mux<T: BulkTransport + Send + 'static>(
                     &reporter,
                 ),
                 local_policy_census: super::local_policy::LocalPolicyCensus::default(),
+                device_hardware_info,
                 port,
                 armed_at_secs,
                 reporter: Arc::clone(&reporter),
@@ -992,6 +1001,45 @@ pub fn run_ramrod_restore_over_mux<T: BulkTransport + Send + 'static>(
     proxy.stop();
 
     outcome
+}
+
+// The device's own statement of its part, asked before StartRestore; a LocalPolicy request
+// names it when the served root ticket is global.
+fn query_device_hardware_info<T: std::io::Read + std::io::Write>(
+    client: &mut crate::ramrod::RamrodClient<T>,
+    port: u16,
+    armed_at_secs: f64,
+    elapsed_secs: f64,
+    reporter: &SharedReporter,
+) -> DeviceHardwareInfo {
+    let info = match client.query_value(QueryKey::HardwareInfo) {
+        Ok(plist::Value::Dictionary(info)) => DeviceHardwareInfo::Answered(info),
+        Ok(other) => DeviceHardwareInfo::Unanswered {
+            detail: format!(
+                "the reply carried {} as {other:?} where restored sends a dictionary",
+                QueryKey::HardwareInfo
+            ),
+        },
+        Err(error) => DeviceHardwareInfo::Unanswered {
+            detail: error.to_string(),
+        },
+    };
+    let (result, meaning) = match &info {
+        DeviceHardwareInfo::Answered(_) => (
+            "hardware-info-answered",
+            "restored stated the part it is: ChipID, BoardID, UniqueChipID, SecurityDomain and ProductionMode from /chosen, SecurityMode and the effective modes from MobileGestalt",
+        ),
+        DeviceHardwareInfo::Unanswered { .. } => (
+            "hardware-info-unanswered",
+            "restored did not state the part it is, so a LocalPolicy request over a global root ticket has no identity to name",
+        ),
+    };
+    let line = format!(
+        "{MUX_PREFIX} result={result} port={port} at={armed_at_secs:.3}s elapsed={elapsed_secs:.3}s {} meaning=\"{meaning}\" detail=\"\"",
+        info.trace_fields()
+    );
+    report(reporter, result, &line);
+    info
 }
 
 pub fn local_policy_signer_for_plan(

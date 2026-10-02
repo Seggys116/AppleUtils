@@ -54,6 +54,90 @@ const TAG_SECURITY_DOMAIN: &str = "SDOM";
 const TAG_PRODUCTION_MODE: &str = "CPRO";
 const TAG_SECURITY_MODE: &str = "CSEC";
 
+// Keys of restored's QueryValue HardwareInfo reply. restored_external builds it at
+// 0x10000d284: ChipID, BoardID, UniqueChipID, SecurityDomain and ProductionMode out of
+// /chosen chip-id, board-id, unique-chip-id, security-domain and
+// certificate-production-status, and SecurityMode out of MobileGestalt
+// CertificateSecurityMode, the same certificate terms the MANP carries as CPRO and CSEC.
+pub const HARDWARE_INFO_CHIP_ID: &str = "ChipID";
+pub const HARDWARE_INFO_BOARD_ID: &str = "BoardID";
+pub const HARDWARE_INFO_UNIQUE_CHIP_ID: &str = "UniqueChipID";
+pub const HARDWARE_INFO_SECURITY_DOMAIN: &str = "SecurityDomain";
+pub const HARDWARE_INFO_PRODUCTION_MODE: &str = "ProductionMode";
+pub const HARDWARE_INFO_SECURITY_MODE: &str = "SecurityMode";
+pub const HARDWARE_INFO_EFFECTIVE_PRODUCTION_MODE: &str = "EffectiveProductionMode";
+pub const HARDWARE_INFO_EFFECTIVE_SECURITY_MODE: &str = "EffectiveSecurityMode";
+pub const HARDWARE_INFO_SUPPORTS_IMAGE4: &str = "SupportsImage4";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalPolicyIdentitySource {
+    ServedRootTicket,
+    DeviceHardwareInfo,
+}
+
+impl LocalPolicyIdentitySource {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ServedRootTicket => "served-root-ticket",
+            Self::DeviceHardwareInfo => "device-hardware-info",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeviceHardwareInfo {
+    Answered(plist::Dictionary),
+    Unanswered { detail: String },
+}
+
+impl DeviceHardwareInfo {
+    pub fn identity(&self) -> Result<LocalPolicyIdentity, Box<IdentityRefusal>> {
+        match self {
+            Self::Answered(info) => LocalPolicyIdentity::from_hardware_info(info),
+            Self::Unanswered { detail } => Err(Box::new(IdentityRefusal::HardwareInfoUnanswered {
+                detail: detail.clone(),
+            })),
+        }
+    }
+
+    #[must_use]
+    pub fn trace_fields(&self) -> String {
+        match self {
+            Self::Answered(info) => {
+                let render = |key: &str| {
+                    info.get(key)
+                        .map_or_else(|| "absent".to_string(), render_hardware_value)
+                };
+                format!(
+                    "{HARDWARE_INFO_UNIQUE_CHIP_ID}={} {HARDWARE_INFO_CHIP_ID}={} {HARDWARE_INFO_BOARD_ID}={} {HARDWARE_INFO_SECURITY_DOMAIN}={} {HARDWARE_INFO_PRODUCTION_MODE}={} {HARDWARE_INFO_SECURITY_MODE}={} {HARDWARE_INFO_EFFECTIVE_PRODUCTION_MODE}={} {HARDWARE_INFO_EFFECTIVE_SECURITY_MODE}={} {HARDWARE_INFO_SUPPORTS_IMAGE4}={} keys={}",
+                    render(HARDWARE_INFO_UNIQUE_CHIP_ID),
+                    render(HARDWARE_INFO_CHIP_ID),
+                    render(HARDWARE_INFO_BOARD_ID),
+                    render(HARDWARE_INFO_SECURITY_DOMAIN),
+                    render(HARDWARE_INFO_PRODUCTION_MODE),
+                    render(HARDWARE_INFO_SECURITY_MODE),
+                    render(HARDWARE_INFO_EFFECTIVE_PRODUCTION_MODE),
+                    render(HARDWARE_INFO_EFFECTIVE_SECURITY_MODE),
+                    render(HARDWARE_INFO_SUPPORTS_IMAGE4),
+                    info.len()
+                )
+            }
+            Self::Unanswered { detail } => format!("unanswered=\"{detail}\""),
+        }
+    }
+}
+
+fn render_hardware_value(value: &plist::Value) -> String {
+    match value {
+        plist::Value::Integer(integer) => integer
+            .as_unsigned()
+            .map_or_else(|| integer.to_string(), |unsigned| format!("0x{unsigned:x}")),
+        plist::Value::Boolean(flag) => flag.to_string(),
+        other => describe_value(other),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LocalPolicyIdentity {
     pub ecid: u64,
@@ -81,6 +165,16 @@ pub enum IdentityRefusal {
         tag: &'static str,
         rendered: String,
     },
+    HardwareInfoUnanswered {
+        detail: String,
+    },
+    HardwareInfoKeyMissing {
+        key: &'static str,
+    },
+    HardwareInfoKeyUnreadable {
+        key: &'static str,
+        rendered: String,
+    },
 }
 
 impl IdentityRefusal {
@@ -94,6 +188,15 @@ impl IdentityRefusal {
             Self::PropertyMissing { .. } => "recovery-os-local-policy-identity-property-missing",
             Self::PropertyUnreadable { .. } => {
                 "recovery-os-local-policy-identity-property-unreadable"
+            }
+            Self::HardwareInfoUnanswered { .. } => {
+                "recovery-os-local-policy-identity-hardware-info-unanswered"
+            }
+            Self::HardwareInfoKeyMissing { .. } => {
+                "recovery-os-local-policy-identity-hardware-info-key-missing"
+            }
+            Self::HardwareInfoKeyUnreadable { .. } => {
+                "recovery-os-local-policy-identity-hardware-info-key-unreadable"
             }
         }
     }
@@ -129,6 +232,18 @@ impl fmt::Display for IdentityRefusal {
             Self::PropertyUnreadable { tag, rendered } => write!(
                 f,
                 "the MANP property {tag} is present as {rendered}, which is not the shape the server request term needs"
+            ),
+            Self::HardwareInfoUnanswered { detail } => write!(
+                f,
+                "the device did not state its identity: the QueryValue HardwareInfo exchange sent before StartRestore gave no dictionary: {detail}"
+            ),
+            Self::HardwareInfoKeyMissing { key } => write!(
+                f,
+                "the device's HardwareInfo reply carries no {key}, which restored fills from /chosen or MobileGestalt and leaves out when that read fails, and the server request has no term to put in its place"
+            ),
+            Self::HardwareInfoKeyUnreadable { key, rendered } => write!(
+                f,
+                "the device's HardwareInfo reply carries {key} as {rendered}, which is not the shape the server request term needs"
             ),
         }
     }
@@ -176,6 +291,59 @@ fn narrow(tag: &'static str, value: u64) -> Result<u32, Box<IdentityRefusal>> {
     })
 }
 
+fn hardware_value<'a>(
+    info: &'a plist::Dictionary,
+    key: &'static str,
+) -> Result<&'a plist::Value, Box<IdentityRefusal>> {
+    info.get(key)
+        .ok_or_else(|| Box::new(IdentityRefusal::HardwareInfoKeyMissing { key }))
+}
+
+fn hardware_unreadable(key: &'static str, value: &plist::Value) -> Box<IdentityRefusal> {
+    Box::new(IdentityRefusal::HardwareInfoKeyUnreadable {
+        key,
+        rendered: describe_value(value),
+    })
+}
+
+// restored builds UniqueChipID as a kCFNumberSInt64Type CFNumber over the eight bytes of
+// /chosen unique-chip-id, so a value with bit 63 set arrives signed and is the same bits.
+fn hardware_unique_chip_id(info: &plist::Dictionary) -> Result<u64, Box<IdentityRefusal>> {
+    let key = HARDWARE_INFO_UNIQUE_CHIP_ID;
+    let value = hardware_value(info, key)?;
+    match value {
+        plist::Value::Integer(integer) => integer
+            .as_unsigned()
+            .or_else(|| integer.as_signed().map(|signed| signed as u64))
+            .ok_or_else(|| hardware_unreadable(key, value)),
+        _ => Err(hardware_unreadable(key, value)),
+    }
+}
+
+fn hardware_u32(info: &plist::Dictionary, key: &'static str) -> Result<u32, Box<IdentityRefusal>> {
+    let value = hardware_value(info, key)?;
+    value
+        .as_unsigned_integer()
+        .and_then(|unsigned| u32::try_from(unsigned).ok())
+        .ok_or_else(|| hardware_unreadable(key, value))
+}
+
+fn hardware_flag(
+    info: &plist::Dictionary,
+    key: &'static str,
+) -> Result<bool, Box<IdentityRefusal>> {
+    let value = hardware_value(info, key)?;
+    match value {
+        plist::Value::Boolean(flag) => Ok(*flag),
+        plist::Value::Integer(integer) => match integer.as_unsigned() {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            _ => Err(hardware_unreadable(key, value)),
+        },
+        _ => Err(hardware_unreadable(key, value)),
+    }
+}
+
 impl LocalPolicyIdentity {
     pub fn from_root_ticket(ticket: &[u8]) -> Result<Self, Box<IdentityRefusal>> {
         let manifest = read_manifest(ticket).map_err(|error: TicketError| {
@@ -203,6 +371,23 @@ impl LocalPolicyIdentity {
         )?;
         let production_mode = boolean_property(manifest, TAG_PRODUCTION_MODE)?;
         let security_mode = boolean_property(manifest, TAG_SECURITY_MODE)?;
+        Ok(Self {
+            ecid,
+            chip_id,
+            board_id,
+            security_domain,
+            production_mode,
+            security_mode,
+        })
+    }
+
+    pub fn from_hardware_info(info: &plist::Dictionary) -> Result<Self, Box<IdentityRefusal>> {
+        let ecid = hardware_unique_chip_id(info)?;
+        let chip_id = hardware_u32(info, HARDWARE_INFO_CHIP_ID)?;
+        let board_id = hardware_u32(info, HARDWARE_INFO_BOARD_ID)?;
+        let security_domain = hardware_u32(info, HARDWARE_INFO_SECURITY_DOMAIN)?;
+        let production_mode = hardware_flag(info, HARDWARE_INFO_PRODUCTION_MODE)?;
+        let security_mode = hardware_flag(info, HARDWARE_INFO_SECURITY_MODE)?;
         Ok(Self {
             ecid,
             chip_id,
@@ -1308,6 +1493,119 @@ mod tests {
                 security_mode: true,
             }
         );
+    }
+
+    // The reply restored_external's 0x10000d284 builds for QueryValue HardwareInfo on a
+    // vma2 guest: integers for the /chosen numbers, booleans for
+    // certificate-production-status and the MobileGestalt answers.
+    fn vma2_hardware_info() -> plist::Dictionary {
+        let mut info = plist::Dictionary::new();
+        info.insert("ChipID".into(), plist::Value::Integer(0xfe00_u64.into()));
+        info.insert("BoardID".into(), plist::Value::Integer(0x20_u64.into()));
+        info.insert(
+            "UniqueChipID".into(),
+            plist::Value::Integer(0x0123_4567_89ab_cdef_u64.into()),
+        );
+        info.insert("SecurityDomain".into(), plist::Value::Integer(1_u64.into()));
+        info.insert("ProductionMode".into(), plist::Value::Boolean(true));
+        info.insert("SecurityMode".into(), plist::Value::Boolean(true));
+        info.insert("SupportsImage4".into(), plist::Value::Boolean(true));
+        info.insert(
+            "EffectiveProductionMode".into(),
+            plist::Value::Boolean(true),
+        );
+        info.insert("EffectiveSecurityMode".into(), plist::Value::Boolean(true));
+        info
+    }
+
+    #[test]
+    fn the_device_hardware_info_names_the_part_a_global_ticket_does_not() {
+        let identity = LocalPolicyIdentity::from_hardware_info(&vma2_hardware_info())
+            .expect("restored's HardwareInfo reply states every identity term");
+        assert_eq!(
+            identity,
+            LocalPolicyIdentity {
+                ecid: 0x0123_4567_89ab_cdef,
+                chip_id: 0xfe00,
+                board_id: 0x20,
+                security_domain: 1,
+                production_mode: true,
+                security_mode: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_request_built_from_the_device_hardware_info_carries_the_device_terms() {
+        let identity = LocalPolicyIdentity::from_hardware_info(&vma2_hardware_info())
+            .expect("restored's HardwareInfo reply states every identity term");
+        let inputs = RecoveryOsLocalPolicyInputs::read(&recorded_arguments(&policy_nonce()))
+            .expect("the recorded arguments are the three terms the guest sends");
+        let body = RecoveryOsLocalPolicyRequest::new(identity, inputs).body();
+
+        assert_eq!(
+            body["ApECID"].as_unsigned_integer(),
+            Some(0x0123_4567_89ab_cdef),
+            "ApECID is the UniqueChipID the device stated"
+        );
+        assert_eq!(body["ApChipID"].as_signed_integer(), Some(0xfe00));
+        assert_eq!(body["ApBoardID"].as_signed_integer(), Some(0x20));
+        assert_eq!(body["ApSecurityDomain"].as_signed_integer(), Some(1));
+        assert_eq!(body["ApProductionMode"].as_boolean(), Some(true));
+        assert_eq!(body["ApSecurityMode"].as_boolean(), Some(true));
+        assert_eq!(body["@ApImg4Ticket"].as_boolean(), Some(true));
+        assert_eq!(body["Ap,LocalBoot"].as_boolean(), Some(true));
+        assert_eq!(
+            body["Ap,NextStageIM4MHash"].as_data(),
+            Some(&RECORDED_NEXT_STAGE_SHA384[..]),
+            "the next stage hash is the guest's own argument, whatever named the part"
+        );
+        assert_eq!(
+            body["Ap,RecoveryOSPolicyNonceHash"].as_data(),
+            Some(&policy_nonce()[..])
+        );
+        assert_eq!(
+            body["Ap,VolumeUUID"].as_data(),
+            Some(
+                &[
+                    0x3D, 0x32, 0x87, 0xDE, 0x28, 0x0D, 0x46, 0x19, 0xAA, 0xAB, 0xD9, 0x74, 0x69,
+                    0xCA, 0x9C, 0x71
+                ][..]
+            )
+        );
+        let policy = body["Ap,LocalPolicy"]
+            .as_dictionary()
+            .expect("Ap,LocalPolicy is the nested dictionary 0x2842e8 builds");
+        assert_eq!(
+            policy["Digest"].as_data(),
+            Some(&RECOVERY_OS_LOCAL_POLICY_IM4P_SHA384[..])
+        );
+        assert_eq!(policy["Trusted"].as_boolean(), Some(true));
+    }
+
+    #[test]
+    fn an_ecid_with_bit_63_set_arrives_signed_and_is_carried_as_the_same_bits() {
+        let mut info = vma2_hardware_info();
+        info.insert(
+            "UniqueChipID".into(),
+            plist::Value::Integer((-0x7edc_ba98_7654_3211_i64).into()),
+        );
+        let identity = LocalPolicyIdentity::from_hardware_info(&info)
+            .expect("a kCFNumberSInt64Type ECID with bit 63 set is still the device's ECID");
+        assert_eq!(identity.ecid, 0x8123_4567_89ab_cdef);
+    }
+
+    #[test]
+    fn a_hardware_info_reply_without_an_identity_term_is_refused_by_name() {
+        let mut info = vma2_hardware_info();
+        info.remove("SecurityDomain");
+        let refusal = LocalPolicyIdentity::from_hardware_info(&info)
+            .expect_err("the request term has nothing to come from");
+        assert_eq!(
+            refusal.name(),
+            "recovery-os-local-policy-identity-hardware-info-key-missing"
+        );
+        assert!(refusal.to_string().contains("SecurityDomain"), "{refusal}");
     }
 
     #[test]

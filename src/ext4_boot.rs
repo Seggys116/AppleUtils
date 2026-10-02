@@ -17,6 +17,31 @@ fn u32_at(data: &[u8], at: usize) -> Result<u32, String> {
     ))
 }
 
+/// ext4 inode crc32c over seed, inode number, generation and the inode with its checksum
+/// fields zeroed; the high half exists only when i_extra_isize reaches i_checksum_hi.
+pub(crate) fn inode_checksum(seed: u32, number: u32, raw: &[u8]) -> Result<(u32, bool), String> {
+    use crate::crypto::crc32::crc32c_update as crc;
+    if raw.len() < 128 || (raw.len() > 128 && raw.len() < 0x84) {
+        return Err("invalid ext4 inode size for checksum".into());
+    }
+    let mut checksum = crc(crc(seed, &number.to_le_bytes()), &raw[100..104]);
+    checksum = crc(checksum, &raw[..0x7c]);
+    checksum = crc(checksum, &[0, 0]);
+    checksum = crc(checksum, &raw[0x7e..128]);
+    let mut has_high = false;
+    if raw.len() > 128 {
+        checksum = crc(checksum, &raw[128..0x82]);
+        let mut offset = 0x82;
+        if 128 + u16_at(raw, 0x80)? as usize >= 0x84 {
+            checksum = crc(checksum, &[0, 0]);
+            offset = 0x84;
+            has_high = true;
+        }
+        checksum = crc(checksum, &raw[offset..]);
+    }
+    Ok((checksum, has_high))
+}
+
 pub(crate) struct Ext4<R> {
     source: R,
     length: u64,
@@ -27,11 +52,18 @@ pub(crate) struct Ext4<R> {
     descriptor_start: u64,
     inode_count: u32,
     protected: Vec<(u64, u64)>,
+    inode_checksum_seed: Option<u32>,
 }
 
 pub(crate) struct FileData {
     pub bytes: Vec<u8>,
     pub ranges: Vec<(u64, usize)>,
+}
+
+pub(crate) struct FileResize {
+    pub ranges: Vec<(u64, usize)>,
+    pub inode_offset: u64,
+    pub inode: Vec<u8>,
 }
 
 impl<R: Read + Seek> Ext4<R> {
@@ -78,6 +110,18 @@ impl<R: Read + Seek> Ext4<R> {
         {
             return Err("invalid ext4 inode geometry".into());
         }
+        let inode_checksum_seed = if u32_at(&sb, 100)? & 0x400 != 0 {
+            if sb[0x175] != 1 {
+                return Err("ext4 metadata checksum type is not crc32c".into());
+            }
+            Some(if incompat & 0x2000 != 0 {
+                u32_at(&sb, 0x270)?
+            } else {
+                crate::crypto::crc32::crc32c_update(u32::MAX, &sb[0x68..0x78])
+            })
+        } else {
+            None
+        };
         let mut fs = Self {
             source,
             length,
@@ -88,6 +132,7 @@ impl<R: Read + Seek> Ext4<R> {
             descriptor_start: (u32_at(&sb, 20)? as u64 + 1) * block,
             inode_count: u32_at(&sb, 0)?,
             protected: vec![(0, 2048)],
+            inode_checksum_seed,
         };
         fs.protect_metadata(&sb)?;
         Ok(Some(fs))
@@ -189,6 +234,11 @@ impl<R: Read + Seek> Ext4<R> {
     }
 
     fn inode(&mut self, number: u32) -> Result<Vec<u8>, String> {
+        let offset = self.inode_offset(number)?;
+        self.read(offset, self.inode_size as usize)
+    }
+
+    fn inode_offset(&mut self, number: u32) -> Result<u64, String> {
         if number == 0 || number > self.inode_count {
             return Err("invalid ext4 inode number".into());
         }
@@ -203,13 +253,12 @@ impl<R: Read + Seek> Ext4<R> {
             } else {
                 0
             };
-        let offset = table
+        table
             .checked_mul(self.block)
             .and_then(|n| {
                 n.checked_add(((number - 1) % self.inodes_per_group) as u64 * self.inode_size)
             })
-            .ok_or("ext4 inode offset overflow")?;
-        self.read(offset, self.inode_size as usize)
+            .ok_or_else(|| "ext4 inode offset overflow".to_string())
     }
 
     fn extents(
@@ -270,7 +319,18 @@ impl<R: Read + Seek> Ext4<R> {
 
     fn contents(&mut self, inode: &[u8]) -> Result<FileData, String> {
         let size = u32_at(inode, 4)? as u64 | (u32_at(inode, 108)? as u64) << 32;
-        if size > 16 * 1024 * 1024 {
+        let ranges = self.mapped(inode, size)?;
+        let mut bytes = Vec::with_capacity(size as usize);
+        for &(offset, len) in &ranges {
+            bytes.extend(self.read(offset, len)?);
+        }
+        Ok(FileData { bytes, ranges })
+    }
+
+    /// Physical byte ranges holding the first `length` bytes of the file, taken only from
+    /// blocks its extents already map.
+    fn mapped(&mut self, inode: &[u8], length: u64) -> Result<Vec<(u64, usize)>, String> {
+        if length > 16 * 1024 * 1024 {
             return Err("ext4 boot metadata file exceeds size limit".into());
         }
         if u32_at(inode, 32)? & 0x80000 == 0 {
@@ -301,69 +361,188 @@ impl<R: Read + Seek> Ext4<R> {
             physical_ranges.push((start, stop));
             previous_end = end;
         }
-        let mut bytes = Vec::with_capacity(size as usize);
+        let mut covered = 0u64;
         let mut ranges = Vec::new();
         for (logical, physical, blocks) in extents {
-            if bytes.len() as u64 >= size {
+            if covered >= length {
                 break;
             }
-            if logical * self.block != bytes.len() as u64 {
+            if logical * self.block != covered {
                 return Err("sparse or overlapping ext4 boot metadata file".into());
             }
-            let len = (blocks * self.block).min(size - bytes.len() as u64) as usize;
+            let len = (blocks * self.block).min(length - covered) as usize;
             let offset = physical
                 .checked_mul(self.block)
                 .ok_or("ext4 data offset overflow")?;
-            bytes.extend(self.read(offset, len)?);
             ranges.push((offset, len));
+            covered += len as u64;
         }
-        if bytes.len() as u64 != size {
+        if covered != length {
             return Err("incomplete ext4 file extents".into());
         }
-        Ok(FileData { bytes, ranges })
+        Ok(ranges)
     }
 
-    pub fn file(&mut self, path: &str) -> Result<Option<FileData>, String> {
+    /// Plans a change of a regular file's length inside the blocks it already owns: the data
+    /// ranges for the new length and the inode carrying the new size and, on a
+    /// metadata_csum filesystem, its recomputed checksum. Allocation is never changed, so a
+    /// length past the last mapped block is refused.
+    pub fn resize_in_place(
+        &mut self,
+        path: &str,
+        length: u64,
+    ) -> Result<Option<FileResize>, String> {
+        let Some(number) = self.inode_at(path)? else {
+            return Ok(None);
+        };
+        let inode_offset = self.inode_offset(number)?;
+        let mut inode = self.inode(number)?;
+        if u16_at(&inode, 0)? & 0xf000 != 0x8000 {
+            return Ok(None);
+        }
+        let ranges = self
+            .mapped(&inode, length)
+            .map_err(|e| format!("{path} cannot hold {length} bytes in its blocks: {e}"))?;
+        if let Some(seed) = self.inode_checksum_seed {
+            let (checksum, has_high) = inode_checksum(seed, number, &inode)?;
+            let stored_low = u16_at(&inode, 0x7c)?;
+            let stored_high = if has_high { u16_at(&inode, 0x82)? } else { 0 };
+            if stored_low != checksum as u16 || (has_high && stored_high != (checksum >> 16) as u16)
+            {
+                return Err(format!("{path} inode checksum does not verify"));
+            }
+        }
+        inode[4..8].copy_from_slice(&(length as u32).to_le_bytes());
+        inode[108..112].copy_from_slice(&((length >> 32) as u32).to_le_bytes());
+        if let Some(seed) = self.inode_checksum_seed {
+            let (checksum, has_high) = inode_checksum(seed, number, &inode)?;
+            inode[0x7c..0x7e].copy_from_slice(&(checksum as u16).to_le_bytes());
+            if has_high {
+                inode[0x82..0x84].copy_from_slice(&((checksum >> 16) as u16).to_le_bytes());
+            }
+        }
+        Ok(Some(FileResize {
+            ranges,
+            inode_offset,
+            inode,
+        }))
+    }
+
+    fn directory_bytes(&mut self, number: u32) -> Result<Option<Vec<u8>>, String> {
+        let inode = self.inode(number)?;
+        if u16_at(&inode, 0)? & 0xf000 != 0x4000 {
+            return Ok(None);
+        }
+        Ok(Some(self.contents(&inode)?.bytes))
+    }
+
+    fn walk_dirent(dir: &[u8], at: usize, block: u64) -> Result<(u32, usize, &[u8], u8), String> {
+        let item = &dir[at..];
+        let len = u16_at(item, 4)? as usize;
+        let name_len = *item.get(6).ok_or("truncated ext4 directory entry")? as usize;
+        let file_type = *item.get(7).ok_or("truncated ext4 directory entry")?;
+        if len < 8
+            || !len.is_multiple_of(4)
+            || len > item.len()
+            || name_len > len - 8
+            || at as u64 % block + len as u64 > block
+        {
+            return Err("invalid ext4 directory entry".into());
+        }
+        Ok((u32_at(item, 0)?, len, &item[8..8 + name_len], file_type))
+    }
+
+    fn lookup(&mut self, parent: u32, name: &str) -> Result<Option<u32>, String> {
+        let Some(dir) = self.directory_bytes(parent)? else {
+            return Ok(None);
+        };
+        let mut at = 0;
+        while at < dir.len() {
+            let (ino, len, bytes, _) = Self::walk_dirent(&dir, at, self.block)?;
+            if ino != 0 && bytes == name.as_bytes() {
+                return Ok(Some(ino));
+            }
+            at += len;
+        }
+        Ok(None)
+    }
+
+    fn inode_at(&mut self, path: &str) -> Result<Option<u32>, String> {
         let mut number = 2;
         for component in path.split('/').filter(|s| !s.is_empty()) {
             if component == "." || component == ".." {
                 return Err("invalid ext4 lookup path".into());
             }
-            let inode = self.inode(number)?;
-            if u16_at(&inode, 0)? & 0xf000 != 0x4000 {
-                return Err("ext4 path component is not a directory".into());
-            }
-            let dir = self.contents(&inode)?.bytes;
-            let mut at = 0;
-            let mut found = None;
-            while at < dir.len() {
-                let item = &dir[at..];
-                let len = u16_at(item, 4)? as usize;
-                let name_len = *item.get(6).ok_or("truncated ext4 directory entry")? as usize;
-                if len < 8
-                    || !len.is_multiple_of(4)
-                    || len > item.len()
-                    || name_len > len - 8
-                    || at as u64 % self.block + len as u64 > self.block
-                {
-                    return Err("invalid ext4 directory entry".into());
-                }
-                let ino = u32_at(item, 0)?;
-                if ino != 0 && &item[8..8 + name_len] == component.as_bytes() {
-                    found = Some(ino);
-                    break;
-                }
-                at += len;
-            }
-            let Some(next) = found else {
+            let Some(next) = self.lookup(number, component)? else {
                 return Ok(None);
             };
             number = next;
         }
+        Ok(Some(number))
+    }
+
+    pub fn file(&mut self, path: &str) -> Result<Option<FileData>, String> {
+        let Some(number) = self.inode_at(path)? else {
+            return Ok(None);
+        };
         let inode = self.inode(number)?;
         if u16_at(&inode, 0)? & 0xf000 != 0x8000 {
-            return Err("ext4 boot metadata path is not a regular file".into());
+            return Ok(None);
         }
         self.contents(&inode).map(Some)
+    }
+
+    pub fn files_in(&mut self, path: &str) -> Result<Option<Vec<String>>, String> {
+        let Some(number) = self.inode_at(path)? else {
+            return Ok(None);
+        };
+        let Some(dir) = self.directory_bytes(number)? else {
+            return Ok(None);
+        };
+        let mut names = Vec::new();
+        let mut at = 0;
+        while at < dir.len() {
+            let (ino, len, bytes, file_type) = Self::walk_dirent(&dir, at, self.block)?;
+            if ino != 0 && file_type != 2 {
+                let name =
+                    std::str::from_utf8(bytes).map_err(|_| "ext4 directory name is not UTF-8")?;
+                if name != "." && name != ".." {
+                    if names.len() >= 256 {
+                        return Err("ext4 directory listing limit exceeded".into());
+                    }
+                    names.push(name.to_string());
+                }
+            }
+            at += len;
+        }
+        Ok(Some(names))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Inode 1616 of the Fedora Asahi Remix 44 Workstation boot.img, its BLS entry, with the
+    // filesystem's s_checksum_seed. mkfs.ext4 and the kernel wrote the stored checksum.
+    const FEDORA_BLS_INODE: &str = "a48100009f0100006aee9a6a6aee9a6a6aee9a6a00000000000001000800000000000800080000000af3010004000000000000000000000001000000411001000000000000000000000000000000000000000000000000000000000000000000000000009db84d2000000000000000000000000000000000000000002d34000020008fae3026e32a3026e32a0c96c12a6aee9a6a0467f6060000000000000000000002ea07064000000000001c0000000000000073656c696e7578000000000000000000000000000000000000000000000000000000000000000000000000000000000073797374656d5f753a6f626a6563745f723a626f6f745f743a733000";
+    const FEDORA_CHECKSUM_SEED: u32 = 0xd088_1913;
+
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn inode_checksum_matches_mkfs_written_inode() {
+        let inode = hex(FEDORA_BLS_INODE);
+        assert_eq!(inode.len(), 256);
+        let (checksum, has_high) = inode_checksum(FEDORA_CHECKSUM_SEED, 1616, &inode).unwrap();
+        assert!(has_high);
+        assert_eq!(checksum, 0xae8f_342d);
+        assert_eq!(u16_at(&inode, 0x7c).unwrap(), 0x342d);
+        assert_eq!(u16_at(&inode, 0x82).unwrap(), 0xae8f);
     }
 }

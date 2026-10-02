@@ -10,9 +10,25 @@ pub fn embedded_panic_crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
+pub fn crc32c_update(mut crc: u32, bytes: &[u8]) -> u32 {
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0x82f6_3b78 & mask);
+        }
+    }
+    crc
+}
+
 #[cfg(test)]
 mod tests {
-    use super::embedded_panic_crc32;
+    use super::{crc32c_update, embedded_panic_crc32};
+
+    #[test]
+    fn crc32c_matches_published_vector() {
+        assert_eq!(!crc32c_update(u32::MAX, b"123456789"), 0xe306_9283);
+    }
 
     #[test]
     fn crc32_matches_published_vectors() {
