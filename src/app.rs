@@ -11,6 +11,7 @@ use crate::banner;
 use crate::clip::ClipWatch;
 use crate::explorer::FileRow;
 use crate::explorer_image::{self, EntryKind, ExplorerView};
+use crate::ipsw_app::IpswState;
 use crate::recovery_model::{RecoveryAction, RecoveryStep};
 use crate::recovery_runtime::RecoveryRuntime;
 use crate::ui::GlyphPack;
@@ -21,10 +22,17 @@ pub enum Tool {
     Explorer,
     Repair,
     Asahi,
+    Ipsw,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 4] = [Tool::Recovery, Tool::Explorer, Tool::Repair, Tool::Asahi];
+    pub const ALL: [Tool; 5] = [
+        Tool::Recovery,
+        Tool::Explorer,
+        Tool::Repair,
+        Tool::Asahi,
+        Tool::Ipsw,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -32,6 +40,7 @@ impl Tool {
             Tool::Explorer => "APFS Explorer",
             Tool::Repair => "APFS Repair",
             Tool::Asahi => "Asahi Linux tooling",
+            Tool::Ipsw => "IPSW Export",
         }
     }
 
@@ -41,6 +50,7 @@ impl Tool {
             Tool::Explorer => "Pick a file, then browse the volume.",
             Tool::Repair => "Pick a path, then analysis, then repairs.",
             Tool::Asahi => "Update kernel and m1n1, or install Asahi Linux.",
+            Tool::Ipsw => "Browse an IPSW, then export files decrypted and decompressed.",
         }
     }
 }
@@ -52,6 +62,7 @@ pub enum Screen {
     Explorer,
     Repair,
     Asahi,
+    Ipsw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,7 +278,7 @@ pub struct Suggestion {
 
 #[derive(Debug, Clone, Default)]
 pub struct HitMap {
-    pub cards: [Rect; 4],
+    pub cards: [Rect; Tool::ALL.len()],
     pub asahi_actions: [Rect; 2],
     pub asahi_sources: [Rect; 2],
     pub asahi_console: [Rect; 2],
@@ -276,6 +287,10 @@ pub struct HitMap {
     pub explorer_volume_rows: Vec<Rect>,
     pub explorer_file_rows: Vec<Rect>,
     pub repair_finding_rows: Vec<Rect>,
+    pub ipsw_tree_rows: Vec<Rect>,
+    pub ipsw_tree_start: usize,
+    pub ipsw_option_rows: Vec<Rect>,
+    pub ipsw_option_start: usize,
     pub path_box: Rect,
 }
 
@@ -345,6 +360,22 @@ impl HitMap {
         self.repair_finding_rows
             .iter()
             .position(|rect| rect.width > 0 && rect.height > 0 && rect.contains(pos))
+    }
+
+    pub fn ipsw_tree_row_at(&self, col: u16, row: u16) -> Option<usize> {
+        let pos = Position::new(col, row);
+        self.ipsw_tree_rows
+            .iter()
+            .position(|rect| rect.width > 0 && rect.height > 0 && rect.contains(pos))
+            .map(|offset| self.ipsw_tree_start + offset)
+    }
+
+    pub fn ipsw_option_at(&self, col: u16, row: u16) -> Option<usize> {
+        let pos = Position::new(col, row);
+        self.ipsw_option_rows
+            .iter()
+            .position(|rect| rect.width > 0 && rect.height > 0 && rect.contains(pos))
+            .map(|offset| self.ipsw_option_start + offset)
     }
 
     pub fn path_box_at(&self, col: u16, row: u16) -> bool {
@@ -421,6 +452,7 @@ pub struct App {
     pub asahi_injected_metadata: Option<String>,
     pub asahi_output_path: Option<std::path::PathBuf>,
     pub asahi_slider_hover: bool,
+    pub ipsw: IpswState,
     last_tick: Instant,
 }
 
@@ -511,8 +543,23 @@ impl App {
             asahi_injected_metadata: None,
             asahi_output_path: None,
             asahi_slider_hover: false,
+            ipsw: IpswState::default(),
             last_tick: Instant::now(),
         }
+    }
+
+    pub fn available_tools(&self) -> Vec<Tool> {
+        Tool::ALL
+            .iter()
+            .copied()
+            .filter(|tool| *tool != Tool::Ipsw || self.ipsw.cli.is_some())
+            .collect()
+    }
+
+    pub fn set_ipsw_cli(&mut self, cli: Option<PathBuf>) {
+        self.ipsw.cli = cli;
+        let last = self.available_tools().len().saturating_sub(1);
+        self.selected = self.selected.min(last);
     }
 
     pub fn tick(&mut self) {
@@ -528,6 +575,7 @@ impl App {
         self.poll_asahi_job();
         self.poll_explorer_job();
         self.poll_repair_job();
+        self.poll_ipsw_job();
         if self.explorer_job_rx.is_some() {
             Self::nudge_progress(&mut self.explorer_progress, 0.04, 0.92);
         }
@@ -551,7 +599,8 @@ impl App {
                     | AsahiStep::WaitM1n1
                     | AsahiStep::WaitIpsw
             ),
-            _ => false,
+            Screen::Ipsw => self.ipsw.wants_clipboard(),
+            Screen::Picker => false,
         }
     }
 
@@ -592,7 +641,7 @@ impl App {
         Some(path)
     }
 
-    fn take_picker_file(&mut self) -> Option<String> {
+    pub(crate) fn take_picker_file(&mut self) -> Option<String> {
         let path = self.confirm_clip_file()?;
         self.clear_path_input();
         Some(path)
@@ -616,7 +665,8 @@ impl App {
                     | AsahiStep::WaitIpsw
             ),
             Screen::Recovery => self.recovery.model.step() == RecoveryStep::PickFile,
-            _ => false,
+            Screen::Ipsw => self.ipsw.wants_clipboard(),
+            Screen::Picker => false,
         }
     }
 
@@ -628,7 +678,7 @@ impl App {
         self.path_editing = true;
     }
 
-    fn typing_char(key: KeyEvent) -> Option<char> {
+    pub(crate) fn typing_char(key: KeyEvent) -> Option<char> {
         let KeyCode::Char(c) = key.code else {
             return None;
         };
@@ -715,18 +765,18 @@ impl App {
         }
     }
 
-    fn clear_path_input(&mut self) {
+    pub(crate) fn clear_path_input(&mut self) {
         self.path_input.clear();
         self.path_cursor = 0;
         self.path_editing = false;
     }
 
-    fn enter_file_picker(&mut self) {
+    pub(crate) fn enter_file_picker(&mut self) {
         self.clear_path_input();
         self.clip.force_refresh();
     }
 
-    fn file_picker_edit_key(&mut self, key: KeyEvent) -> bool {
+    pub(crate) fn file_picker_edit_key(&mut self, key: KeyEvent) -> bool {
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.path_editing = !self.path_editing;
             return true;
@@ -779,7 +829,8 @@ impl App {
     }
 
     pub fn current_tool(&self) -> Tool {
-        Tool::ALL[self.selected]
+        let tools = self.available_tools();
+        tools[self.selected.min(tools.len() - 1)]
     }
 
     pub fn handle_event(&mut self, event: Event) -> bool {
@@ -833,6 +884,9 @@ impl App {
                 if self.screen == Screen::Explorer && self.explorer_phase == ExplorerPhase::Browse {
                     self.explorer_click(mouse.column, mouse.row);
                 }
+                if self.screen == Screen::Ipsw {
+                    self.ipsw_click(mouse.column, mouse.row);
+                }
                 if self.screen == Screen::Repair
                     && self.repair_step != RepairStep::Path
                     && let Some(index) = self.hits.repair_finding_at(mouse.column, mouse.row)
@@ -843,15 +897,23 @@ impl App {
                 false
             }
             MouseEventKind::ScrollDown if self.screen == Screen::Picker => {
-                self.selected = (self.selected + 1) % Tool::ALL.len();
+                self.selected = (self.selected + 1) % self.available_tools().len();
                 false
             }
             MouseEventKind::ScrollUp if self.screen == Screen::Picker => {
                 self.selected = if self.selected == 0 {
-                    Tool::ALL.len() - 1
+                    self.available_tools().len() - 1
                 } else {
                     self.selected - 1
                 };
+                false
+            }
+            MouseEventKind::ScrollDown if self.screen == Screen::Ipsw => {
+                self.ipsw_scroll(mouse.column, mouse.row, 1);
+                false
+            }
+            MouseEventKind::ScrollUp if self.screen == Screen::Ipsw => {
+                self.ipsw_scroll(mouse.column, mouse.row, -1);
                 false
             }
             MouseEventKind::ScrollDown
@@ -927,6 +989,9 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        if self.screen == Screen::Ipsw && self.ipsw_paste(text) {
+            return;
+        }
         if self.on_path_entry() {
             self.focus_path_input();
             let line = text
@@ -976,6 +1041,7 @@ impl App {
             Screen::Explorer => self.explorer_key(key),
             Screen::Repair => self.repair_key(key),
             Screen::Asahi => self.asahi_key(key),
+            Screen::Ipsw => self.ipsw_key(key),
         }
     }
 
@@ -989,14 +1055,14 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = if self.selected == 0 {
-                    Tool::ALL.len() - 1
+                    self.available_tools().len() - 1
                 } else {
                     self.selected - 1
                 };
                 false
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.selected = (self.selected + 1) % Tool::ALL.len();
+                self.selected = (self.selected + 1) % self.available_tools().len();
                 false
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
@@ -1005,7 +1071,7 @@ impl App {
             }
             KeyCode::Char(c) if c.is_ascii_digit() => {
                 let n = c.to_digit(10).unwrap() as usize;
-                if (1..=Tool::ALL.len()).contains(&n) {
+                if (1..=self.available_tools().len()).contains(&n) {
                     self.selected = n - 1;
                     self.open_selected();
                 }
@@ -1501,7 +1567,7 @@ impl App {
         };
     }
 
-    fn nudge_progress(slot: &mut Option<f64>, step: f64, cap: f64) {
+    pub(crate) fn nudge_progress(slot: &mut Option<f64>, step: f64, cap: f64) {
         let next = slot.unwrap_or(0.06) + step;
         *slot = Some(next.min(cap));
     }
@@ -1747,6 +1813,11 @@ impl App {
                 self.asahi_action_cursor = 0;
                 self.asahi_error = None;
                 self.asahi_status.clear();
+            }
+            Tool::Ipsw => {
+                self.screen = Screen::Ipsw;
+                self.ipsw.reset_session();
+                self.enter_file_picker();
             }
         }
     }
@@ -2263,8 +2334,11 @@ impl App {
         }
     }
 
-    fn back_to_picker(&mut self) {
+    pub(crate) fn back_to_picker(&mut self) {
         self.clear_path_input();
+        if self.screen == Screen::Ipsw {
+            self.ipsw.reset_session();
+        }
         self.screen = Screen::Picker;
     }
 
@@ -3400,6 +3474,7 @@ mod tests {
             Tool::Explorer => Screen::Explorer,
             Tool::Repair => Screen::Repair,
             Tool::Asahi => Screen::Asahi,
+            Tool::Ipsw => Screen::Ipsw,
         }
     }
 
@@ -3641,9 +3716,10 @@ mod tests {
     fn picker_jump_keys_cover_every_tool_and_asahi_actions_are_independent() {
         let mut app = App::new();
         assert_eq!(app.screen, Screen::Picker);
-        assert_eq!(Tool::ALL.len(), 4);
+        assert_eq!(Tool::ALL.len(), 5);
+        assert_eq!(app.available_tools().len(), 4, "no ipsw command, no card");
 
-        for (index, tool) in Tool::ALL.iter().enumerate() {
+        for (index, tool) in app.available_tools().iter().enumerate() {
             let digit = char::from_digit((index + 1) as u32, 10).unwrap();
             press(&mut app, KeyCode::Char(digit));
             assert_eq!(app.selected, index, "jump key {}", digit);

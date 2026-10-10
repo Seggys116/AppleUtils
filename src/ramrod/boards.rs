@@ -41,6 +41,19 @@ pub fn describe_board(class: &str, platform: Option<&str>) -> BoardLabel {
     }
 }
 
+/// The chip of a board the bundled data knows ("M2" for `j473ap`), when it is a single usable
+/// chip name. Combined labels such as "A12X/A12Z Bionic" give `None`.
+#[must_use]
+pub fn board_chip(class: &str) -> Option<String> {
+    let key = class.trim().to_ascii_lowercase();
+    let record = device_catalog().boards.get(&key)?;
+    record
+        .cpu
+        .as_deref()
+        .and_then(usable_chip_label)
+        .map(str::to_string)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RestoreCatalog {
     pub product_version: Option<String>,
@@ -252,6 +265,18 @@ mod tests {
 
         let ipad = describe_board("J617AP", None);
         assert_eq!(ipad.title, "iPad Pro (11-inch) (4th generation, M2, Wi-Fi)");
+    }
+
+    #[test]
+    fn board_chip_reports_single_usable_chips_only() {
+        assert_eq!(board_chip("j473ap").as_deref(), Some("M2"));
+        assert_eq!(board_chip("J414CAP").as_deref(), Some("M2 Max"));
+        assert_eq!(
+            board_chip("j273aap"),
+            None,
+            "a combined chip label is not usable"
+        );
+        assert_eq!(board_chip("j999ap"), None);
     }
 
     #[test]

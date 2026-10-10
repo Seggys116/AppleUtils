@@ -8,15 +8,16 @@ use crate::ui;
 #[derive(Debug, Clone, Copy)]
 pub struct PickerLayout {
     pub banner: Option<(Rect, Banner)>,
-    pub cards: [Rect; 4],
+    pub cards: [Rect; Tool::ALL.len()],
 }
 
-pub fn layout(area: Rect, order: &banner::BannerOrder) -> PickerLayout {
+/// Slots past `count` stay empty so hit-testing ignores them.
+pub fn layout(area: Rect, order: &banner::BannerOrder, count: usize) -> PickerLayout {
     let pad_x = edge_x(area.width);
     let pad_y = edge_y(area.height);
     let inner = ui::inset(area, pad_x, pad_y);
 
-    let n = Tool::ALL.len() as u16;
+    let n = count.clamp(1, Tool::ALL.len()) as u16;
     let card_h = if inner.height >= n * 5 { 4 } else { 3 };
     let card_gap = u16::from(inner.height >= n * 6);
     let cards_h = card_h * n + card_gap * n.saturating_sub(1);
@@ -55,10 +56,10 @@ pub fn layout(area: Rect, order: &banner::BannerOrder) -> PickerLayout {
         .saturating_add(group.height)
         .saturating_sub(y)
         .max(1);
-    let mut cards = [Rect::default(); 4];
+    let mut cards = [Rect::default(); Tool::ALL.len()];
     let card_x = group.x + group.width.saturating_sub(card_w) / 2;
     let mut cy = y;
-    for slot in &mut cards {
+    for slot in cards.iter_mut().take(n as usize) {
         let height = card_h.min(remain.saturating_sub(cy.saturating_sub(y)).max(1));
         *slot = Rect {
             x: card_x,
@@ -96,13 +97,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let plan = layout(area, &app.banner_order);
+    let tools = app.available_tools();
+    let plan = layout(area, &app.banner_order, tools.len());
     app.hits.cards = plan.cards;
 
     if let Some((rect, size)) = plan.banner {
         banner::render_banner(frame, rect, size);
     }
-    for (i, (tool, rect)) in Tool::ALL.iter().zip(plan.cards).enumerate() {
+    for (i, (tool, rect)) in tools.iter().zip(plan.cards).enumerate() {
         if rect.width > 0 && rect.height > 0 {
             ui::render_choice_card(frame, rect, tool.name(), tool.blurb(), i == app.selected);
         }

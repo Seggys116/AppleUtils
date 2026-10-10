@@ -30,8 +30,19 @@ run the toolkit. APFS and FAT image work is done in-process.
 cargo run
 ```
 
-Starts the picker. From there: Recovery, APFS Explorer, APFS Repair, or Asahi
-Linux tooling.
+Starts the picker. From there: Recovery, APFS Explorer, APFS Repair, Asahi
+Linux tooling, or IPSW Export.
+
+IPSW Export appears only when the optional `ipsw` command is installed (see
+Requirements). Pick an `.ipsw`, then browse its file tree: space selects a file
+or a whole folder, `/` filters, and the options pane picks what happens on the
+way out. `.aea` images are decrypted (with your own AEA key, or the one `ipsw`
+fetches from Apple), IM4P payloads are decompressed, and `ipsw extract`
+components such as the kernelcache or dyld shared cache can be added to the
+export. Press `e` and choose an output folder (the default is `<archive>-export`
+next to the archive); files are streamed out of the archive with their
+checksums verified. Everything temporary is cleaned up
+automatically, including when you cancel or quit mid-export.
 
 ## CLI
 

@@ -50,6 +50,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     crate::explorer::render(frame, body, app);
     crate::repair::render(frame, body, app);
     crate::asahi::render(frame, body, app);
+    crate::ipsw_ui::render(frame, body, app);
     render_footer(frame, footer, app);
 }
 
@@ -74,6 +75,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         Screen::Explorer => "EXPLORER",
         Screen::Repair => "REPAIR",
         Screen::Asahi => "ASAHI",
+        Screen::Ipsw => "IPSW",
     };
 
     let [left, right] = Layout::horizontal([
@@ -110,7 +112,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn path_picker_hints(app: &App, width: u16) -> &'static [&'static str] {
+pub(crate) fn path_picker_hints(app: &App, width: u16) -> &'static [&'static str] {
     match (app.path_editing, width) {
         (true, w) if w >= 56 => &["type a path", "esc cancel", "enter"],
         (true, _) => &["type", "esc", "enter"],
@@ -127,15 +129,17 @@ fn path_picker_hints(app: &App, width: u16) -> &'static [&'static str] {
 }
 
 fn footer_hints(app: &App, width: u16) -> Line<'static> {
+    let jump = format!("1–{} jump", app.available_tools().len());
+    let picker_wide = [
+        "click open",
+        "↑↓ move",
+        "enter open",
+        jump.as_str(),
+        "g glyphs",
+        "q quit",
+    ];
     let parts: &[&str] = match (app.screen, width) {
-        (Screen::Picker, w) if w >= 78 => &[
-            "click open",
-            "↑↓ move",
-            "enter open",
-            "1–4 jump",
-            "g glyphs",
-            "q quit",
-        ],
+        (Screen::Picker, w) if w >= 78 => &picker_wide,
         (Screen::Picker, w) if w >= 56 => &["click", "↑↓", "enter", "g", "q"],
         (Screen::Picker, _) => &["click", "g", "q"],
         (Screen::Recovery, w)
@@ -304,6 +308,7 @@ fn footer_hints(app: &App, width: u16) -> Line<'static> {
         }
         (Screen::Asahi, w) if w >= 40 => &["esc back", "q quit"],
         (Screen::Asahi, _) => &["esc"],
+        (Screen::Ipsw, w) => crate::ipsw_ui::footer_hints(app, w),
     };
 
     let mut spans = Vec::new();
@@ -334,13 +339,47 @@ pub fn render_file_picker_with(
     clipboard_invalid: bool,
     typed_invalid: bool,
 ) {
+    render_file_picker_hinted(
+        frame,
+        area,
+        app,
+        title,
+        clipboard_invalid,
+        typed_invalid,
+        &PickerHints::default(),
+    );
+}
+
+pub struct PickerHints<'a> {
+    pub empty: &'a str,
+    pub folder: &'a str,
+}
+
+impl Default for PickerHints<'_> {
+    fn default() -> Self {
+        Self {
+            empty: "press Enter to search a folder for every remaining file",
+            folder: "from clipboard  ·  folder  ·  press Enter",
+        }
+    }
+}
+
+pub fn render_file_picker_hinted(
+    frame: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    title: &str,
+    clipboard_invalid: bool,
+    typed_invalid: bool,
+    hints: &PickerHints<'_>,
+) {
     let file = app.clip.file.as_ref();
     let typed = crate::clip::inspect(app.path_input.trim());
     let typing = app.path_editing || !app.path_input.is_empty();
     let (copy, path) = file_picker_stack(area, file.is_some(), typed.is_some());
     app.hits.path_box = path;
 
-    render_copy_card(frame, copy, file, title, typing, clipboard_invalid);
+    render_copy_card(frame, copy, file, title, typing, clipboard_invalid, hints);
     render_path_dialog(frame, path, app, typed.as_ref(), typed_invalid);
 }
 
@@ -399,6 +438,7 @@ fn render_copy_card(
     title: &str,
     typing: bool,
     invalid: bool,
+    hints: &PickerHints<'_>,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -429,7 +469,7 @@ fn render_copy_card(
             vec![
                 Line::from(Span::styled(
                     if info.kind == FileKind::Directory {
-                        "from clipboard  ·  folder  ·  press Enter"
+                        hints.folder
                     } else {
                         "from clipboard"
                     },
@@ -451,10 +491,7 @@ fn render_copy_card(
         }
         None => vec![
             Line::from(Span::styled("COPY A FILE OR FOLDER", theme::dim())),
-            Line::from(Span::styled(
-                "press Enter to search a folder for every remaining file",
-                theme::mute(),
-            )),
+            Line::from(Span::styled(hints.empty, theme::mute())),
             Line::from(""),
             Line::from(Span::styled("waiting", theme::wait())),
             Line::from(Span::styled("no file on the clipboard", theme::dim())),

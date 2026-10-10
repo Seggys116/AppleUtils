@@ -5,7 +5,7 @@ resolver = "3"
 
 [package]
 name = "apple-utils"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 authors = ["Zak Noble-Clarke"]
 description = "Terminal toolkit for Apple device recovery and APFS work"

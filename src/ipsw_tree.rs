@@ -10,6 +10,7 @@ use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::scratch::ScratchDir;
 use flate2::Crc;
@@ -54,11 +55,13 @@ pub enum IpswError {
     Unsupported(String),
     NoCli,
     Cli(String),
+    Cancelled,
 }
 
 impl fmt::Display for IpswError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => write!(f, "cancelled"),
             Self::Io { context, error } => write!(f, "{context}: {error}"),
             Self::NotAnArchive(reason) => write!(f, "not a usable IPSW: {reason}"),
             Self::Unsafe(reason) => write!(f, "unsafe IPSW entry: {reason}"),
@@ -150,7 +153,6 @@ impl IpswTree {
         self.directories.contains(name)
     }
 
-    /// Immediate children of `directory` (`""` is the archive root), files and subdirectories.
     pub fn children(&self, directory: &str) -> Vec<(String, bool)> {
         let prefix = if directory.is_empty() {
             String::new()
@@ -177,7 +179,6 @@ impl IpswTree {
         out
     }
 
-    /// Entry names equal to `prefix` or below it.
     pub fn names_under<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         let below = format!("{prefix}/");
         self.entries
@@ -208,6 +209,17 @@ impl IpswTree {
         destination: &Path,
         progress: &mut dyn FnMut(u64, u64),
     ) -> Result<(), IpswError> {
+        self.extract_file_cancellable(name, destination, progress, &AtomicBool::new(false))
+    }
+
+    /// Like `extract_file`, but checks `cancel` before every read and removes the partial file.
+    pub fn extract_file_cancellable(
+        &self,
+        name: &str,
+        destination: &Path,
+        progress: &mut dyn FnMut(u64, u64),
+        cancel: &AtomicBool,
+    ) -> Result<(), IpswError> {
         let entry = self
             .entries
             .get(name)
@@ -231,6 +243,9 @@ impl IpswTree {
             let mut written = 0u64;
             let mut reported = 0u64;
             loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(IpswError::Cancelled);
+                }
                 let read = reader
                     .read(&mut buffer)
                     .map_err(|error| IpswError::Corrupt(format!("{name}: {error}")))?;
@@ -290,7 +305,40 @@ impl IpswTree {
         outcome
     }
 
-    /// The link target of a symlink entry.
+    /// Entries larger than `limit` are refused before any data is read.
+    pub fn read_entry(&self, name: &str, limit: u64) -> Result<Vec<u8>, IpswError> {
+        let entry = self
+            .entries
+            .get(name)
+            .ok_or_else(|| IpswError::Missing(name.to_string()))?;
+        if entry.kind != EntryKind::File {
+            return Err(IpswError::Unsupported(format!(
+                "{name} is not a regular file"
+            )));
+        }
+        if entry.size > limit {
+            return Err(IpswError::Unsupported(format!(
+                "{name} is {} bytes, more than the {limit} byte limit",
+                entry.size
+            )));
+        }
+        let reader = self.open_entry(name, entry)?;
+        let mut bytes = Vec::new();
+        // One byte past the declared size catches an entry that lies about its length.
+        reader
+            .take(entry.size + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| IpswError::Corrupt(format!("{name}: {error}")))?;
+        let mut crc = Crc::new();
+        crc.update(&bytes);
+        if bytes.len() as u64 != entry.size || crc.sum() != entry.crc32 {
+            return Err(IpswError::Corrupt(format!(
+                "{name} failed its integrity check"
+            )));
+        }
+        Ok(bytes)
+    }
+
     pub fn symlink_target(&self, name: &str) -> Result<String, IpswError> {
         let entry = self
             .entries
@@ -749,8 +797,7 @@ impl IpswStage {
         Ok(destination)
     }
 
-    /// Creates the directories above `destination` one component at a time, refusing any that
-    /// resolves, through a symlink or otherwise, to somewhere outside the staging root.
+    /// Refuses any parent that resolves, through a symlink or otherwise, outside the staging root.
     fn ensure_parent(&self, destination: &Path) -> Result<(), IpswError> {
         let Some(parent) = destination.parent() else {
             return Ok(());
@@ -792,7 +839,6 @@ impl IpswStage {
         Ok(())
     }
 
-    /// Stages `prefix` and everything below it, returning how many entries were written.
     pub fn stage_tree(&self, prefix: &str) -> Result<usize, IpswError> {
         let names: Vec<String> = self.tree.names_under(prefix).map(str::to_string).collect();
         for name in &names {
@@ -801,9 +847,6 @@ impl IpswStage {
         Ok(names.len())
     }
 
-    /// Writes the plain disk image for an `.aea` entry by running `ipsw fw aea` on a temporary
-    /// copy, then drops that copy. The result sits beside where the encrypted file would be,
-    /// named without the `.aea` suffix.
     pub fn decrypt(&self, name: &str) -> Result<PathBuf, IpswError> {
         let plain_name = name
             .strip_suffix(AEA_SUFFIX)
@@ -881,8 +924,6 @@ impl IpswStage {
         Ok(destination)
     }
 
-    /// Removes one staged file so its disk space is returned once nothing else holds it. A later
-    /// `stage` call writes it again.
     pub fn release(&self, name: &str) {
         let removed_plain = {
             let mut decrypted = self.decrypted.lock().expect("stage lock");
@@ -897,7 +938,6 @@ impl IpswStage {
         }
     }
 
-    /// Removes everything staged but keeps the stage usable.
     pub fn release_all(&self) {
         let names: Vec<String> = {
             let staged = self.staged.lock().expect("stage lock");
@@ -910,7 +950,7 @@ impl IpswStage {
     }
 }
 
-fn validate_link_target(name: &str, target: &str) -> Result<(), IpswError> {
+pub(crate) fn validate_link_target(name: &str, target: &str) -> Result<(), IpswError> {
     let bad = || IpswError::Unsafe(format!("{name} links to {target:?}"));
     if target.is_empty() || target.contains('\0') || target.starts_with('/') {
         return Err(bad());

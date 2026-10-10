@@ -1643,10 +1643,12 @@ pub const FIRMWARE_UPDATER_DATA_V2_TYPE: &str = "FirmwareUpdaterDataV2";
 
 const KEY_MESSAGE_ARG_UPDATER_NAME: &str = "MessageArgUpdaterName";
 const UPDATER_NAME_CRYPTEX1: &str = "Cryptex1";
+const UPDATER_NAME_CRYPTEX1_LOCAL_POLICY: &str = "Cryptex1LocalPolicy";
 
 pub const KEY_FIRMWARE_RESPONSE_DATA: &str = "FirmwareResponseData";
 
 pub const KEY_CRYPTEX1_TICKET: &str = "Cryptex1,Ticket";
+const KEY_AP_IMG4_TICKET: &str = "ApImg4Ticket";
 
 fn signing_unsigned(value: &plist::Value, key: &str) -> Result<plist::Value, String> {
     let parsed = match value {
@@ -2027,6 +2029,88 @@ impl PersonalizedFirmwareProvider {
         );
         report(&self.reporter, "personalized-object-served", &line);
         Ok(StreamedObject::from_bytes(image, chunk_size))
+    }
+
+    fn install_boot_component(&self, component: &str) -> Result<plist::Dictionary, ProviderError> {
+        let variant = &self.install_variant;
+        let relative = self.component_path(variant, component).ok_or_else(|| {
+            ProviderError::Other(format!(
+                "the {variant} identity for {} names no {component} path",
+                self.hardware_model,
+            ))
+        })?;
+        let root = self.firmware_root.as_ref().ok_or_else(|| {
+            ProviderError::Other(format!(
+                "the install {component} at {relative} has no firmware root to read from"
+            ))
+        })?;
+        let board_manifest = self.board_manifest.as_ref().ok_or_else(|| {
+            ProviderError::Other(format!(
+                "the install {component} has no board manifest to personalize it with"
+            ))
+        })?;
+        let path = root.join(&relative);
+        let (payload, payload_type) =
+            match self.retagged_component_payload(variant, component, &path) {
+                Some((payload, payload_type)) => (payload, payload_type),
+                None => (
+                    std::fs::read(&path).map_err(ProviderError::Io)?,
+                    "as-shipped".to_string(),
+                ),
+            };
+        let identity = raw_identity_for_variant(&self.manifest, &self.hardware_model, variant)
+            .ok_or_else(|| {
+                ProviderError::Other(format!("the {variant} identity is unavailable"))
+            })?;
+        let entry = identity
+            .get(IDENTITY_MANIFEST_KEY)
+            .and_then(plist::Value::as_dictionary)
+            .and_then(|components| components.get(component))
+            .and_then(plist::Value::as_dictionary)
+            .ok_or_else(|| {
+                ProviderError::Other(format!("the {variant} identity has no {component} entry"))
+            })?;
+        let expected = entry
+            .get("Digest")
+            .and_then(plist::Value::as_data)
+            .ok_or_else(|| {
+                ProviderError::Other(format!("the {variant} {component} has no digest"))
+            })?;
+        let method = entry
+            .get(COMPONENT_INFO_KEY)
+            .and_then(plist::Value::as_dictionary)
+            .and_then(|info| info.get("HashMethod"))
+            .and_then(plist::Value::as_string)
+            .unwrap_or(HASH_METHOD_SHA2_384);
+        let actual = match method {
+            HASH_METHOD_SHA2_384 => sha384(&payload).to_vec(),
+            HASH_METHOD_SHA2_256 => sha256(&payload).to_vec(),
+            other => {
+                return Err(ProviderError::Other(format!(
+                    "the {variant} {component} names unsupported hash method {other}"
+                )));
+            }
+        };
+        if actual != expected {
+            return Err(ProviderError::Other(format!(
+                "the {variant} {component} at {} does not match its manifest digest",
+                path.display()
+            )));
+        }
+        let image = wrap_image4(&payload, board_manifest).map_err(ProviderError::Other)?;
+        let line = format!(
+            "{MUX_PREFIX} result=install-boot-component-served port={} at={:.3}s variant=\"{variant}\" component={component} key={component}File im4p={} img4={} payload_type={payload_type} meaning=\"the install identity's boot component was wrapped with its board manifest and returned under the component's File key\" detail=\"path={} manifest={}\"",
+            self.port,
+            self.armed_at_secs,
+            payload.len(),
+            image.len(),
+            path.display(),
+            self.board_manifest_source.as_deref().unwrap_or("none")
+        );
+        report(&self.reporter, "install-boot-component-served", &line);
+        let mut body = plist::Dictionary::new();
+        body.insert(format!("{component}File"), plist::Value::Data(image));
+        Ok(body)
     }
 }
 
@@ -3109,18 +3193,20 @@ impl RestoreAnswers {
         let updater = request
             .argument_string(KEY_MESSAGE_ARG_UPDATER_NAME)
             .unwrap_or("unknown");
-        if updater != UPDATER_NAME_CRYPTEX1 {
+        if updater != UPDATER_NAME_CRYPTEX1 && updater != UPDATER_NAME_CRYPTEX1_LOCAL_POLICY {
             return self.decline_firmware_updater_personalization(request);
         }
         let Some(signer) = self.firmware_updater_signer.as_ref() else {
             let line = format!(
-                "{MUX_PREFIX} result=firmware-updater-signing-not-armed port={} at={:.3}s updater={updater} meaning=\"the guest requested a personalized Cryptex1 ticket, but this restore did not arm Apple signing\"",
+                "{MUX_PREFIX} result=firmware-updater-signing-not-armed port={} at={:.3}s updater={updater} meaning=\"the guest requested a personalized firmware updater ticket, but this restore did not arm Apple signing\"",
                 self.port, self.armed_at_secs,
             );
             report(&self.reporter, "firmware-updater-signing-not-armed", &line);
             return plist::Dictionary::new();
         };
-        let (signing_request, response_tag) = match self.cryptex1_signing_request(request) {
+        let (signing_request, response_tag) = match self
+            .firmware_updater_signing_request(request, updater)
+        {
             Ok(prepared) => prepared,
             Err(error) => {
                 let line = format!(
@@ -3131,6 +3217,44 @@ impl RestoreAnswers {
                 return plist::Dictionary::new();
             }
         };
+        if updater == UPDATER_NAME_CRYPTEX1_LOCAL_POLICY {
+            let policy = signing_request
+                .get("Ap,LocalPolicy")
+                .and_then(plist::Value::as_dictionary);
+            let data = |key: &str| {
+                signing_request
+                    .get(key)
+                    .and_then(plist::Value::as_data)
+                    .map_or_else(|| "absent".to_string(), hex_digest)
+            };
+            let policy_digest = policy
+                .and_then(|policy| policy.get("Digest"))
+                .and_then(plist::Value::as_data)
+                .map_or_else(|| "absent".to_string(), hex_digest);
+            let line = format!(
+                "{MUX_PREFIX} result=firmware-updater-signing-request port={} at={:.3}s updater={updater} source={} response_tag={response_tag} local_boot={:?} policy_trusted={:?} policy_digest={policy_digest} next_stage={} next_stage_cryptex={} recovery_nonce_hash={} volume_uuid={} ap_nonce={} request_keys=[{}]",
+                self.port,
+                self.armed_at_secs,
+                signer.source(),
+                signing_request
+                    .get("Ap,LocalBoot")
+                    .and_then(plist::Value::as_boolean),
+                policy
+                    .and_then(|policy| policy.get("Trusted"))
+                    .and_then(plist::Value::as_boolean),
+                data("Ap,NextStageIM4MHash"),
+                data("Ap,NextStageCryptex1IM4MHash"),
+                data("Ap,RecoveryOSPolicyNonceHash"),
+                data("Ap,VolumeUUID"),
+                data("ApNonce"),
+                signing_request
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            report(&self.reporter, "firmware-updater-signing-request", &line);
+        }
         let response = match signer.personalize(&signing_request) {
             Ok(response) => response,
             Err(error) => {
@@ -3173,7 +3297,7 @@ impl RestoreAnswers {
             plist::Value::Dictionary(response),
         );
         let line = format!(
-            "{MUX_PREFIX} result=firmware-updater-ticket-served port={} at={:.3}s type={:?} updater={updater} source={} key={response_tag} bytes={} sha384={} request_keys=[{}] meaning=\"the guest's generated Cryptex1 signing terms were submitted and the returned ticket was passed through under FirmwareResponseData\"",
+            "{MUX_PREFIX} result=firmware-updater-ticket-served port={} at={:.3}s type={:?} updater={updater} source={} key={response_tag} bytes={} sha384={} request_keys=[{}] meaning=\"the guest's generated updater signing terms were submitted and the returned ticket was passed through under FirmwareResponseData\"",
             self.port,
             self.armed_at_secs,
             request.data_type,
@@ -3190,9 +3314,10 @@ impl RestoreAnswers {
         body
     }
 
-    fn cryptex1_signing_request(
+    fn firmware_updater_signing_request(
         &self,
         request: &DataRequest,
+        updater: &str,
     ) -> Result<(plist::Dictionary, String), String> {
         let info = request
             .arguments
@@ -3227,7 +3352,7 @@ impl RestoreAnswers {
                 }
             }
         }
-        for key in ["UniqueBuildID", "ApChipID", "ApBoardID", "ApSecurityDomain"] {
+        for key in ["ApChipID", "ApBoardID", "ApSecurityDomain"] {
             if !parameters.contains_key(key)
                 && let Some(value) = identity.get(key)
             {
@@ -3270,11 +3395,6 @@ impl RestoreAnswers {
                 signing.insert(key.to_string(), normalized);
             }
         }
-        for (key, value) in &parameters {
-            if key.starts_with("Cryptex1") {
-                signing.insert(key.clone(), value.clone());
-            }
-        }
         for key in [
             "ApECID",
             "ApChipID",
@@ -3284,22 +3404,74 @@ impl RestoreAnswers {
         ] {
             if !signing.contains_key(key) {
                 return Err(format!(
-                    "the generated Cryptex1 request has no {key} signing term"
+                    "the generated {updater} request has no {key} signing term"
                 ));
             }
         }
-        if !signing.keys().any(|key| key.starts_with("Cryptex1,")) {
-            return Err(
-                "the generated Cryptex1 request contains no Cryptex1 signing terms".to_string(),
-            );
-        }
-        signing.insert("@Cryptex1,Ticket".to_string(), plist::Value::Boolean(true));
+        let default_response_tag = match updater {
+            UPDATER_NAME_CRYPTEX1 => {
+                for (key, value) in &parameters {
+                    if key.starts_with("Cryptex1") {
+                        signing.insert(key.clone(), value.clone());
+                    }
+                }
+                if !signing.keys().any(|key| key.starts_with("Cryptex1,")) {
+                    return Err(
+                        "the generated Cryptex1 request contains no Cryptex1 signing terms"
+                            .to_string(),
+                    );
+                }
+                signing.insert("@Cryptex1,Ticket".to_string(), plist::Value::Boolean(true));
+                KEY_CRYPTEX1_TICKET
+            }
+            UPDATER_NAME_CRYPTEX1_LOCAL_POLICY => {
+                let local_boot = parameters
+                    .get("Ap,LocalBoot")
+                    .ok_or("the generated Cryptex1LocalPolicy request has no Ap,LocalBoot")?;
+                signing.insert(
+                    "Ap,LocalBoot".to_string(),
+                    signing_flag(local_boot, "Ap,LocalBoot")?,
+                );
+                let local_policy = parameters
+                    .get("Ap,LocalPolicy")
+                    .ok_or("the generated Cryptex1LocalPolicy request has no Ap,LocalPolicy")?;
+                signing.insert("Ap,LocalPolicy".to_string(), local_policy.clone());
+                let next_stage = parameters
+                    .get("Ap,NextStageIM4MHash")
+                    .and_then(plist::Value::as_data)
+                    .filter(|hash| !hash.is_empty())
+                    .ok_or(
+                        "the generated Cryptex1LocalPolicy request has no Ap,NextStageIM4MHash",
+                    )?;
+                signing.insert(
+                    "Ap,NextStageIM4MHash".to_string(),
+                    plist::Value::Data(next_stage.to_vec()),
+                );
+                for key in [
+                    "Ap,NextStageCryptex1IM4MHash",
+                    "Ap,RecoveryOSPolicyNonceHash",
+                    "Ap,VolumeUUID",
+                    "ApNonce",
+                ] {
+                    if let Some(value) = parameters.get(key) {
+                        let data = value
+                            .as_data()
+                            .ok_or_else(|| format!("{key} is not data"))?;
+                        signing.insert(key.to_string(), plist::Value::Data(data.to_vec()));
+                    }
+                }
+                signing.insert("@ApImg4Ticket".to_string(), plist::Value::Boolean(true));
+                KEY_AP_IMG4_TICKET
+            }
+            _ => return Err(format!("unsupported firmware updater {updater}")),
+        };
         let response_tag = tags
             .get("ResponseTags")
             .and_then(plist::Value::as_array)
             .and_then(|tags| tags.first())
             .and_then(plist::Value::as_string)
-            .unwrap_or(KEY_CRYPTEX1_TICKET)
+            .filter(|tag| !tag.is_empty())
+            .unwrap_or(default_response_tag)
             .to_string();
         Ok((signing, response_tag))
     }
@@ -3642,6 +3814,9 @@ impl RestoreDataProvider for RestoreAnswers {
         if wire_name == PERSONALIZED_DATA_TYPE {
             return self.personalized.supply(request);
         }
+        if wire_name == "KernelCache" || wire_name == "DeviceTree" {
+            return self.personalized.install_boot_component(wire_name);
+        }
         if wire_name == EAN_DATA_TYPE {
             return Ok(self.personalized.early_access_list(request));
         }
@@ -3680,16 +3855,16 @@ mod tests {
         BuildIdentityProvider, COMPONENT_SYSTEM_VOLUME, COMPONENT_SYSTEM_VOLUME_CANONICAL_METADATA,
         DeviceHardwareInfo, EAN_DATA_TYPE, FDR_MEMORY_COMMIT_DATA_TYPE, FDR_TRUST_DATA_TYPE,
         FDR_TRUST_OBJECT_TAGS, FIRMWARE_UPDATER_DATA_TYPE, FUD_DATA_TYPE, FdrTrustDigest,
-        FdrTrustProvider, GlobalManifestProvider, IDENTITY_MANIFEST_KEY, KEY_AP_LOCAL_POLICY,
-        KEY_BOOTED_OS_FDR_TRUST_DATA, KEY_CRYPTEX1_TICKET, KEY_EAN_IMAGE_LIST,
+        FdrTrustProvider, GlobalManifestProvider, IDENTITY_MANIFEST_KEY, KEY_AP_IMG4_TICKET,
+        KEY_AP_LOCAL_POLICY, KEY_BOOTED_OS_FDR_TRUST_DATA, KEY_CRYPTEX1_TICKET, KEY_EAN_IMAGE_LIST,
         KEY_FDR_MEMORY_STORE_DATA, KEY_FDR_TRUST_DATA, KEY_FIRMWARE_RESPONSE_DATA,
         KEY_FUD_IMAGE_LIST, KEY_MESSAGE_ARG_UPDATER_NAME, KEY_RECOVERY_OS_VERSION_DATA,
         LocalPolicyCensus, NorFirmwareProvider, PERSONALIZED_DATA_TYPE,
         PersonalizedFirmwareProvider, RECOVERY_OS_LOCAL_POLICY_IM4P,
         RECOVERY_OS_LOCAL_POLICY_IM4P_SHA384, RamrodTrace, RestoreAnswers, RestoreVariants,
         SourceBootObjectProvider, SplatComponent, SplatPlan, UPDATER_NAME_CRYPTEX1,
-        describe_dictionary_entries, describe_plist_value, im4p_type_span,
-        resolve_splat_components, wrap_image4,
+        UPDATER_NAME_CRYPTEX1_LOCAL_POLICY, describe_dictionary_entries, describe_plist_value,
+        im4p_type_span, resolve_splat_components, wrap_image4,
     };
     use crate::crypto::{sha256, sha384};
     use crate::ramrod::{
@@ -6344,6 +6519,118 @@ mod tests {
         vec![0x30, 0x06, 0x16, 0x04, b'I', b'M', b'4', b'M']
     }
 
+    #[test]
+    fn install_boot_components_use_the_install_identity_and_signed_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Firmware")).unwrap();
+        let install_payload = test_im4p("krnl", &[1, 2, 3, 4]);
+        let recovery_payload = test_im4p("krnl", &[5, 6, 7, 8]);
+        let install_tree = test_im4p("dtre", &[9, 10, 11, 12]);
+        let recovery_tree = test_im4p("dtre", &[13, 14, 15, 16]);
+        std::fs::write(dir.path().join("Firmware/install.im4p"), &install_payload).unwrap();
+        std::fs::write(dir.path().join("Firmware/recovery.im4p"), &recovery_payload).unwrap();
+        std::fs::write(dir.path().join("Firmware/install-tree.im4p"), &install_tree).unwrap();
+        std::fs::write(
+            dir.path().join("Firmware/recovery-tree.im4p"),
+            &recovery_tree,
+        )
+        .unwrap();
+        let component = |path: &str, payload: &[u8]| {
+            plist::Value::Dictionary(plist::Dictionary::from_iter([
+                (
+                    "Info".to_string(),
+                    plist::Value::Dictionary(plist::Dictionary::from_iter([(
+                        "Path".to_string(),
+                        plist::Value::String(path.to_string()),
+                    )])),
+                ),
+                (
+                    "Digest".to_string(),
+                    plist::Value::Data(sha384(payload).to_vec()),
+                ),
+            ]))
+        };
+        let identity = |variant: &str, path: &str, payload: &[u8], tree_path: &str, tree: &[u8]| {
+            plist::Value::Dictionary(plist::Dictionary::from_iter([
+                (
+                    "Info".to_string(),
+                    plist::Value::Dictionary(plist::Dictionary::from_iter([
+                        (
+                            "DeviceClass".to_string(),
+                            plist::Value::String("j274ap".into()),
+                        ),
+                        ("Variant".to_string(), plist::Value::String(variant.into())),
+                    ])),
+                ),
+                (
+                    "Manifest".to_string(),
+                    plist::Value::Dictionary(plist::Dictionary::from_iter([
+                        ("KernelCache".to_string(), component(path, payload)),
+                        ("DeviceTree".to_string(), component(tree_path, tree)),
+                    ])),
+                ),
+            ]))
+        };
+        let manifest = plist::Dictionary::from_iter([(
+            "BuildIdentities".to_string(),
+            plist::Value::Array(vec![
+                identity(
+                    "Customer Erase Install (IPSW)",
+                    "Firmware/install.im4p",
+                    &install_payload,
+                    "Firmware/install-tree.im4p",
+                    &install_tree,
+                ),
+                identity(
+                    "Recovery Customer Install",
+                    "Firmware/recovery.im4p",
+                    &recovery_payload,
+                    "Firmware/recovery-tree.im4p",
+                    &recovery_tree,
+                ),
+            ]),
+        )]);
+        let (reporter, lines) = capturing();
+        let board_manifest = test_board_manifest();
+        let mut answers = splat_answers(dir.path(), None, &reporter);
+        answers.personalized = PersonalizedFirmwareProvider::new(
+            manifest,
+            "J274AP".into(),
+            "Customer Erase Install (IPSW)".into(),
+            "Recovery Customer Install".to_string(),
+            Some(dir.path().to_path_buf()),
+            Some(board_manifest.clone()),
+            Some("test-board-manifest".into()),
+            62078,
+            0.0,
+            &reporter,
+        );
+        answers
+            .personalized
+            .follow_variant("Recovery Customer Install");
+        let body = answers
+            .supply(&data_request(DataType::Other("KernelCache".into())))
+            .expect("the install step receives the signed kernelcache");
+        let expected = wrap_image4(&install_payload, &board_manifest).unwrap();
+        assert_eq!(
+            body.get("KernelCacheFile").and_then(plist::Value::as_data),
+            Some(expected.as_slice())
+        );
+        let body = answers
+            .supply(&data_request(DataType::Other("DeviceTree".into())))
+            .expect("the install step receives the signed device tree");
+        let expected = wrap_image4(&install_tree, &board_manifest).unwrap();
+        assert_eq!(
+            body.get("DeviceTreeFile").and_then(plist::Value::as_data),
+            Some(expected.as_slice())
+        );
+        assert!(lines.lock().unwrap().iter().any(|line| {
+            line.contains("result=install-boot-component-served")
+                && line.contains("component=KernelCache")
+                && line.contains("variant=\"Customer Erase Install (IPSW)\"")
+        }));
+    }
+
     fn seal_identity_manifest() -> plist::Dictionary {
         let component = |path: &str| {
             let mut info = plist::Dictionary::new();
@@ -6652,6 +6939,25 @@ mod tests {
             self.requests.lock().unwrap().push(request.clone());
             Ok(plist::Dictionary::from_iter([(
                 KEY_CRYPTEX1_TICKET.to_string(),
+                plist::Value::Data(self.ticket.clone()),
+            )]))
+        }
+    }
+
+    struct RecordingLocalPolicyFirmwareSigner {
+        requests: Arc<std::sync::Mutex<Vec<plist::Dictionary>>>,
+        ticket: Vec<u8>,
+    }
+
+    impl crate::restore::local_policy::FirmwareUpdaterSigner for RecordingLocalPolicyFirmwareSigner {
+        fn source(&self) -> &'static str {
+            "recording-test-signer"
+        }
+
+        fn personalize(&self, request: &plist::Dictionary) -> Result<plist::Dictionary, String> {
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(plist::Dictionary::from_iter([(
+                KEY_AP_IMG4_TICKET.to_string(),
                 plist::Value::Data(self.ticket.clone()),
             )]))
         }
@@ -7082,6 +7388,115 @@ mod tests {
             line.contains("result=firmware-updater-ticket-served")
                 && line.contains("updater=Cryptex1")
                 && line.contains("source=recording-test-signer")
+        }));
+    }
+
+    #[test]
+    fn cryptex1_local_policy_signing_preserves_the_generated_policy_and_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticket = image4_element("IM4M", &[]);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (reporter, lines) = capturing();
+        let mut answers = splat_answers(dir.path(), None, &reporter);
+        answers.firmware_updater_signer = Some(Arc::new(RecordingLocalPolicyFirmwareSigner {
+            requests: Arc::clone(&requests),
+            ticket: ticket.clone(),
+        }));
+        let mut request = splat_request(UPDATER_NAME_CRYPTEX1_LOCAL_POLICY);
+        let generated = request
+            .arguments
+            .get_mut("DeviceGeneratedRequest")
+            .and_then(plist::Value::as_dictionary_mut)
+            .unwrap();
+        generated.clear();
+        generated.insert("Ap,LocalBoot".to_string(), plist::Value::Boolean(false));
+        generated.insert(
+            "Ap,LocalPolicy".to_string(),
+            plist::Value::Dictionary(plist::Dictionary::from_iter([(
+                "Digest".to_string(),
+                plist::Value::Data(vec![0x11; 48]),
+            )])),
+        );
+        generated.insert(
+            "Ap,NextStageIM4MHash".to_string(),
+            plist::Value::Data(vec![0x22; 48]),
+        );
+        generated.insert(
+            "Ap,NextStageCryptex1IM4MHash".to_string(),
+            plist::Value::Data(vec![0x33; 48]),
+        );
+        generated.insert(
+            "Ap,RecoveryOSPolicyNonceHash".to_string(),
+            plist::Value::Data(vec![0x44; 48]),
+        );
+        generated.insert(
+            "Ap,VolumeUUID".to_string(),
+            plist::Value::Data(vec![0x55; 16]),
+        );
+        generated.insert("ApNonce".to_string(), plist::Value::Data(vec![0x66; 32]));
+        let tags = request
+            .arguments
+            .get_mut("DeviceGeneratedTags")
+            .and_then(plist::Value::as_dictionary_mut)
+            .unwrap();
+        tags.insert(
+            "ResponseTags".to_string(),
+            plist::Value::Array(vec![plist::Value::String(KEY_AP_IMG4_TICKET.to_string())]),
+        );
+        let body = answers.supply(&request).unwrap();
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0]
+                .get("@ApImg4Ticket")
+                .and_then(plist::Value::as_boolean),
+            Some(true),
+        );
+        assert_eq!(
+            sent[0]
+                .get("Ap,LocalBoot")
+                .and_then(plist::Value::as_boolean),
+            Some(false),
+        );
+        assert_eq!(
+            sent[0]
+                .get("Ap,LocalPolicy")
+                .and_then(plist::Value::as_dictionary)
+                .and_then(|policy| policy.get("Digest"))
+                .and_then(plist::Value::as_data),
+            Some([0x11; 48].as_slice()),
+        );
+        for (key, expected) in [
+            ("Ap,NextStageIM4MHash", [0x22; 48].as_slice()),
+            ("Ap,NextStageCryptex1IM4MHash", [0x33; 48].as_slice()),
+            ("Ap,RecoveryOSPolicyNonceHash", [0x44; 48].as_slice()),
+            ("Ap,VolumeUUID", [0x55; 16].as_slice()),
+            ("ApNonce", [0x66; 32].as_slice()),
+        ] {
+            assert_eq!(
+                sent[0].get(key).and_then(plist::Value::as_data),
+                Some(expected),
+                "{key}",
+            );
+        }
+        assert_eq!(
+            body.get(KEY_FIRMWARE_RESPONSE_DATA)
+                .and_then(plist::Value::as_dictionary)
+                .and_then(|response| response.get(KEY_AP_IMG4_TICKET))
+                .and_then(plist::Value::as_data),
+            Some(ticket.as_slice()),
+        );
+        assert!(lines.lock().unwrap().iter().any(|line| {
+            line.contains("result=firmware-updater-signing-request")
+                && line.contains("updater=Cryptex1LocalPolicy")
+                && line.contains("local_boot=Some(false)")
+                && line.contains("policy_digest=")
+                && line.contains("next_stage_cryptex=")
+        }));
+        assert!(lines.lock().unwrap().iter().any(|line| {
+            line.contains("result=firmware-updater-ticket-served")
+                && line.contains("updater=Cryptex1LocalPolicy")
+                && line.contains("key=ApImg4Ticket")
         }));
     }
 

@@ -12,6 +12,7 @@ use crate::app::{
     App, AsahiAction, AsahiSource, AsahiStep, ExplorerPhase, RepairStep, Screen, Suggestion,
 };
 use crate::clip::{FileInfo, FileKind};
+use crate::ipsw_app::IpswPhase;
 use crate::recovery_model::{
     DeviceState, FileRequestSpec, RecoveryDevice, RecoveryEvent, RestoreProgress, SizeRange,
 };
@@ -151,6 +152,46 @@ pub fn write_previews() -> io::Result<()> {
             height: 32,
             build: asahi_wait,
             tick: 4,
+        },
+        Shot {
+            name: "Picker · IPSW installed",
+            file: "picker-ipsw.html",
+            width: 120,
+            height: 40,
+            build: picker_ipsw,
+            tick: 0,
+        },
+        Shot {
+            name: "Picker · IPSW installed, compact",
+            file: "picker-ipsw-compact.html",
+            width: 80,
+            height: 18,
+            build: picker_ipsw,
+            tick: 0,
+        },
+        Shot {
+            name: "IPSW · browse",
+            file: "ipsw-browse.html",
+            width: 110,
+            height: 34,
+            build: ipsw_browse,
+            tick: 0,
+        },
+        Shot {
+            name: "IPSW · exporting",
+            file: "ipsw-exporting.html",
+            width: 100,
+            height: 32,
+            build: ipsw_exporting,
+            tick: 6,
+        },
+        Shot {
+            name: "IPSW · done",
+            file: "ipsw-done.html",
+            width: 100,
+            height: 32,
+            build: ipsw_done,
+            tick: 0,
         },
     ];
 
@@ -488,6 +529,140 @@ fn asahi_wait() -> App {
     app.screen = Screen::Asahi;
     app.asahi_step = AsahiStep::WaitFile;
     app.asahi_action = AsahiAction::Update;
+    app
+}
+
+fn picker_ipsw() -> App {
+    let mut app = picker();
+    app.set_ipsw_cli(Some("/opt/homebrew/bin/ipsw".into()));
+    app
+}
+
+fn ipsw_opened() -> App {
+    let mut app = App::new();
+    app.set_ipsw_cli(Some("/opt/homebrew/bin/ipsw".into()));
+    app.screen = Screen::Ipsw;
+    // Only the central directory is read, so the archive can go away once it is open.
+    if let Ok(dir) = tempfile::tempdir() {
+        let archive = dir.path().join("Mac14,3_26.0_25A1_Restore.ipsw");
+        if crate::ipsw_fixture::write_ipsw(&archive, &crate::ipsw_fixture::realistic_entries())
+            .is_ok()
+        {
+            app.open_ipsw(&archive.to_string_lossy());
+            app.drain_ipsw_job();
+        }
+    }
+    app
+}
+
+fn ipsw_browse() -> App {
+    let mut app = ipsw_opened();
+    let state = &mut app.ipsw;
+    state.expanded.insert("Firmware".into());
+    for name in [
+        "kernelcache.release.mac14j",
+        "090-12345-001.dmg.aea",
+        "090-12345-003.dmg",
+    ] {
+        state.selected.insert(name.into());
+    }
+    state
+        .components
+        .insert(crate::ipsw_export::Component::DeviceTree);
+    state.device = state
+        .info
+        .as_ref()
+        .and_then(|info| info.product_types.first().cloned());
+    state.cursor = state
+        .rows()
+        .iter()
+        .position(|row| row.name == "090-12345-003.dmg")
+        .unwrap_or(0);
+    app
+}
+
+fn ipsw_exporting() -> App {
+    use crate::ipsw_export::ItemAction;
+
+    let mut app = ipsw_opened();
+    let state = &mut app.ipsw;
+    state.phase = IpswPhase::Exporting;
+    state.output = Some("/Users/me/Downloads/Mac14,2_26.0_25A1_Restore-export".into());
+    state.run.total_items = 4;
+    state.run.index = 1;
+    state.run.current = "090-12345-001.dmg.aea".into();
+    state.run.action = Some(ItemAction::Decrypt);
+    state.run.done_bytes = 3_100_000_000;
+    state.run.total_bytes = 7_400_000_000;
+    state.run.log.extend([
+        "copied BuildManifest.plist".to_string(),
+        "decompressed kernelcache.release.mac14j".to_string(),
+        "decrypting 090-12345-001.dmg.aea".to_string(),
+    ]);
+    app
+}
+
+fn ipsw_done() -> App {
+    use crate::ipsw_export::{ExportReport, ItemReport, Outcome};
+
+    let output = std::path::PathBuf::from("/Users/me/Downloads/Mac14,2_26.0_25A1_Restore-export");
+    let item = |name: &str, outcome: Outcome| ItemReport {
+        name: name.into(),
+        outcome,
+    };
+    let mut app = ipsw_opened();
+    app.ipsw.phase = IpswPhase::Done;
+    app.ipsw.report = Some(ExportReport {
+        output: output.clone(),
+        cancelled: false,
+        items: vec![
+            item(
+                "BuildManifest.plist",
+                Outcome::Written {
+                    path: output.join("BuildManifest.plist"),
+                },
+            ),
+            item(
+                "090-12345-001.dmg.aea",
+                Outcome::Decrypted {
+                    path: output.join("090-12345-001.dmg"),
+                    original: None,
+                },
+            ),
+            item(
+                "kernelcache.release.mac14j",
+                Outcome::Decompressed {
+                    path: output.join("kernelcache.release.mac14j"),
+                    original: None,
+                },
+            ),
+            item(
+                "Firmware/dfu/iBEC.j414c.RELEASE.im4p",
+                Outcome::Kept {
+                    path: output.join("Firmware/dfu/iBEC.j414c.RELEASE.im4p"),
+                    warning: "failed to parse IM4P: not a valid payload".into(),
+                },
+            ),
+            item(
+                "Firmware/latest",
+                Outcome::Linked {
+                    path: output.join("Firmware/latest"),
+                },
+            ),
+            item(
+                "DeviceTree",
+                Outcome::Failed {
+                    reason: "failed to extract files matching pattern from ZIP".into(),
+                },
+            ),
+            item(
+                "Kernelcache",
+                Outcome::Produced {
+                    paths: vec![output.join("25A1__Mac14,2/kernelcache.release.mac14j")],
+                },
+            ),
+        ],
+    });
     app
 }
 
