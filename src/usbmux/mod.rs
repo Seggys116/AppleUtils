@@ -11,6 +11,7 @@ pub use crate::bridge_protocol;
 #[path = "../bridge_transport.rs"]
 pub mod bridge_transport;
 
+mod packet_trace;
 pub mod trace;
 pub mod watchdog;
 
@@ -35,7 +36,7 @@ pub use frame::{
 };
 pub use link::{
     BulkTransport, DEFAULT_RECEIVE_WINDOW, FIRST_LOCAL_PORT, InboundSignal, LinkEvent,
-    LinkLiveness, MuxError, MuxLink,
+    LinkLiveness, MuxError, MuxLink, SendState,
 };
 pub use roundtrip::{
     LineBudget, LineGrant, LineSink, PROCESS_LINE_BUDGET, PortStats, ROUNDTRIP_TAG, RoundtripMeter,
@@ -45,10 +46,11 @@ pub use session::{
     DEVICE_ISN, MuxSession, Segment, SessionConfig, SessionError, SessionEvent, SessionState,
 };
 pub use stream::{
-    DEFAULT_LINK_SLICE, DEFAULT_READ_POLL, DEFAULT_WRITE_POLL, DEFAULT_WRITE_TIMEOUT,
-    DEVICE_GONE_MARKER, HOST_TEARDOWN_MARKER, MuxDialer, MuxReadPolicy, MuxStream, MuxWritePolicy,
-    REFERENCE_ASR_READ_TIMEOUT, RUN_STOPPED_MARKER, ReadExpiry, SharedLink, WriteExpiry,
-    is_device_gone, is_host_initiated_teardown, is_run_stopped,
+    CONNECTION_CANCELLED_MARKER, DEFAULT_LINK_SLICE, DEFAULT_READ_POLL, DEFAULT_WRITE_POLL,
+    DEFAULT_WRITE_TIMEOUT, DEVICE_GONE_MARKER, HOST_TEARDOWN_MARKER, MuxDialer, MuxReadHalf,
+    MuxReadPolicy, MuxStream, MuxWriteHalf, MuxWritePolicy, REFERENCE_ASR_READ_TIMEOUT,
+    RUN_STOPPED_MARKER, ReadExpiry, SharedLink, WriteExpiry, is_device_gone,
+    is_host_initiated_teardown, is_run_stopped,
 };
 pub use tcp::{DATA_OFFSET_WORDS, TCP_HEADER_LEN, TcpError, TcpHeader, WINDOW_SCALE_SHIFT, flags};
 pub use watchdog::{

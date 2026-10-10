@@ -4,6 +4,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::packet_trace::{Context as PacketTraceContext, Disposition, Stage};
 use super::trace::{MuxTraceEvent, MuxTraceSink};
 
 use super::frame::{
@@ -29,6 +30,10 @@ pub trait BulkTransport {
 
     fn max_packet(&self) -> usize {
         MAX_PACKET
+    }
+
+    fn packet_trace_identity(&self) -> Option<(u64, u64)> {
+        None
     }
 
     fn device_accepted_packets(&self) -> Option<u64> {
@@ -101,6 +106,7 @@ pub struct SendState {
     pub snd_una: u32,
     pub snd_nxt: u32,
     pub snd_wnd_edge: u32,
+    pub send_epoch: u64,
     pub peer_window: u32,
     pub usable: usize,
     pub pending: usize,
@@ -224,6 +230,7 @@ impl From<MuxError> for io::Error {
 }
 
 pub struct MuxLink<T> {
+    packet_trace: PacketTraceContext,
     transport: T,
     version: Option<MuxVersion>,
     tx_seq: u16,
@@ -242,7 +249,9 @@ pub struct MuxLink<T> {
 impl<T: BulkTransport> MuxLink<T> {
     #[must_use]
     pub fn new(transport: T) -> Self {
+        let (generation, lease) = transport.packet_trace_identity().unwrap_or((0, 0));
         Self {
+            packet_trace: PacketTraceContext::new(generation, lease),
             transport,
             version: None,
             tx_seq: 0,
@@ -280,6 +289,32 @@ impl<T: BulkTransport> MuxLink<T> {
         if let Some(sink) = &self.trace {
             sink.event(event);
         }
+    }
+
+    pub(super) fn trace_delivery_probe(
+        &self,
+        stage: Stage,
+        local_port: u16,
+        observed: SendState,
+        disposition: Disposition,
+    ) {
+        if self.packet_trace.enabled() {
+            self.packet_trace.packet(
+                stage,
+                &[],
+                self.version,
+                Some(local_port),
+                Some(observed),
+                self.send_state(local_port),
+                disposition,
+                0,
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_packet_trace(&mut self, context: PacketTraceContext) {
+        self.packet_trace = context;
     }
 
     #[must_use]
@@ -334,7 +369,17 @@ impl<T: BulkTransport> MuxLink<T> {
             let Some(bytes) = self.transport.recv(remaining)? else {
                 continue;
             };
-            let reply = VersionPacket::decode(&bytes)?;
+            let reply = match VersionPacket::decode(&bytes) {
+                Ok(reply) => reply,
+                Err(FrameError::NotVersion { protocol }) => {
+                    self.trace(MuxTraceEvent::VersionWaitDiscarded {
+                        protocol,
+                        bytes: bytes.len(),
+                    });
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let version = reply.negotiated();
             self.version = Some(version);
             self.tx_seq = 0;
@@ -427,6 +472,29 @@ impl<T: BulkTransport> MuxLink<T> {
             .map_or(0, MuxSession::received_len)
     }
 
+    pub fn received_eof(&self, local_port: u16) -> Result<bool, MuxError> {
+        let session = self
+            .sessions
+            .get(&local_port)
+            .ok_or(MuxError::NoSession { local_port })?;
+        if session.state() == SessionState::Closed {
+            return Err(MuxError::Io(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                format!("mux peer reset or aborted port {local_port}"),
+            )));
+        }
+        Ok(session.received_eof())
+    }
+
+    pub fn shutdown_write(&mut self, local_port: u16) -> Result<(), MuxError> {
+        self.sessions
+            .get_mut(&local_port)
+            .ok_or(MuxError::NoSession { local_port })?
+            .shutdown_write()
+            .map_err(|error| MuxError::Session { local_port, error })?;
+        self.flush(local_port)
+    }
+
     pub fn write(
         &mut self,
         local_port: u16,
@@ -437,8 +505,11 @@ impl<T: BulkTransport> MuxLink<T> {
             .sessions
             .get_mut(&local_port)
             .ok_or(MuxError::NoSession { local_port })?;
-        if session.state() != SessionState::Established {
-            return Err(MuxError::Closed { local_port });
+        if !session.can_write() {
+            return Err(MuxError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("mux port {local_port} write side is closed"),
+            )));
         }
         session.queue(data);
         self.roundtrip.on_queue(local_port, data.len());
@@ -543,8 +614,11 @@ impl<T: BulkTransport> MuxLink<T> {
             .sessions
             .get_mut(&local_port)
             .ok_or(MuxError::NoSession { local_port })?;
-        if session.state() != SessionState::Established {
-            return Err(MuxError::Closed { local_port });
+        if !session.can_write() {
+            return Err(MuxError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("mux port {local_port} write side is closed"),
+            )));
         }
         session.queue(data);
         self.roundtrip.on_queue(local_port, data.len());
@@ -569,9 +643,10 @@ impl<T: BulkTransport> MuxLink<T> {
             snd_una: session.snd_una(),
             snd_nxt: session.snd_nxt(),
             snd_wnd_edge: session.snd_wnd_edge(),
+            send_epoch: session.send_epoch(),
             peer_window: session.peer_window(),
             usable: session.usable_window(),
-            pending: session.pending_len(),
+            pending: session.pending_sequences(),
             segments_in: session.segments_in(),
         })
     }
@@ -585,6 +660,32 @@ impl<T: BulkTransport> MuxLink<T> {
             return Ok(false);
         }
         self.flush(local_port)?;
+        Ok(true)
+    }
+
+    pub fn retransmit_unacknowledged(&mut self, local_port: u16) -> Result<bool, MuxError> {
+        if self.transport.send_capacity() == Some(false) {
+            return Ok(false);
+        }
+        let session = self
+            .sessions
+            .get(&local_port)
+            .ok_or(MuxError::NoSession { local_port })?;
+        let segment = session.retransmit_unacknowledged();
+        let Some(segment) = segment else {
+            return self.probe_window(local_port);
+        };
+        let outer_sequence = self
+            .version
+            .filter(|version| version.is_sequenced())
+            .map(|_| self.tx_seq);
+        self.send_segment(&segment.to_bytes())?;
+        self.trace(MuxTraceEvent::Retransmitted {
+            local_port,
+            sequence: segment.header.sequence,
+            bytes: segment.payload.len(),
+            outer_sequence,
+        });
         Ok(true)
     }
 
@@ -623,7 +724,7 @@ impl<T: BulkTransport> MuxLink<T> {
             if taken > 0 {
                 return Ok(taken);
             }
-            if self.session_state(local_port) == Some(SessionState::Closed) {
+            if self.received_eof(local_port)? {
                 return Ok(0);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -682,6 +783,11 @@ impl<T: BulkTransport> MuxLink<T> {
         let Some(session) = self.sessions.get_mut(&local_port) else {
             return Ok(());
         };
+        if session.orderly_closed() {
+            self.sessions.remove(&local_port);
+            self.roundtrip.on_close(local_port);
+            return Ok(());
+        }
         let segment = session.close();
         self.sessions.remove(&local_port);
         self.roundtrip.on_close(local_port);
@@ -693,6 +799,16 @@ impl<T: BulkTransport> MuxLink<T> {
         let Some(packet) = self.transport.recv(timeout)? else {
             return Ok(LinkEvent::Idle);
         };
+        self.packet_trace.packet(
+            Stage::PumpReceipt,
+            &packet,
+            Some(version),
+            None,
+            None,
+            None,
+            Disposition::Packet,
+            0,
+        );
         self.packets_received = self.packets_received.wrapping_add(1);
         let header = match MuxHeader::decode(version, &packet) {
             Ok(header) => header,
@@ -717,6 +833,19 @@ impl<T: BulkTransport> MuxLink<T> {
 
         if version.is_sequenced() {
             if header.tx_seq != self.rx_expected {
+                self.packet_trace.packet(
+                    Stage::Apply,
+                    &packet,
+                    Some(version),
+                    None,
+                    None,
+                    None,
+                    Disposition::SequenceGap {
+                        expected: self.rx_expected,
+                        received: header.tx_seq,
+                    },
+                    0,
+                );
                 self.trace(MuxTraceEvent::SequenceGap {
                     expected: self.rx_expected,
                     received: header.tx_seq,
@@ -729,6 +858,16 @@ impl<T: BulkTransport> MuxLink<T> {
             self.rx_expected = self.rx_expected.wrapping_add(1);
         }
 
+        if header.protocol == Protocol::Control {
+            self.trace(MuxTraceEvent::ControlMessage {
+                payload: payload.to_vec(),
+                acknowledged_host_packet: version.is_sequenced().then_some(header.rx_ack),
+            });
+            return Ok(LinkEvent::Other {
+                protocol: Protocol::Control,
+            });
+        }
+
         if header.protocol != Protocol::Tcp {
             self.trace(MuxTraceEvent::OtherProtocol {
                 protocol: header.protocol.wire_value(),
@@ -738,10 +877,35 @@ impl<T: BulkTransport> MuxLink<T> {
             });
         }
 
-        let tcp = TcpHeader::decode(payload)?;
+        let tcp = match TcpHeader::decode(payload) {
+            Ok(tcp) => tcp,
+            Err(error) => {
+                self.packet_trace.packet(
+                    Stage::Apply,
+                    &packet,
+                    Some(version),
+                    None,
+                    None,
+                    None,
+                    Disposition::TcpDecodeError(error),
+                    0,
+                );
+                return Err(error.into());
+            }
+        };
         let body = &payload[TCP_HEADER_LEN..];
         let local_port = tcp.destination_port;
         let Some(session) = self.sessions.get_mut(&local_port) else {
+            self.packet_trace.packet(
+                Stage::Apply,
+                &packet,
+                Some(version),
+                Some(local_port),
+                None,
+                None,
+                Disposition::Unmatched,
+                0,
+            );
             self.trace(MuxTraceEvent::Unmatched { local_port });
             return Ok(LinkEvent::Unmatched { local_port });
         };
@@ -753,14 +917,30 @@ impl<T: BulkTransport> MuxLink<T> {
             };
             self.trace(event);
         }
+        let before = self
+            .packet_trace
+            .enabled()
+            .then(|| self.send_state(local_port))
+            .flatten();
         let session = self
             .sessions
             .get_mut(&local_port)
             .ok_or(MuxError::NoSession { local_port })?;
         let una_before = session.snd_una();
-        let event = session
-            .on_segment(&tcp, body)
-            .map_err(|error| MuxError::Session { local_port, error })?;
+        let applied = session.on_segment(&tcp, body);
+        if self.packet_trace.enabled() {
+            self.packet_trace.packet(
+                Stage::Apply,
+                &packet,
+                Some(version),
+                Some(local_port),
+                before,
+                self.send_state(local_port),
+                Disposition::Session(applied),
+                0,
+            );
+        }
+        let event = applied.map_err(|error| MuxError::Session { local_port, error })?;
         let una_after = self.sessions.get(&local_port).map(MuxSession::snd_una);
         if let Some(una_after) = una_after {
             self.roundtrip.on_ack(
@@ -896,6 +1076,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::usbmux::frame::{DEVICE_MAGIC, HEADER_LEN_V2, VERSION_PACKET_LEN};
     use crate::usbmux::tcp::flags;
+    use crate::usbmux::trace::RecordingTrace;
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::io::{Read, Write};
@@ -912,6 +1093,7 @@ pub(crate) mod tests {
         sessions: Vec<DeviceSession>,
         sequence_faults: u32,
         window: u32,
+        drop_next_payload: bool,
     }
 
     #[derive(Debug)]
@@ -948,6 +1130,10 @@ pub(crate) mod tests {
         pub(crate) fn with_window(self, window: u32) -> Self {
             self.state.borrow_mut().window = window;
             self
+        }
+
+        pub(crate) fn drop_next_payload(&self) {
+            self.state.borrow_mut().drop_next_payload = true;
         }
 
         pub(crate) fn received_packets(&self) -> Vec<Vec<u8>> {
@@ -1029,7 +1215,7 @@ pub(crate) mod tests {
             let _ = sequence;
             state.sessions[index].snd_nxt = state.sessions[index]
                 .snd_nxt
-                .wrapping_add(data.len() as u32);
+                .wrapping_add(data.len() as u32 + u32::from(header.is_fin()));
             let payload = encode_segment(header, data);
             state.queue_tcp(&payload);
         }
@@ -1158,7 +1344,7 @@ pub(crate) mod tests {
                 self.queue_tcp(&segment);
                 return;
             }
-            if !tcp.is_bare_ack() {
+            if !tcp.is_bare_ack() && !tcp.is_fin() {
                 return;
             }
             let Some(index) = self
@@ -1168,6 +1354,10 @@ pub(crate) mod tests {
             else {
                 return;
             };
+            if !body.is_empty() && self.drop_next_payload {
+                self.drop_next_payload = false;
+                return;
+            }
             if tcp.sequence != self.sessions[index].rcv_nxt {
                 return;
             }
@@ -1175,6 +1365,9 @@ pub(crate) mod tests {
                 self.sessions[index].received.extend_from_slice(body);
                 self.sessions[index].rcv_nxt =
                     self.sessions[index].rcv_nxt.wrapping_add(body.len() as u32);
+            }
+            if tcp.is_fin() {
+                self.sessions[index].rcv_nxt = self.sessions[index].rcv_nxt.wrapping_add(1);
             }
             let reply = {
                 let session = &self.sessions[index];
@@ -1294,6 +1487,60 @@ pub(crate) mod tests {
         );
         wire.take_sent();
         (link, wire)
+    }
+
+    #[test]
+    fn a_device_control_warning_is_reported_with_its_text() {
+        let (link, wire) = negotiated_wire();
+        let trace = Arc::new(RecordingTrace::new());
+        let mut link = link.with_trace(trace.clone());
+        let payload = b"\x05duplicate ack received, ignoring\n";
+        let mut packet = device_packet(0, 0, payload);
+        packet[0..4].copy_from_slice(&Protocol::Control.wire_value().to_be_bytes());
+        wire.queue(packet);
+
+        assert_eq!(
+            link.pump(Duration::from_millis(50)).unwrap(),
+            LinkEvent::Other {
+                protocol: Protocol::Control,
+            }
+        );
+        let rendered = trace.events().last().unwrap().to_string();
+        assert!(rendered.contains("result=control-message"), "{rendered}");
+        assert!(rendered.contains("code=5"), "{rendered}");
+        assert!(rendered.contains("device-rx-ack=0"), "{rendered}");
+        assert!(
+            rendered.contains("duplicate ack received, ignoring\\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn version_exchange_reaches_reply_after_queued_prior_session_tcp() {
+        let wire = Wire::new();
+        let prior_segment = encode_segment(
+            TcpHeader {
+                source_port: 62078,
+                destination_port: FIRST_LOCAL_PORT,
+                sequence: 9,
+                acknowledgement: 12,
+                flags: flags::ACK,
+                window: 65535,
+            },
+            &[],
+        );
+        wire.queue(device_packet(4, 0, &prior_segment));
+        wire.queue(device_version_reply(MuxVersion::V2.wire_value()));
+        let mut link = MuxLink::new(wire.clone());
+        assert_eq!(
+            link.negotiate(VersionRequest::resync(), Duration::from_millis(50))
+                .unwrap(),
+            MuxVersion::V2
+        );
+        assert_eq!(
+            VersionPacket::decode(&wire.take_sent()[0]).unwrap().version,
+            HOST_MAGIC
+        );
     }
 
     fn drain_handshake_ack<T: BulkTransport>(link: &mut MuxLink<T>) {
@@ -1600,6 +1847,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_unacknowledged_payload_is_retransmitted_at_its_original_sequence() {
+        let (link, device) = negotiated_device();
+        let trace = Arc::new(RecordingTrace::new());
+        let mut link = link.with_trace(trace.clone());
+        let port = link.open(62078, Duration::from_millis(200)).unwrap();
+        drain_handshake_ack(&mut link);
+        device.drop_next_payload();
+        let payload = b"restore image data";
+        assert_eq!(link.queue_write(port, payload).unwrap(), 0);
+        let sent = link.send_state(port).unwrap();
+        assert_eq!(
+            sent.snd_nxt.wrapping_sub(sent.snd_una),
+            payload.len() as u32
+        );
+
+        assert!(link.retransmit_unacknowledged(port).unwrap());
+        let rendered = trace.events().last().unwrap().to_string();
+        assert!(rendered.contains("result=retransmitted"), "{rendered}");
+        assert!(rendered.contains("outer-seq="), "{rendered}");
+        assert_eq!(device.session_bytes(port), payload);
+        link.drain_inbound().unwrap();
+        let acknowledged = link.send_state(port).unwrap();
+        assert_eq!(acknowledged.snd_una, acknowledged.snd_nxt);
+    }
+
+    #[test]
+    fn a_shut_window_probes_before_retransmitting_and_resumes_after_it_opens() {
+        let (mut link, device) = negotiated_device();
+        let port = link.open(62078, Duration::from_millis(200)).unwrap();
+        drain_handshake_ack(&mut link);
+        device.drop_next_payload();
+        let payload = b"restore image data";
+        assert_eq!(link.queue_write(port, payload).unwrap(), 0);
+        let sent = link.send_state(port).unwrap();
+
+        device.clone().with_window(0).push(port, b"");
+        link.drain_inbound().unwrap();
+        assert!(link.retransmit_unacknowledged(port).unwrap());
+        let packets = device.received_packets();
+        let probe = packets.last().expect("the closed window is probed");
+        let header = MuxHeader::decode(MuxVersion::V2, probe).unwrap();
+        let segment = header.payload(MuxVersion::V2, probe).unwrap();
+        assert_eq!(segment.len(), TCP_HEADER_LEN);
+        let tcp = TcpHeader::decode(segment).unwrap();
+        assert_eq!(tcp.sequence, sent.snd_nxt);
+        assert_eq!(tcp.flags, flags::ACK);
+
+        device.clone().with_window(65536).push(port, b"");
+        link.drain_inbound().unwrap();
+        assert!(link.retransmit_unacknowledged(port).unwrap());
+        assert_eq!(device.session_bytes(port), payload);
+        link.drain_inbound().unwrap();
+        let delivered = link.send_state(port).unwrap();
+        assert_eq!(delivered.snd_una, delivered.snd_nxt);
+    }
+
+    #[test]
     fn a_send_window_that_is_shut_can_be_probed_and_says_what_it_is_parked_on() {
         let device = Device::new().with_window(0);
         let mut link = MuxLink::new(device.clone());
@@ -1647,7 +1951,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_segment_that_is_not_a_bare_ack_ends_the_session_by_name() {
+    fn unsupported_push_flags_close_the_session_by_name() {
         let (mut link, device) = negotiated_device();
         let port = link.open(62078, Duration::from_millis(200)).unwrap();
         drain_handshake_ack(&mut link);

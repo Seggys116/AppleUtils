@@ -199,7 +199,7 @@ fn render_system_cards(frame: &mut Frame, area: Rect, app: &mut App) {
     let [header, body, control] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
-        Constraint::Length(1),
+        Constraint::Length(3),
     ])
     .areas(area);
     let visible = visible_card_count(body).min(systems.len()).max(1);
@@ -236,7 +236,7 @@ fn render_system_cards(frame: &mut Frame, area: Rect, app: &mut App) {
         }
     }
     render_list_scrollbar(frame, &rects, systems.len(), visible, cursor);
-    render_local_policy_signing(frame, control, app);
+    render_signing_controls(frame, control, app);
 }
 
 fn render_pick_mode(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -276,10 +276,10 @@ fn render_mode_cards(frame: &mut Frame, area: Rect, app: &mut App) {
     let [header, body, control] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
-        Constraint::Length(1),
+        Constraint::Length(3),
     ])
     .areas(area);
-    render_local_policy_signing(frame, control, app);
+    render_signing_controls(frame, control, app);
     let system = app
         .recovery
         .model
@@ -305,6 +305,77 @@ fn render_mode_cards(frame: &mut Frame, area: Rect, app: &mut App) {
             ui::render_choice_card(frame, rect, mode.title(), mode.detail(), index == cursor);
         }
     }
+}
+
+fn render_signing_controls(frame: &mut Frame, area: Rect, app: &mut App) {
+    let [apple, vm, tcon] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+    render_local_policy_signing(frame, apple, app);
+    render_vm_local_signing(frame, vm, app);
+    render_skip_tcon_firmware(frame, tcon, app);
+}
+
+fn render_skip_tcon_firmware(frame: &mut Frame, area: Rect, app: &mut App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let enabled = app.recovery.model.skip_tcon_firmware;
+    let title = crate::recovery_model::skip_tcon_firmware_title(enabled);
+    let sentence = format!("t  {title}  ·  requires separately patched recovery media");
+    let text = if sentence.chars().count() <= usize::from(area.width) {
+        sentence
+    } else {
+        format!("t  {title}")
+    };
+    let style = if enabled {
+        theme::fail().add_modifier(Modifier::BOLD)
+    } else {
+        theme::mute()
+    };
+    app.recovery.model.hits.skip_tcon_firmware = area;
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            ui::truncate_middle(&text, area.width),
+            style,
+        )))
+        .alignment(Alignment::Center),
+        area,
+    );
+}
+
+fn render_vm_local_signing(frame: &mut Frame, area: Rect, app: &mut App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let enabled = app.recovery.model.vm_local_signing_enabled;
+    let title = crate::recovery_model::vm_local_signing_title(enabled);
+    let sentence = format!(
+        "l  {title}  ·  {}",
+        crate::recovery_model::vm_local_signing_detail(enabled)
+    );
+    let text = if sentence.chars().count() <= usize::from(area.width) {
+        sentence
+    } else {
+        format!("l  {title}")
+    };
+    let style = if enabled {
+        theme::ice().add_modifier(Modifier::BOLD)
+    } else {
+        theme::mute()
+    };
+    app.recovery.model.hits.vm_local_signing = area;
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            ui::truncate_middle(&text, area.width),
+            style,
+        )))
+        .alignment(Alignment::Center),
+        area,
+    );
 }
 
 fn render_local_policy_signing(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -361,8 +432,8 @@ fn render_pick_device(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     let [area, control] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
-    render_local_policy_signing(frame, control, app);
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]).areas(area);
+    render_signing_controls(frame, control, app);
     let cursor = app.recovery.model.device_cursor;
     let visible = visible_card_count(area).min(connected.len()).max(1);
     app.recovery.model.device_page_rows = visible;
@@ -546,9 +617,14 @@ fn scroll_start(len: usize, cursor: usize, height: usize) -> usize {
 
 fn stacked_cards_n(area: Rect, n: usize, rail: u16) -> Vec<Rect> {
     let n = n.max(1) as u16;
-    let inner = ui::inset(area, 2, 1);
+    let vertical_padding = u16::from(area.height >= n.saturating_mul(3).saturating_add(2));
+    let inner = ui::inset(area, 2, vertical_padding);
     let card_gap = u16::from(inner.height >= n * 6);
-    let card_h = if inner.height >= n * 5 { 4 } else { 3 };
+    let card_h = if inner.height >= n * 5 {
+        4
+    } else {
+        3.min(inner.height / n)
+    };
     let cards_h = card_h * n + card_gap * n.saturating_sub(1);
     let usable = inner.width.saturating_sub(rail);
     let card_w = usable.saturating_sub(2).min(66).max(36.min(usable));
@@ -631,6 +707,47 @@ mod tests {
         );
         event.kind = KeyEventKind::Press;
         app.handle_event(Event::Key(event));
+    }
+
+    fn press_vm_signing_key(app: &mut App) {
+        use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        let mut event = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
+        event.kind = KeyEventKind::Press;
+        app.handle_event(Event::Key(event));
+    }
+
+    fn assert_signing_controls(app: &App, text: &str, apple: bool, vm: bool) {
+        assert!(
+            text.contains(crate::recovery_model::local_policy_signing_title(apple)),
+            "{text}"
+        );
+        assert!(
+            text.contains(crate::recovery_model::vm_local_signing_title(vm)),
+            "{text}"
+        );
+        assert!(
+            text.contains(crate::recovery_model::vm_local_signing_detail(vm)),
+            "{text}"
+        );
+        assert_eq!(
+            (
+                app.recovery.model.sign_recovery_os_local_policy,
+                app.recovery.model.vm_local_signing_enabled,
+            ),
+            (apple, vm)
+        );
+        let apple = app.recovery.model.hits.local_policy_signing;
+        let vm = app.recovery.model.hits.vm_local_signing;
+        assert!(apple.width > 0 && vm.width > 0);
+        assert_eq!((apple.height, vm.height), (1, 1));
+        assert_eq!(apple.bottom(), vm.y);
+        assert!(
+            app.recovery
+                .model
+                .hits
+                .local_policy_signing_at(apple.x, apple.y)
+        );
+        assert!(app.recovery.model.hits.vm_local_signing_at(vm.x, vm.y));
     }
 
     fn boards(classes: &[&str]) -> Vec<CompatibleSystem> {
@@ -794,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn the_signing_control_is_on_every_screen_a_restore_is_set_up_from() {
+    fn signing_controls_are_independent_on_each_restore_setup_screen() {
         let mut app = App::new();
         app.screen = Screen::Recovery;
         app.recovery.model.requests.clear();
@@ -811,10 +928,14 @@ mod tests {
             }));
         assert_eq!(app.recovery.model.step(), RecoveryStep::PickDevice);
         let text = render_text(&mut app, 100, 32);
-        assert!(text.contains("LocalPolicy signing off"), "{text}");
+        assert_signing_controls(&app, &text, false, true);
+        press_vm_signing_key(&mut app);
+        let text = render_text(&mut app, 100, 32);
+        assert_signing_controls(&app, &text, false, false);
+        assert!(text.contains("Apple restore signing off"), "{text}");
         assert!(
             text.contains("Apple is not contacted"),
-            "the off state says plainly that nothing is sent: {text}"
+            "the off state identifies the Apple policy setting: {text}"
         );
 
         press_signing_key(&mut app);
@@ -823,10 +944,11 @@ mod tests {
             "the key arms the opt in"
         );
         let text = render_text(&mut app, 100, 32);
-        assert!(text.contains("LocalPolicy signing armed"), "{text}");
+        assert_signing_controls(&app, &text, true, false);
+        assert!(text.contains("Apple restore signing armed"), "{text}");
         assert!(
-            text.contains("ECID, chip and board"),
-            "the armed state names what is sent to Apple: {text}"
+            text.contains("device identity and requests"),
+            "the armed state names the signing request sent to Apple: {text}"
         );
         assert!(
             text.contains("gs.apple.com"),
@@ -842,12 +964,13 @@ mod tests {
             });
         assert_eq!(app.recovery.model.step(), RecoveryStep::PickSystem);
         let text = render_text(&mut app, 100, 32);
-        assert!(text.contains("LocalPolicy signing armed"), "{text}");
+        assert_signing_controls(&app, &text, true, false);
+        press_vm_signing_key(&mut app);
+        let text = render_text(&mut app, 100, 32);
+        assert_signing_controls(&app, &text, true, true);
         press_signing_key(&mut app);
-        assert!(
-            !app.recovery.model.sign_recovery_os_local_policy,
-            "the same key disarms it from the system screen"
-        );
+        let text = render_text(&mut app, 100, 32);
+        assert_signing_controls(&app, &text, false, true);
 
         app.recovery
             .model
@@ -861,12 +984,96 @@ mod tests {
             });
         assert_eq!(app.recovery.model.step(), RecoveryStep::PickMode);
         let text = render_text(&mut app, 100, 32);
-        assert!(text.contains("LocalPolicy signing off"), "{text}");
+        assert_signing_controls(&app, &text, false, true);
+        press_vm_signing_key(&mut app);
+        let text = render_text(&mut app, 100, 32);
+        assert_signing_controls(&app, &text, false, false);
         press_signing_key(&mut app);
-        assert!(
-            app.recovery.model.sign_recovery_os_local_policy,
-            "the same key arms it from the mode screen"
-        );
+        let text = render_text(&mut app, 100, 32);
+        assert_signing_controls(&app, &text, true, false);
+    }
+
+    #[test]
+    fn signing_and_tcon_rows_fit_the_minimum_terminal_on_each_setup_screen() {
+        let mut app = App::new();
+        app.screen = Screen::Recovery;
+        app.recovery.model.requests.clear();
+        app.recovery
+            .model
+            .apply_event(RecoveryEvent::DeviceDiscovered(RecoveryDevice {
+                id: "dev-1".into(),
+                title: "Mac mini".into(),
+                detail: "j274ap".into(),
+                connection: "usb".into(),
+                state: DeviceState::Available,
+                connected: true,
+            }));
+        for step in [
+            RecoveryStep::PickDevice,
+            RecoveryStep::PickSystem,
+            RecoveryStep::PickMode,
+        ] {
+            match step {
+                RecoveryStep::PickSystem => {
+                    app.recovery
+                        .model
+                        .apply_event(RecoveryEvent::CompatibleBoards {
+                            systems: boards(&["j274ap", "j293ap"]),
+                            product_version: None,
+                            product_build: None,
+                        });
+                }
+                RecoveryStep::PickMode => {
+                    app.recovery
+                        .model
+                        .apply_event(RecoveryEvent::SystemSelected {
+                            class: "j274ap".into(),
+                        });
+                    app.recovery
+                        .model
+                        .apply_event(RecoveryEvent::CompatibleModes {
+                            modes: vec![RestoreMode::Update, RestoreMode::Erase],
+                        });
+                }
+                _ => {}
+            }
+            assert_eq!(app.recovery.model.step(), step);
+            let full = render_text(&mut app, 100, 32);
+            assert!(
+                full.contains("requires separately patched recovery media"),
+                "{full}"
+            );
+            let text = render_text(&mut app, ui::MIN_WIDTH, ui::MIN_HEIGHT);
+            assert!(text.contains("p  Apple signing off"), "{text}");
+            assert!(text.contains("l  VM local signing on"), "{text}");
+            assert!(text.contains("t  Skip TCON firmware off"), "{text}");
+            let tcon = app.recovery.model.hits.skip_tcon_firmware;
+            assert_eq!(tcon.height, 1);
+            assert!(
+                app.recovery
+                    .model
+                    .hits
+                    .skip_tcon_firmware_at(tcon.x, tcon.y)
+            );
+            let apple = app.recovery.model.hits.local_policy_signing;
+            let vm = app.recovery.model.hits.vm_local_signing;
+            assert_eq!((apple.height, vm.height), (1, 1));
+            assert_eq!(apple.bottom(), vm.y);
+            assert_eq!(vm.bottom(), tcon.y);
+            for card in &app.recovery.model.hits.device_rows {
+                assert!(
+                    card.bottom() <= apple.y,
+                    "cards must fit above the signing controls"
+                );
+            }
+            assert!(
+                app.recovery
+                    .model
+                    .hits
+                    .local_policy_signing_at(apple.x, apple.y)
+            );
+            assert!(app.recovery.model.hits.vm_local_signing_at(vm.x, vm.y));
+        }
     }
 
     #[test]

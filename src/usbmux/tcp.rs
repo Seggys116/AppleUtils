@@ -14,7 +14,6 @@ pub mod flags {
     pub const SYN: u8 = 0x02;
     pub const RST: u8 = 0x04;
     pub const PSH: u8 = 0x08;
-    // Established sessions: the device matches the flag byte for equality, not by bit test.
     pub const ACK: u8 = 0x10;
     pub const URG: u8 = 0x20;
 
@@ -104,6 +103,11 @@ impl TcpHeader {
     #[must_use]
     pub const fn is_syn_ack(&self) -> bool {
         self.flags == flags::SYN_ACK
+    }
+
+    #[must_use]
+    pub const fn is_fin(&self) -> bool {
+        self.flags & flags::FIN != 0 && self.flags & !(flags::FIN | flags::ACK | flags::PSH) == 0
     }
 
     #[must_use]

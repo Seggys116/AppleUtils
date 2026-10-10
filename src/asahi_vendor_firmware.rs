@@ -21,7 +21,7 @@ pub struct VendorFirmwareFile {
 }
 
 pub struct VendorFirmwarePackage {
-    pub directory: tempfile::TempDir,
+    pub directory: crate::scratch::ScratchDir,
     pub files: Vec<VendorFirmwareFile>,
     pub installer_digest: String,
 }
@@ -210,13 +210,15 @@ pub fn build_vendor_firmware(
     if let Some(path) = &calibration {
         confined_tree(path)?;
     }
-    let decoded = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let decoded = crate::scratch::ScratchDir::new("apple-utils-firmware-decode-")
+        .map_err(|e| e.to_string())?;
     let raw_kernel = decoded.path().join("kernel.raw");
     let kernel_bytes = std::fs::read(&kernel).map_err(|e| e.to_string())?;
     let kernel_bytes = crate::asahi_kernel::decode_kernel_im4p(&kernel_bytes, 1024 * 1024 * 1024)?;
     std::fs::write(&raw_kernel, kernel_bytes).map_err(|e| e.to_string())?;
     let multitouch = decode_multitouch(&fud, decoded.path())?;
-    let directory = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let directory =
+        crate::scratch::ScratchDir::new("apple-utils-firmware-").map_err(|e| e.to_string())?;
     let request = serde_json::json!({"installer":installer,"wifi":wifi,"bluetooth":bluetooth,"isp":isp,
         "multitouch":multitouch,"kernel":raw_kernel,"calibration":calibration,"output":directory.path()});
     let mut child = Command::new("python3")

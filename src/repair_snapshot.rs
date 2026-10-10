@@ -654,6 +654,7 @@ fn publish_transaction(
     let spaceman_body = private.materialize(disc, new_xid)?;
     let publish = CheckpointPublish {
         omap_oid: Some(new_omap_paddr),
+        next_oid: None,
         ephemeral_bodies: vec![(spaceman_oid, spaceman_body)],
     };
     Ok(checkpoint::append_with(

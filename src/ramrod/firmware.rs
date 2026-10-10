@@ -1152,11 +1152,8 @@ mod tests {
 
     #[test]
     fn every_component_in_the_plan_is_built_from_its_own_file() {
-        let root = std::env::temp_dir().join(format!(
-            "ramrod-nor-payload-{}-{}",
-            std::process::id(),
-            "built"
-        ));
+        let scratch = tempfile::tempdir().expect("the scratch directory is created");
+        let root = scratch.path().to_path_buf();
         let all_flash = root.join("Firmware").join("all_flash");
         std::fs::create_dir_all(&all_flash).expect("the source tree is created");
         let llb = im4p("illb", b"llb payload");

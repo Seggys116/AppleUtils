@@ -6,8 +6,8 @@ use plist::Dictionary;
 use crate::ramrod::client::{RamrodClient, connect_and_identify};
 use crate::ramrod::dial::{Clock, DialPlan, GuestDialer};
 use crate::ramrod::{
-    BuildIdentity, DataType, DeviceType, RamrodError, RestoreOptions, bulk_image_entry,
-    bulk_image_types, load_build_manifest, resolve_bulk_image,
+    DataType, DeviceType, RamrodError, RestoreOptions, bulk_image_entry, bulk_image_types,
+    load_build_manifest, resolve_bulk_image,
 };
 
 use super::options::{
@@ -57,8 +57,8 @@ pub struct SelectedIdentitySummary {
     pub hardware_model: String,
     pub install_index: usize,
     pub install_variant: String,
-    pub macos_index: usize,
-    pub macos_variant: String,
+    pub recovery_index: Option<usize>,
+    pub recovery_variant: Option<String>,
 }
 
 #[derive(Debug)]
@@ -172,7 +172,7 @@ fn explicit_bulk_override<'a>(plan: &'a RestorePlan, data_type: &DataType) -> Op
 fn bulk_requirements(
     plan: &RestorePlan,
     root: &Path,
-    identity: &BuildIdentity,
+    derived: &DerivedRestoreOptions,
 ) -> Vec<AssetRequirement> {
     let mut requirements = Vec::new();
     for data_type in bulk_image_types() {
@@ -197,6 +197,26 @@ fn bulk_requirements(
             });
             continue;
         }
+        let identity = if matches!(data_type, DataType::RecoveryOSASRImage) && !derived.is_macos {
+            derived.recovery_identity.as_ref()
+        } else {
+            Some(&derived.install_identity)
+        };
+        let Some(identity) = identity else {
+            requirements.push(AssetRequirement {
+                kind: AssetKind::BulkImage {
+                    data_type: data_type.wire_name().to_string(),
+                    component: entry.entry.to_string(),
+                },
+                required: false,
+                check: AssetCheck {
+                    path: root.to_path_buf(),
+                    state: AssetState::NotRequested,
+                    detail: "install identity declares no recovery variant".to_string(),
+                },
+            });
+            continue;
+        };
         match resolve_bulk_image(&entry, identity, root) {
             Ok(resolved) => {
                 requirements.push(AssetRequirement {
@@ -277,7 +297,7 @@ fn build_prepared_restore_session(
             "the directory bulk image resolution runs under",
         ),
     });
-    assets.extend(bulk_requirements(plan, &root, &derived.install_identity));
+    assets.extend(bulk_requirements(plan, &root, &derived));
 
     if let Some(path) = &plan.bootability_bundle {
         assets.push(AssetRequirement {
@@ -332,8 +352,8 @@ fn build_prepared_restore_session(
         hardware_model: derived.hardware_model.clone(),
         install_index: derived.install_index,
         install_variant: derived.install_variant.clone(),
-        macos_index: derived.macos_index,
-        macos_variant: derived.macos_variant.clone(),
+        recovery_index: derived.recovery_index,
+        recovery_variant: derived.recovery_variant.clone(),
     };
 
     PreparedRestoreSession {
@@ -477,7 +497,9 @@ mod tests {
             bootability_bundle: None,
             corrupt_manifest: false,
             staged_boot_manifest_sha384: None,
+            staged_boot_manifest: None,
             fdr_trust_digest: None,
+            restore_ramdisk: None,
             fdr_material_dir: None,
             sign_recovery_os_local_policy: false,
         }

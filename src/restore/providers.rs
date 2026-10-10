@@ -19,9 +19,10 @@ use crate::ramrod::{
 };
 
 use super::local_policy::{
-    DeviceHardwareInfo, IdentityRefusal, LocalPolicyCensus, LocalPolicyIdentity,
-    LocalPolicyIdentitySource, RecoveryOsLocalPolicyInputs, RecoveryOsLocalPolicyRequest,
-    RecoveryOsLocalPolicySigner, SigningRefusal, next_stage_im4m_hash, personalize,
+    DeviceHardwareInfo, FirmwareUpdaterSigner, IdentityRefusal, LocalPolicyCensus,
+    LocalPolicyIdentity, LocalPolicyIdentitySource, RecoveryOsLocalPolicyInputs,
+    RecoveryOsLocalPolicyRequest, RecoveryOsLocalPolicySigner, SigningRefusal,
+    next_stage_im4m_hash, personalize,
 };
 use super::plan::{FdrTrustDigest, hex_digest};
 use super::report::{MUX_PREFIX, SharedReporter, lock, report};
@@ -43,6 +44,9 @@ pub const KEY_FDR_MEMORY_STORE_DATA: &str = "FDRMemoryStoreData";
 
 fn describe_bulk_outcome(outcome: &BulkOutcome) -> String {
     match outcome {
+        BulkOutcome::Received { bytes, path } => {
+            format!("received_bytes={bytes} path=\"{}\"", path.display())
+        }
         BulkOutcome::Served {
             bytes,
             blocks,
@@ -269,7 +273,6 @@ impl SessionObserver for RamrodTrace {
             self.checkpoint_state()
         );
         report(&self.reporter, "data-requested", &line);
-        lock(&self.reporter).data_request(request.data_type.wire_name(), false);
     }
 
     fn on_data_answered(&mut self, request: &DataRequest, keys: &[&str], bytes: usize) {
@@ -298,6 +301,28 @@ impl SessionObserver for RamrodTrace {
             self.port, self.armed_at_secs, request.data_type,
         );
         report(&self.reporter, "data-streamed", &line);
+        lock(&self.reporter).data_request(request.data_type.wire_name(), true);
+    }
+
+    fn on_bulk_receiving(&mut self, request: &DataRequest, port: u16) {
+        let sequence = self.next_sequence();
+        let line = format!(
+            "{MUX_PREFIX} result=bulk-receiving port={} at={:.3}s seq={sequence} type={:?} data_port={port} meaning=\"the host is connecting to receive the guest updater output\"",
+            self.port, self.armed_at_secs, request.data_type,
+        );
+        report(&self.reporter, "bulk-receiving", &line);
+    }
+
+    fn on_bulk_received(&mut self, request: &DataRequest, port: u16, bytes: u64, path: &Path) {
+        let sequence = self.next_sequence();
+        let line = format!(
+            "{MUX_PREFIX} result=bulk-received port={} at={:.3}s seq={sequence} type={:?} data_port={port} received_bytes={bytes} path=\"{}\" meaning=\"the guest updater output reached EOF, was persisted and synced, and the host shut down its write half to release the guest\"",
+            self.port,
+            self.armed_at_secs,
+            request.data_type,
+            path.display(),
+        );
+        report(&self.reporter, "bulk-received", &line);
         lock(&self.reporter).data_request(request.data_type.wire_name(), true);
     }
 
@@ -357,6 +382,19 @@ impl SessionObserver for RamrodTrace {
         );
         report(&self.reporter, "bulk-declined", &line);
         lock(&self.reporter).data_request(request.data_type.wire_name(), false);
+    }
+
+    fn on_bulk_cancelled(&mut self, request: &DataRequest, port: u16, reason: &str) {
+        let sequence = self.next_sequence();
+        let line = format!(
+            "{MUX_PREFIX} result=bulk-cancelled port={} at={:.3}s seq={sequence} type={:?} data_port={port} async={} async_uuid={} meaning=\"the restore control session ended and this outstanding transfer was cancelled during cleanup; this outcome does not measure how many payload bytes had already been delivered\" detail=\"{reason}\"",
+            self.port,
+            self.armed_at_secs,
+            request.data_type,
+            request.asynchronous,
+            request.async_context_uuid.as_deref().unwrap_or("none")
+        );
+        report(&self.reporter, "bulk-cancelled", &line);
     }
 
     fn on_async_wait(&mut self, uuid: Option<&str>, body: &plist::Dictionary) {
@@ -425,18 +463,20 @@ fn describe_plist_value(value: &plist::Value) -> String {
 #[derive(Clone, Debug)]
 pub struct RestoreVariants {
     pub install: String,
-    pub recovery_os: String,
+    pub recovery_os: Option<String>,
 }
 
 impl RestoreVariants {
     #[must_use]
     pub fn os_order(&self) -> Vec<&str> {
-        vec![self.install.as_str(), self.recovery_os.as_str()]
+        std::iter::once(self.install.as_str())
+            .chain(self.recovery_os.as_deref())
+            .collect()
     }
 
     #[must_use]
     pub fn recovery_order(&self) -> Vec<&str> {
-        vec![self.recovery_os.as_str()]
+        self.recovery_os.as_deref().into_iter().collect()
     }
 }
 
@@ -470,10 +510,12 @@ pub struct GlobalManifestProvider {
     armed_at_secs: f64,
     logged: std::collections::HashSet<String>,
     staged_boot_manifest_sha384: Option<[u8; 48]>,
+    staged_boot_manifest: Option<Vec<u8>>,
     fdr_trust_digest: Option<FdrTrustDigest>,
     ap_nonce: Option<[u8; BOOT_NONCE_HASH_BYTES]>,
     // Guest hashes the served ticket, not the file on disk (FDR/nonce rewrite first).
     served_os_root_ticket: Option<Vec<u8>>,
+    personalized_root: Option<PathBuf>,
     reporter: SharedReporter,
 }
 
@@ -499,12 +541,26 @@ impl GlobalManifestProvider {
             port,
             armed_at_secs,
             staged_boot_manifest_sha384,
+            staged_boot_manifest: None,
             fdr_trust_digest,
             ap_nonce,
             served_os_root_ticket: None,
+            personalized_root: None,
             logged: std::collections::HashSet::new(),
             reporter: Arc::clone(reporter),
         }
+    }
+
+    #[must_use]
+    pub fn with_personalized_source(mut self, root: PathBuf) -> Self {
+        self.personalized_root = Some(root);
+        self
+    }
+
+    #[must_use]
+    pub fn with_staged_boot_manifest(mut self, manifest: Option<Vec<u8>>) -> Self {
+        self.staged_boot_manifest = manifest;
+        self
     }
 
     #[must_use]
@@ -558,9 +614,7 @@ impl GlobalManifestProvider {
         let bytes = load_global_manifest(&resolved).map_err(|error| error.to_string())?;
         Ok(SplatManifest {
             bytes,
-            path: resolved.path,
             variant: resolved.variant,
-            nonce_staged: false,
         })
     }
 }
@@ -574,9 +628,15 @@ impl GlobalManifestProvider {
     }
 
     fn recovery_os_manifest(&self) -> Result<SplatManifest, String> {
+        if self.variants.recovery_os.is_none() {
+            return Err(format!(
+                "no recovery OS variant was declared for {} in this restore",
+                self.hardware_model
+            ));
+        }
         let order = self.variants.recovery_order();
         let resolved = resolve_global_manifest_in_variants(
-            &self.root,
+            self.personalized_root.as_ref().unwrap_or(&self.root),
             &order,
             &self.hardware_model,
             GlobalManifestKind::Os,
@@ -585,18 +645,14 @@ impl GlobalManifestProvider {
         let bytes = load_global_manifest(&resolved).map_err(|error| error.to_string())?;
         Ok(SplatManifest {
             bytes,
-            path: resolved.path,
             variant: resolved.variant,
-            nonce_staged: false,
         })
     }
 }
 
 struct SplatManifest {
     bytes: Vec<u8>,
-    path: PathBuf,
     variant: String,
-    nonce_staged: bool,
 }
 
 impl RestoreDataProvider for GlobalManifestProvider {
@@ -619,12 +675,65 @@ impl RestoreDataProvider for GlobalManifestProvider {
                 data_type: request.data_type.wire_name().to_string(),
             });
         };
+        if matches!((role, kind), (TicketRole::Os, GlobalManifestKind::Os))
+            && let Some(staged) = self.staged_boot_manifest.as_deref()
+        {
+            let digest = sha384(staged);
+            if staged.is_empty() || self.staged_boot_manifest_sha384 != Some(digest) {
+                return Err(ProviderError::Other(
+                    "staged OS root ticket does not match the VM boot manifest digest".to_string(),
+                ));
+            }
+            let served = if self.corrupt {
+                corrupt_manifest_bytes(staged)
+            } else {
+                staged.to_vec()
+            };
+            self.served_os_root_ticket = Some(served.clone());
+            report(
+                &self.reporter,
+                "ticket-staged-answered",
+                &format!(
+                    "{MUX_PREFIX} result=ticket-staged-answered port={} at={:.3}s type={:?} bytes={} sha384={} corrupt={} meaning=\"the OS root ticket is the exact Image4 manifest measured into the VM boot device tree\"",
+                    self.port,
+                    self.armed_at_secs,
+                    request.data_type,
+                    served.len(),
+                    hex_digest(&sha384(&served)),
+                    self.corrupt,
+                ),
+            );
+            let mut body = plist::Dictionary::new();
+            body.insert("RootTicketData".to_string(), plist::Value::Data(served));
+            return Ok(body);
+        }
         let order = match role {
             TicketRole::Os => self.variants.os_order(),
             TicketRole::RecoveryOs => self.variants.recovery_order(),
         };
+        if role == TicketRole::RecoveryOs && self.variants.recovery_os.is_none() {
+            let reason = format!(
+                "no recovery OS variant was declared for {} in this restore",
+                self.hardware_model
+            );
+            let line = format!(
+                "{MUX_PREFIX} result=ticket-manifest-missing port={} at={:.3}s type={:?} role={} kind={} meaning=\"the guest requested a recovery OS ticket but this restore declared no recovery identity\" detail=\"{reason}\"",
+                self.port,
+                self.armed_at_secs,
+                request.data_type,
+                role.label(),
+                kind.label()
+            );
+            report(&self.reporter, "ticket-manifest-missing", &line);
+            return Err(ProviderError::Other(reason));
+        }
+        let source_root = if kind == GlobalManifestKind::Os {
+            self.personalized_root.as_ref().unwrap_or(&self.root)
+        } else {
+            &self.root
+        };
         let resolved = match resolve_global_manifest_in_variants(
-            &self.root,
+            source_root,
             &order,
             &self.hardware_model,
             kind,
@@ -669,11 +778,38 @@ impl RestoreDataProvider for GlobalManifestProvider {
                 )));
             }
         };
+        if self.personalized_root.is_some() && kind == GlobalManifestKind::Os {
+            let served = if self.corrupt {
+                corrupt_manifest_bytes(&bytes)
+            } else {
+                bytes
+            };
+            if matches!((role, kind), (TicketRole::Os, GlobalManifestKind::Os)) {
+                self.served_os_root_ticket = Some(served.clone());
+            }
+            let line = format!(
+                "{MUX_PREFIX} result=ticket-personalized-answered port={} at={:.3}s type={:?} role={} kind={} variant={:?} bytes={} sha384={} corrupt={} detail=\"TSS response preserved; path={}\"",
+                self.port,
+                self.armed_at_secs,
+                request.data_type,
+                role.label(),
+                kind.label(),
+                resolved.variant,
+                served.len(),
+                hex_digest(&sha384(&served)),
+                self.corrupt,
+                resolved.path.display()
+            );
+            report(&self.reporter, "ticket-personalized-answered", &line);
+            let mut body = plist::Dictionary::new();
+            body.insert("RootTicketData".to_string(), plist::Value::Data(served));
+            return Ok(body);
+        }
         let bytes = if matches!((role, kind), (TicketRole::Os, GlobalManifestKind::Os)) {
             match &self.fdr_trust_digest {
                 None => {
                     let line = format!(
-                        "{MUX_PREFIX} result=ticket-fdr-objects-unadded port={} at={:.3}s type={:?} meaning=\"no FDR trust digest was resolved for this machine, so the OS ticket is served without rfta/ftap and fdr_create will find them absent\" detail=\"\"",
+                        "{MUX_PREFIX} result=ticket-fdr-objects-unadded port={} at={:.3}s type={:?} meaning=\"no local FDR trust digest was resolved, so the signed OS ticket is served unchanged; any rfta/ftap objects it already contains remain available to fdr_create\" detail=\"\"",
                         self.port, self.armed_at_secs, request.data_type,
                     );
                     report(&self.reporter, "ticket-fdr-objects-unadded", &line);
@@ -705,7 +841,7 @@ impl RestoreDataProvider for GlobalManifestProvider {
                         }
                         Err(error) => {
                             let line = format!(
-                                "{MUX_PREFIX} result=ticket-fdr-objects-unadded port={} at={:.3}s type={:?} meaning=\"the OS ticket could not be parsed to add the FDR trust objects, so it is served as loaded and fdr_create will still miss them\" detail=\"{error}\"",
+                                "{MUX_PREFIX} result=ticket-fdr-objects-unadded port={} at={:.3}s type={:?} meaning=\"the OS ticket could not be parsed for a local FDR trust update, so it is served unchanged and its FDR objects remain unverified here\" detail=\"{error}\"",
                                 self.port, self.armed_at_secs, request.data_type,
                             );
                             report(&self.reporter, "ticket-fdr-objects-unadded", &line);
@@ -848,19 +984,52 @@ impl RestoreDataProvider for GlobalManifestProvider {
 }
 
 pub struct BoardManifest {
-    pub path: PathBuf,
+    pub source: String,
     pub bytes: Vec<u8>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn board_manifest_for_firmware(
     root: &Path,
     variants: &RestoreVariants,
     hardware_model: &str,
+    staged_boot_manifest: Option<&[u8]>,
+    staged_boot_manifest_sha384: Option<[u8; 48]>,
     corrupt: bool,
     port: u16,
     armed_at_secs: f64,
     reporter: &SharedReporter,
 ) -> Option<BoardManifest> {
+    if let Some(staged) = staged_boot_manifest {
+        let digest = sha384(staged);
+        if staged.is_empty() || staged_boot_manifest_sha384 != Some(digest) {
+            let line = format!(
+                "{MUX_PREFIX} result=firmware-boot-manifest-mismatch port={port} at={armed_at_secs:.3}s meaning=\"firmware objects must carry the exact OS manifest measured into this boot; the staged bytes do not match the published digest, so no object is prepared\" detail=\"bytes={} sha384={}\"",
+                staged.len(),
+                hex_digest(&digest)
+            );
+            report(reporter, "firmware-boot-manifest-mismatch", &line);
+            return None;
+        }
+        let bytes = if corrupt {
+            corrupt_manifest_bytes(staged)
+        } else {
+            staged.to_vec()
+        };
+        report(
+            reporter,
+            "firmware-boot-manifest-selected",
+            &format!(
+                "{MUX_PREFIX} result=firmware-boot-manifest-selected port={port} at={armed_at_secs:.3}s bytes={} sha384={} corrupt={corrupt} meaning=\"the NOR and personalized OS firmware objects carry the same signed manifest that this VM boot measured into /chosen/boot-manifest-hash\"",
+                bytes.len(),
+                hex_digest(&sha384(&bytes))
+            ),
+        );
+        return Some(BoardManifest {
+            source: "staged-boot-manifest".to_string(),
+            bytes,
+        });
+    }
     let order = variants.os_order();
     let resolved = match resolve_global_manifest_in_variants(
         root,
@@ -904,7 +1073,7 @@ pub fn board_manifest_for_firmware(
         bytes
     };
     Some(BoardManifest {
-        path: resolved.path,
+        source: resolved.path.display().to_string(),
         bytes,
     })
 }
@@ -912,7 +1081,7 @@ pub fn board_manifest_for_firmware(
 pub struct NorFirmwareProvider {
     payload: Result<NorPayload, String>,
     firmware_root: PathBuf,
-    manifest_path: PathBuf,
+    manifest_source: String,
     port: u16,
     armed_at_secs: f64,
     reporter: SharedReporter,
@@ -921,7 +1090,7 @@ pub struct NorFirmwareProvider {
 impl NorFirmwareProvider {
     fn poisoned(
         firmware_root: PathBuf,
-        manifest_path: PathBuf,
+        manifest_source: String,
         port: u16,
         armed_at_secs: f64,
         reporter: &SharedReporter,
@@ -930,7 +1099,7 @@ impl NorFirmwareProvider {
         Self {
             payload: Err(reason),
             firmware_root,
-            manifest_path,
+            manifest_source,
             port,
             armed_at_secs,
             reporter: Arc::clone(reporter),
@@ -940,7 +1109,7 @@ impl NorFirmwareProvider {
     pub fn prepare(
         identity: &BuildIdentity,
         firmware_root: PathBuf,
-        manifest_path: PathBuf,
+        manifest_source: String,
         board_manifest: &[u8],
         port: u16,
         armed_at_secs: f64,
@@ -956,7 +1125,7 @@ impl NorFirmwareProvider {
                 report(reporter, "nor-plan-unreadable", &line);
                 return Self::poisoned(
                     firmware_root,
-                    manifest_path,
+                    manifest_source,
                     port,
                     armed_at_secs,
                     reporter,
@@ -992,7 +1161,7 @@ impl NorFirmwareProvider {
                 report(reporter, "nor-firmware-root-unresolved", &line);
                 return Self::poisoned(
                     firmware_root,
-                    manifest_path,
+                    manifest_source,
                     port,
                     armed_at_secs,
                     reporter,
@@ -1010,7 +1179,7 @@ impl NorFirmwareProvider {
                 report(reporter, "nor-payload-unbuildable", &line);
                 return Self::poisoned(
                     firmware_root,
-                    manifest_path,
+                    manifest_source,
                     port,
                     armed_at_secs,
                     reporter,
@@ -1023,7 +1192,7 @@ impl NorFirmwareProvider {
             payload.images.len(),
             payload.total_image_bytes(),
             firmware_root.display(),
-            manifest_path.display(),
+            manifest_source,
             payload
                 .images
                 .iter()
@@ -1043,7 +1212,7 @@ impl NorFirmwareProvider {
         Self {
             payload: Ok(payload),
             firmware_root,
-            manifest_path,
+            manifest_source,
             port,
             armed_at_secs,
             reporter: Arc::clone(reporter),
@@ -1062,7 +1231,7 @@ impl RestoreDataProvider for NorFirmwareProvider {
                     self.armed_at_secs,
                     request.data_type,
                     self.firmware_root.display(),
-                    self.manifest_path.display()
+                    self.manifest_source
                 );
                 report(&self.reporter, "nor-plan-failed", &line);
                 return Err(ProviderError::Other(reason.clone()));
@@ -1089,7 +1258,7 @@ impl RestoreDataProvider for NorFirmwareProvider {
             payload.images.len(),
             payload.total_image_bytes(),
             self.firmware_root.display(),
-            self.manifest_path.display()
+            self.manifest_source
         );
         report(&self.reporter, "nor-served", &line);
         Ok(body)
@@ -1150,7 +1319,7 @@ impl FdrTrustProvider {
             None => String::new(),
         };
         let line = format!(
-            "{MUX_PREFIX} result=fdr-memory-committed port={} at={:.3}s type={:?} present={} instance={} entries={} store=[{}] meaning=\"the guest uploaded its own FDR memory store after fdr_recover, which is the guest generating its class data and handing it back rather than the host authoring any of it; every entry is retained exactly as keyed, so a later FDRTrustData request is answered with this store plus the local trust object, and each key is printed with the byte count of its data so what the guest produced is on the record\" detail=\"the acknowledgement echoes the store back under {}; restored never reads this reply, it only requires that one arrives, since func_100025f48 stores the response and the caller releases it unread at 0x100070130, and a NULL response is what produces failed to copy response to data request and a -1\"",
+            "{MUX_PREFIX} result=fdr-memory-committed port={} at={:.3}s type={:?} present={} instance={} entries={} store=[{}] meaning=\"the guest uploaded its FDR memory store during recovery; every entry is retained exactly as keyed, so a later FDRTrustData request is answered with this store plus the selected trust object, and each key is printed with the byte count of its data\" detail=\"the acknowledgement echoes the store back under {}; restored never reads this reply, it only requires that one arrives, since func_100025f48 stores the response and the caller releases it unread at 0x100070130, and a NULL response is what produces failed to copy response to data request and a -1\"",
             self.port,
             self.armed_at_secs,
             request.data_type,
@@ -1172,7 +1341,7 @@ impl FdrTrustProvider {
     fn trust(&mut self, request: &DataRequest) -> Result<plist::Dictionary, ProviderError> {
         if self.trust_object.is_empty() {
             let line = format!(
-                "{MUX_PREFIX} result=fdr-trust-unheld port={} at={:.3}s type={:?} args=[{}] keys=[] meaning=\"the guest asked for factory data restore trust material and the host has none to give: its local trust object could not be built, so this reply carries no trust bytes and no memory store, and nothing is fabricated to fill them\" detail=\"read this run's fdr-trust-digest-unresolved line for why the material is missing; with the memory store selected and empty, AMFDRDataMemoryCopyTrustObject finds nothing under {}, the digest comparison has nothing to make, and the ticket's {} and {} are equally absent because the same unresolved digest feeds both\"",
+                "{MUX_PREFIX} result=fdr-trust-unheld port={} at={:.3}s type={:?} args=[{}] keys=[] meaning=\"no host-authored FDR trust object was configured, so an empty dictionary lets the guest inspect its recovery ramdisk trust objects against the signed OS ticket\" detail=\"the memory store has no host trust object under {}; the signed ticket's {} and {} may still carry stock digests\"",
                 self.port,
                 self.armed_at_secs,
                 request.data_type,
@@ -1210,7 +1379,7 @@ impl FdrTrustProvider {
             plist::Value::Dictionary(store),
         );
         let line = format!(
-            "{MUX_PREFIX} result=fdr-trust-served port={} at={:.3}s type={:?} args=[{}] keys=[{}] object_bytes={} sha256={} store_entries={} store_keys=[{}] instance={} meaning=\"the recovery host served this machine's factory data restore trust object, its offline local trust root, under both {} and {} and inside a flat {} dictionary keyed {}; the restore options carry FDRMemoryStorePath so the guest built a memory backed FDR client, which is what makes this dictionary reach AMFDRSetMemoryStore at 0x10006edd8 instead of being discarded, and AMFDRDataMemoryCopyTrustObject then returns exactly these bytes for the digest comparison\" detail=\"the ticket half has to agree: {} and {} in the OS ticket carry the SHA-256 printed here, resolved once for this machine and used for both, so a ticket-fdr-objects-unadded line on this run is what puts the guest back on failed to set trust object digest and a return of 6. store_entries counts the local object plus everything the guest has already committed back under FDRMemoryCommit\"",
+            "{MUX_PREFIX} result=fdr-trust-served port={} at={:.3}s type={:?} args=[{}] keys=[{}] object_bytes={} sha256={} store_entries={} store_keys=[{}] instance={} meaning=\"the recovery host served the selected FDR trust object under both {} and {} and inside a flat {} dictionary keyed {}; FDRMemoryStorePath makes the guest install this dictionary into its memory backed FDR client, where AMFDRDataMemoryCopyTrustObject reads the same bytes\" detail=\"the object is selected from the restore ramdisk by matching the signed OS ticket's {} digest, or is bound to a locally signed ticket when local trust material was configured. The OS ticket may carry a separate {} digest for the booted OS. store_entries counts the trust object plus data the guest has committed under FDRMemoryCommit\"",
             self.port,
             self.armed_at_secs,
             request.data_type,
@@ -1254,7 +1423,7 @@ pub struct BuildIdentityProvider {
     manifest: plist::Dictionary,
     hardware_model: String,
     default_variant: String,
-    recovery_variant: String,
+    recovery_variant: Option<String>,
     last_variant: Option<String>,
     omitted_components: Vec<String>,
     port: u16,
@@ -1268,7 +1437,7 @@ impl BuildIdentityProvider {
         manifest: plist::Dictionary,
         hardware_model: String,
         default_variant: String,
-        recovery_variant: String,
+        recovery_variant: impl Into<Option<String>>,
         omitted_components: Vec<String>,
         port: u16,
         armed_at_secs: f64,
@@ -1278,7 +1447,7 @@ impl BuildIdentityProvider {
             manifest,
             hardware_model,
             default_variant,
-            recovery_variant,
+            recovery_variant: recovery_variant.into(),
             last_variant: None,
             omitted_components,
             port,
@@ -1292,9 +1461,16 @@ impl BuildIdentityProvider {
         self.last_variant.as_deref()
     }
 
+    fn install_identity(&self) -> Option<plist::Dictionary> {
+        let mut identity =
+            raw_identity_for_variant(&self.manifest, &self.hardware_model, &self.default_variant)?;
+        self.drop_omitted_components(&mut identity);
+        Some(identity)
+    }
+
     fn recovery_os_version(&self) -> Option<(Vec<&'static str>, plist::Dictionary)> {
-        let identity =
-            raw_identity_for_variant(&self.manifest, &self.hardware_model, &self.recovery_variant)?;
+        let variant = self.recovery_variant.as_deref()?;
+        let identity = raw_identity_for_variant(&self.manifest, &self.hardware_model, variant)?;
         let info = identity.get("Info")?.as_dictionary()?;
         let mut version = plist::Dictionary::new();
         let mut copied = Vec::new();
@@ -1338,10 +1514,14 @@ impl BuildIdentityProvider {
     }
 
     fn answer(&self, request: &DataRequest) -> Option<(String, plist::Dictionary)> {
-        let wanted = request
-            .argument_string(KEY_VARIANT)
-            .unwrap_or(&self.default_variant)
-            .to_string();
+        let wanted = if let Some(variant) = request.argument_string(KEY_VARIANT) {
+            variant
+        } else if request.argument_bool(KEY_IS_RECOVERY_OS) == Some(true) {
+            self.recovery_variant.as_deref()?
+        } else {
+            &self.default_variant
+        }
+        .to_string();
         let mut identity = raw_identity_for_variant(&self.manifest, &self.hardware_model, &wanted)?;
         let dropped = self.drop_omitted_components(&mut identity);
         if !dropped.is_empty() {
@@ -1375,7 +1555,7 @@ impl RestoreDataProvider for BuildIdentityProvider {
                         "{MUX_PREFIX} result=recovery-os-version-answered port={} at={:.3}s variant=\"{}\" model={} fields=[{}] bytes={} meaning=\"the guest asked what the recovery OS build is and was answered from that identity's own Info, copied verbatim into an XML property list; a field the identity does not carry is absent rather than invented\" detail=\"\"",
                         self.port,
                         self.armed_at_secs,
-                        self.recovery_variant,
+                        self.recovery_variant.as_deref().unwrap_or("undeclared"),
                         self.hardware_model,
                         copied.join(","),
                         body.get(KEY_RECOVERY_OS_VERSION_DATA)
@@ -1387,8 +1567,16 @@ impl RestoreDataProvider for BuildIdentityProvider {
                 }
                 None => {
                     let line = format!(
-                        "{MUX_PREFIX} result=recovery-os-version-absent port={} at={:.3}s variant=\"{}\" model={} meaning=\"this manifest carries no recovery OS identity for this model, so the reply carries no version data rather than the install identity's; the guest reports the missing key itself and the session continues\" detail=\"\"",
-                        self.port, self.armed_at_secs, self.recovery_variant, self.hardware_model
+                        "{MUX_PREFIX} result=recovery-os-version-absent port={} at={:.3}s variant=\"{}\" model={} meaning=\"the requested recovery OS version could not be read from a declared recovery identity for this model; the guest reports the missing key itself and the session continues\" detail=\"{}\"",
+                        self.port,
+                        self.armed_at_secs,
+                        self.recovery_variant.as_deref().unwrap_or("undeclared"),
+                        self.hardware_model,
+                        if self.recovery_variant.is_some() {
+                            "the declared recovery identity or its version fields could not be read"
+                        } else {
+                            "no recovery OS variant was declared in this restore"
+                        }
                     );
                     report(&self.reporter, "recovery-os-version-absent", &line);
                     plist::Dictionary::new()
@@ -1399,7 +1587,7 @@ impl RestoreDataProvider for BuildIdentityProvider {
             Some((variant, body)) => {
                 self.last_variant = Some(variant.clone());
                 let line = format!(
-                    "{MUX_PREFIX} result=build-identity-answered port={} at={:.3}s type={:?} variant=\"{variant}\" variant_requested=\"{}\" model={} keys=[{}] meaning=\"the guest's build identity request was answered with the BuildIdentities entry the manifest itself holds for that variant, unaltered; variant_requested is what the request named and variant is what answered, and they differ only when the request named none and the install variant was used\" detail=\"\"",
+                    "{MUX_PREFIX} result=build-identity-answered port={} at={:.3}s type={:?} variant=\"{variant}\" variant_requested=\"{}\" model={} keys=[{}] meaning=\"the guest's build identity request was answered with the BuildIdentities entry the manifest itself holds for that variant, unaltered; an unnamed request uses the recovery variant when IsRecoveryOS is true and the install variant otherwise\" detail=\"\"",
                     self.port,
                     self.armed_at_secs,
                     request.data_type,
@@ -1414,8 +1602,16 @@ impl RestoreDataProvider for BuildIdentityProvider {
                 Ok(body)
             }
             None => {
+                let reason = if request.argument_string(KEY_VARIANT).is_none()
+                    && request.argument_bool(KEY_IS_RECOVERY_OS) == Some(true)
+                    && self.recovery_variant.is_none()
+                {
+                    "no recovery OS variant was declared in this restore"
+                } else {
+                    "the requested variant has no readable identity for this model"
+                };
                 let line = format!(
-                    "{MUX_PREFIX} result=build-identity-absent port={} at={:.3}s type={:?} variant_requested=\"{}\" model={} meaning=\"the guest asked for a build identity under a variant this manifest carries none of for this model, so the reply carries no identity rather than the wrong one; an identity cut for a different variant passes every check made here and fails later in the first step that reads a component it does not ship\" detail=\"the reply is well formed and empty, so the guest reports the missing key itself and the session continues\"",
+                    "{MUX_PREFIX} result=build-identity-absent port={} at={:.3}s type={:?} variant_requested=\"{}\" model={} meaning=\"the requested build identity could not be resolved for this model; the reply is well formed and empty, so the guest reports the missing key itself and the session continues\" detail=\"{reason}\"",
                     self.port,
                     self.armed_at_secs,
                     request.data_type,
@@ -1452,6 +1648,38 @@ pub const KEY_FIRMWARE_RESPONSE_DATA: &str = "FirmwareResponseData";
 
 pub const KEY_CRYPTEX1_TICKET: &str = "Cryptex1,Ticket";
 
+fn signing_unsigned(value: &plist::Value, key: &str) -> Result<plist::Value, String> {
+    let parsed = match value {
+        plist::Value::Integer(integer) => integer
+            .as_unsigned()
+            .or_else(|| integer.as_signed().map(|signed| signed as u64)),
+        plist::Value::String(text) => {
+            let text = text.trim();
+            if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+                u64::from_str_radix(hex, 16).ok()
+            } else {
+                text.parse::<u64>().ok()
+            }
+        }
+        _ => None,
+    };
+    parsed
+        .map(|integer| plist::Value::Integer(integer.into()))
+        .ok_or_else(|| format!("{key} is not an unsigned integer or numeric string"))
+}
+
+fn signing_flag(value: &plist::Value, key: &str) -> Result<plist::Value, String> {
+    match value {
+        plist::Value::Boolean(flag) => Ok(plist::Value::Boolean(*flag)),
+        plist::Value::Integer(integer) => match integer.as_unsigned() {
+            Some(0) => Ok(plist::Value::Boolean(false)),
+            Some(1) => Ok(plist::Value::Boolean(true)),
+            _ => Err(format!("{key} is not a boolean or 0/1 integer")),
+        },
+        _ => Err(format!("{key} is not a boolean or 0/1 integer")),
+    }
+}
+
 pub use super::local_policy::{
     KEY_AP_LOCAL_POLICY, RECOVERY_OS_LOCAL_POLICY_IM4P, RECOVERY_OS_LOCAL_POLICY_IM4P_SHA384,
 };
@@ -1466,11 +1694,11 @@ pub struct PersonalizedFirmwareProvider {
     manifest: plist::Dictionary,
     hardware_model: String,
     install_variant: String,
-    recovery_variant: String,
+    recovery_variant: Option<String>,
     followed_variant: Option<String>,
     firmware_root: Option<PathBuf>,
     board_manifest: Option<Vec<u8>>,
-    board_manifest_path: Option<PathBuf>,
+    board_manifest_source: Option<String>,
     port: u16,
     armed_at_secs: f64,
     reporter: SharedReporter,
@@ -1482,10 +1710,10 @@ impl PersonalizedFirmwareProvider {
         manifest: plist::Dictionary,
         hardware_model: String,
         install_variant: String,
-        recovery_variant: String,
+        recovery_variant: impl Into<Option<String>>,
         firmware_root: Option<PathBuf>,
         board_manifest: Option<Vec<u8>>,
-        board_manifest_path: Option<PathBuf>,
+        board_manifest_source: Option<String>,
         port: u16,
         armed_at_secs: f64,
         reporter: &SharedReporter,
@@ -1494,11 +1722,11 @@ impl PersonalizedFirmwareProvider {
             manifest,
             hardware_model,
             install_variant,
-            recovery_variant,
+            recovery_variant: recovery_variant.into(),
             followed_variant: None,
             firmware_root,
             board_manifest,
-            board_manifest_path,
+            board_manifest_source,
             port,
             armed_at_secs,
             reporter: Arc::clone(reporter),
@@ -1519,18 +1747,34 @@ impl PersonalizedFirmwareProvider {
         self.followed_variant = Some(variant.to_string());
     }
 
-    fn variant_for(&self, request: &DataRequest) -> (String, &'static str) {
+    fn variant_for(&self, request: &DataRequest) -> Result<(String, &'static str), ProviderError> {
         if let Some(named) = request.argument_string(KEY_VARIANT) {
-            return (named.to_string(), "request");
+            return Ok((named.to_string(), "request"));
         }
         // Must outrank the `IsRecoveryOS` branch below: a per-image fetch sends it false while enumerating a list that came off the followed identity.
         if let Some(followed) = self.followed_variant.as_deref() {
-            return (followed.to_string(), "followed-identity");
+            return Ok((followed.to_string(), "followed-identity"));
         }
         if request.argument_bool(KEY_IS_RECOVERY_OS) == Some(true) {
-            return (self.recovery_variant.clone(), "is-recovery-os");
+            let Some(variant) = self.recovery_variant.as_ref() else {
+                let reason = format!(
+                    "no recovery OS variant was declared for {} in this restore",
+                    self.hardware_model
+                );
+                let line = format!(
+                    "{MUX_PREFIX} result=personalized-recovery-identity-unavailable port={} at={:.3}s type={:?} model={} meaning=\"the guest requested recovery firmware but this restore declared no recovery identity\" detail=\"{reason}\"",
+                    self.port, self.armed_at_secs, request.data_type, self.hardware_model
+                );
+                report(
+                    &self.reporter,
+                    "personalized-recovery-identity-unavailable",
+                    &line,
+                );
+                return Err(ProviderError::Other(reason));
+            };
+            return Ok((variant.clone(), "is-recovery-os"));
         }
-        (self.install_variant.clone(), "install-default")
+        Ok((self.install_variant.clone(), "install-default"))
     }
 
     fn components_flagged(&self, variant: &str, flag: &str) -> Option<Vec<String>> {
@@ -1588,7 +1832,10 @@ impl PersonalizedFirmwareProvider {
             );
             return plist::Dictionary::new();
         }
-        let (variant, chosen_by) = self.variant_for(request);
+        let (variant, chosen_by) = match self.variant_for(request) {
+            Ok(selection) => selection,
+            Err(_) => return plist::Dictionary::new(),
+        };
         let Some(names) = self.components_flagged(&variant, flag) else {
             let line = format!(
                 "{MUX_PREFIX} result={label}-list-identity-absent port={} at={:.3}s type={:?} variant=\"{variant}\" variant_chosen_by={chosen_by} model={} flag={flag} meaning=\"this manifest carries no identity for that variant and model, so there is no component list to read the flag off; the reply carries no key and the guest reports the missing list itself\" detail=\"\"",
@@ -1645,7 +1892,10 @@ impl PersonalizedFirmwareProvider {
         request: &DataRequest,
         component: &str,
     ) -> Option<Result<StreamedObject, ProviderError>> {
-        let (variant, chosen_by) = self.variant_for(request);
+        let (variant, chosen_by) = match self.variant_for(request) {
+            Ok(selection) => selection,
+            Err(error) => return Some(Err(error)),
+        };
         let missing = |reason: &str| {
             let line = format!(
                 "{MUX_PREFIX} result=system-volume-object-absent port={} at={:.3}s type={:?} variant=\"{variant}\" component={component} meaning=\"the seal step's input could not be resolved to genuine Apple bytes this host holds, so the request is left to the decline that answers it with a well formed empty reply; nothing is fabricated and the guest fails at the step that reads it\" detail=\"{reason}\"",
@@ -1699,9 +1949,9 @@ impl PersonalizedFirmwareProvider {
             payload.len(),
             image.len(),
             path.display(),
-            self.board_manifest_path
+            self.board_manifest_source
                 .as_ref()
-                .map_or_else(|| "none".to_string(), |path| path.display().to_string())
+                .map_or("none", String::as_str)
         );
         report(&self.reporter, "system-volume-object-served", &line);
         Some(Ok(StreamedObject::from_bytes(image, chunk_size)))
@@ -1731,7 +1981,7 @@ impl PersonalizedFirmwareProvider {
     }
 
     fn personalized_object(&self, request: &DataRequest) -> Result<StreamedObject, ProviderError> {
-        let (variant, chosen_by) = self.variant_for(request);
+        let (variant, chosen_by) = self.variant_for(request)?;
         let Some(name) = request.argument_string(KEY_IMAGE_NAME) else {
             return Err(ProviderError::Other(
                 "a personalised boot object request named no ImageName, so there is nothing to resolve against the build identity".to_string(),
@@ -1771,9 +2021,9 @@ impl PersonalizedFirmwareProvider {
             payload.len(),
             image.len(),
             path.display(),
-            self.board_manifest_path
+            self.board_manifest_source
                 .as_ref()
-                .map_or_else(|| "none".to_string(), |path| path.display().to_string())
+                .map_or("none", String::as_str)
         );
         report(&self.reporter, "personalized-object-served", &line);
         Ok(StreamedObject::from_bytes(image, chunk_size))
@@ -1804,7 +2054,10 @@ impl RestoreDataProvider for PersonalizedFirmwareProvider {
             report(&self.reporter, "personalized-list-untyped", &line);
             return Ok(plist::Dictionary::new());
         };
-        let (variant, chosen_by) = self.variant_for(request);
+        let (variant, chosen_by) = match self.variant_for(request) {
+            Ok(selection) => selection,
+            Err(_) => return Ok(plist::Dictionary::new()),
+        };
         let Some(names) = self.components_flagged(&variant, flag) else {
             let line = format!(
                 "{MUX_PREFIX} result=personalized-list-identity-absent port={} at={:.3}s type={:?} variant=\"{variant}\" variant_chosen_by={chosen_by} model={} image_type={flag} meaning=\"this manifest carries no identity for that variant and model, so there is no component list to read the flag off; the reply carries no key and the guest reports the missing list itself\" detail=\"\"",
@@ -2357,6 +2610,7 @@ fn prefix_is_contained(prefix: &str) -> bool {
 
 pub struct SourceBootObjectProvider {
     root: PathBuf,
+    personalized_root: Option<PathBuf>,
     default_variant: String,
     hardware_model: String,
     manifest: plist::Dictionary,
@@ -2384,6 +2638,7 @@ impl SourceBootObjectProvider {
     ) -> Self {
         Self {
             root,
+            personalized_root: None,
             default_variant,
             hardware_model,
             manifest,
@@ -2394,6 +2649,11 @@ impl SourceBootObjectProvider {
             armed_at_secs,
             reporter: Arc::clone(reporter),
         }
+    }
+
+    pub fn with_personalized_source(mut self, root: Option<PathBuf>) -> Self {
+        self.personalized_root = root;
+        self
     }
 
     fn source_component(request: &DataRequest) -> Option<&str> {
@@ -2711,6 +2971,11 @@ impl RestoreDataProvider for SourceBootObjectProvider {
             return self.source_component_object(request, component);
         }
         let prefix = Self::global_manifest_prefix(request)?;
+        let source_root = if prefix == GLOBAL_MANIFEST_PREFIX_DEFAULT {
+            self.personalized_root.as_ref().unwrap_or(&self.root)
+        } else {
+            &self.root
+        };
         let variant = request
             .argument_string(KEY_VARIANT)
             .unwrap_or(&self.default_variant)
@@ -2726,8 +2991,7 @@ impl RestoreDataProvider for SourceBootObjectProvider {
             return None;
         }
         let board = normalise_board(&self.hardware_model);
-        let path = self
-            .root
+        let path = source_root
             .join(&variant)
             .join(format!("{prefix}.{board}.im4m"));
         if !path.is_file() {
@@ -2776,6 +3040,7 @@ pub struct RestoreAnswers {
     pub source_boot_objects: SourceBootObjectProvider,
     pub fdr: FdrTrustProvider,
     pub local_policy_signer: Option<Arc<dyn RecoveryOsLocalPolicySigner>>,
+    pub firmware_updater_signer: Option<Arc<dyn FirmwareUpdaterSigner>>,
     pub local_policy_census: LocalPolicyCensus,
     pub device_hardware_info: DeviceHardwareInfo,
     pub port: u16,
@@ -2847,50 +3112,196 @@ impl RestoreAnswers {
         if updater != UPDATER_NAME_CRYPTEX1 {
             return self.decline_firmware_updater_personalization(request);
         }
-        let manifest = match self.tickets.cryptex1_splat_manifest() {
-            Ok(manifest) => manifest,
+        let Some(signer) = self.firmware_updater_signer.as_ref() else {
+            let line = format!(
+                "{MUX_PREFIX} result=firmware-updater-signing-not-armed port={} at={:.3}s updater={updater} meaning=\"the guest requested a personalized Cryptex1 ticket, but this restore did not arm Apple signing\"",
+                self.port, self.armed_at_secs,
+            );
+            report(&self.reporter, "firmware-updater-signing-not-armed", &line);
+            return plist::Dictionary::new();
+        };
+        let (signing_request, response_tag) = match self.cryptex1_signing_request(request) {
+            Ok(prepared) => prepared,
             Err(error) => {
                 let line = format!(
-                    "{MUX_PREFIX} result=splat-ticket-manifest-missing port={} at={:.3}s type={:?} updater={updater} meaning=\"the guest asked for the Cryptex1 splat ticket and this host could not resolve the board's genuine cryptex1 global manifest under any variant this restore declared, so the reply carries no ticket key and install_splat fails its presence check at 0x100034038 with FAILURE:2200; no ticket is invented to fill it\" detail=\"{error}\"",
+                    "{MUX_PREFIX} result=firmware-updater-request-unusable port={} at={:.3}s type={:?} updater={updater} detail=\"{error}\"",
                     self.port, self.armed_at_secs, request.data_type,
                 );
-                report(&self.reporter, "splat-ticket-manifest-missing", &line);
+                report(&self.reporter, "firmware-updater-request-unusable", &line);
                 return plist::Dictionary::new();
             }
         };
-        let repersonalize = request
-            .argument_bool("MessageForceRepersonalization")
-            .unwrap_or(false);
-        let device_generated = request.arguments.contains_key("DeviceGeneratedRequest")
-            && request.arguments.contains_key("DeviceGeneratedTags");
-        let digest = sha384(&manifest.bytes);
-        let mut response = plist::Dictionary::new();
-        response.insert(
-            KEY_CRYPTEX1_TICKET.to_string(),
-            plist::Value::Data(manifest.bytes.clone()),
-        );
+        let response = match signer.personalize(&signing_request) {
+            Ok(response) => response,
+            Err(error) => {
+                let line = format!(
+                    "{MUX_PREFIX} result=firmware-updater-signing-failed port={} at={:.3}s type={:?} updater={updater} source={} detail=\"{error}\"",
+                    self.port,
+                    self.armed_at_secs,
+                    request.data_type,
+                    signer.source(),
+                );
+                report(&self.reporter, "firmware-updater-signing-failed", &line);
+                return plist::Dictionary::new();
+            }
+        };
+        let Some(ticket) = response
+            .get(&response_tag)
+            .and_then(plist::Value::as_data)
+            .filter(|ticket| !ticket.is_empty())
+        else {
+            let line = format!(
+                "{MUX_PREFIX} result=firmware-updater-ticket-missing port={} at={:.3}s type={:?} updater={updater} source={} expected={response_tag} response_keys=[{}]",
+                self.port,
+                self.armed_at_secs,
+                request.data_type,
+                signer.source(),
+                response
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            report(&self.reporter, "firmware-updater-ticket-missing", &line);
+            return plist::Dictionary::new();
+        };
+        let ticket_len = ticket.len();
+        let digest = sha384(ticket);
         let mut body = plist::Dictionary::new();
         body.insert(
             KEY_FIRMWARE_RESPONSE_DATA.to_string(),
             plist::Value::Dictionary(response),
         );
         let line = format!(
-            "{MUX_PREFIX} result=splat-ticket-served port={} at={:.3}s type={:?} updater={updater} device_generated={device_generated} repersonalize={repersonalize} variant=\"{}\" bytes={} sha384={} boot_nonce={} signature=apple-intact key={KEY_CRYPTEX1_TICKET} meaning=\"install_splat's Cryptex1 ticket request was answered with the genuine Apple signed cryptex1 global manifest this IPSW ships for this board, byte for byte, under the libauthinstall key kAMAuthInstallTagCryptex1Img4Ticket, inside the reply's FirmwareResponseData dictionary, which is where 0x100034038 reads it; nothing was signed, re-signed, synthesised or rewritten here, and sha384 above is the digest of Apple's file as it sits in the tree\" detail=\"DEVIATION FROM A REAL DEVICE: the guest asked for a REPERSONALISED ticket bound to the Nonce it sent, and a real restore host answers it from Apple's TSS. This host does not use TSS and holds no signing key, so this is a STATIC GLOBAL manifest and not a TSS response, and boot_nonce=unstaged says it carries no Cryptex1 nonce. That is deliberate: ramrod_splat_write_personalized_ticket at 0x100066954 writes these exact bytes to <preboot>/<group>/cryptex1/current/apticket.<board>.<ecid>.im4m, and load_trust_cache_with_type type 0xd cryptex1.boot.os hands that file to the privileged monitor, which re-verifies its RSA-4096 PKCS1v15 SHA-384 signature over the MANB SET. Writing BNCH into MANP grows that SET and invalidates the shipped signature, so a stapled manifest is one no key can make valid. Nothing at restore time wants it: BNCH is read once in restored_external, at 0x100033c88, out of the AP root ticket at 0x100279218, which is the OS role's ticket and is still stapled. path={}\"",
+            "{MUX_PREFIX} result=firmware-updater-ticket-served port={} at={:.3}s type={:?} updater={updater} source={} key={response_tag} bytes={} sha384={} request_keys=[{}] meaning=\"the guest's generated Cryptex1 signing terms were submitted and the returned ticket was passed through under FirmwareResponseData\"",
             self.port,
             self.armed_at_secs,
             request.data_type,
-            manifest.variant,
-            manifest.bytes.len(),
+            signer.source(),
+            ticket_len,
             hex_digest(&digest),
-            if manifest.nonce_staged {
-                "staged"
-            } else {
-                "unstaged"
-            },
-            manifest.path.display(),
+            signing_request
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(","),
         );
-        report(&self.reporter, "splat-ticket-served", &line);
+        report(&self.reporter, "firmware-updater-ticket-served", &line);
         body
+    }
+
+    fn cryptex1_signing_request(
+        &self,
+        request: &DataRequest,
+    ) -> Result<(plist::Dictionary, String), String> {
+        let info = request
+            .arguments
+            .get("MessageArgInfo")
+            .and_then(plist::Value::as_dictionary)
+            .ok_or("MessageArgInfo is not a dictionary")?;
+        let generated = request
+            .arguments
+            .get("DeviceGeneratedRequest")
+            .and_then(plist::Value::as_dictionary)
+            .ok_or("DeviceGeneratedRequest is not a dictionary")?;
+        let tags = request
+            .arguments
+            .get("DeviceGeneratedTags")
+            .and_then(plist::Value::as_dictionary)
+            .ok_or("DeviceGeneratedTags is not a dictionary")?;
+        let identity = self
+            .identities
+            .install_identity()
+            .ok_or("the selected install BuildIdentity could not be read")?;
+        let mut parameters = info.clone();
+        if let Some(build_tags) = tags
+            .get("BuildIdentityTags")
+            .and_then(plist::Value::as_array)
+        {
+            for tag in build_tags {
+                let key = tag
+                    .as_string()
+                    .ok_or("BuildIdentityTags contains a non-string")?;
+                if let Some(value) = identity.get(key) {
+                    parameters.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        for key in ["UniqueBuildID", "ApChipID", "ApBoardID", "ApSecurityDomain"] {
+            if !parameters.contains_key(key)
+                && let Some(value) = identity.get(key)
+            {
+                parameters.insert(key.to_string(), value.clone());
+            }
+        }
+        for (key, value) in generated {
+            parameters.insert(key.clone(), value.clone());
+        }
+        if let DeviceHardwareInfo::Answered(hardware) = &self.device_hardware_info {
+            for (signing_key, hardware_key) in [
+                ("ApSecurityMode", "SecurityMode"),
+                ("ApProductionMode", "ProductionMode"),
+            ] {
+                if !parameters.contains_key(signing_key)
+                    && let Some(value) = hardware.get(hardware_key)
+                {
+                    parameters.insert(signing_key.to_string(), value.clone());
+                }
+            }
+        }
+        let mut signing = plist::Dictionary::new();
+        for key in [
+            "ApECID",
+            "UniqueBuildID",
+            "ApChipID",
+            "ApBoardID",
+            "ApSecurityDomain",
+            "ApSecurityMode",
+            "ApProductionMode",
+        ] {
+            if let Some(value) = parameters.get(key) {
+                let normalized = match key {
+                    "ApECID" | "ApChipID" | "ApBoardID" | "ApSecurityDomain" => {
+                        signing_unsigned(value, key)?
+                    }
+                    "ApSecurityMode" | "ApProductionMode" => signing_flag(value, key)?,
+                    _ => value.clone(),
+                };
+                signing.insert(key.to_string(), normalized);
+            }
+        }
+        for (key, value) in &parameters {
+            if key.starts_with("Cryptex1") {
+                signing.insert(key.clone(), value.clone());
+            }
+        }
+        for key in [
+            "ApECID",
+            "ApChipID",
+            "ApBoardID",
+            "ApSecurityMode",
+            "ApProductionMode",
+        ] {
+            if !signing.contains_key(key) {
+                return Err(format!(
+                    "the generated Cryptex1 request has no {key} signing term"
+                ));
+            }
+        }
+        if !signing.keys().any(|key| key.starts_with("Cryptex1,")) {
+            return Err(
+                "the generated Cryptex1 request contains no Cryptex1 signing terms".to_string(),
+            );
+        }
+        signing.insert("@Cryptex1,Ticket".to_string(), plist::Value::Boolean(true));
+        let response_tag = tags
+            .get("ResponseTags")
+            .and_then(plist::Value::as_array)
+            .and_then(|tags| tags.first())
+            .and_then(plist::Value::as_string)
+            .unwrap_or(KEY_CRYPTEX1_TICKET)
+            .to_string();
+        Ok((signing, response_tag))
     }
 
     fn decline_firmware_updater_personalization(&self, request: &DataRequest) -> plist::Dictionary {
@@ -3342,8 +3753,23 @@ mod tests {
     fn test_variants() -> RestoreVariants {
         RestoreVariants {
             install: "Customer Erase Install (IPSW)".to_string(),
-            recovery_os: "macOS Customer".to_string(),
+            recovery_os: Some("macOS Customer".to_string()),
         }
+    }
+
+    #[test]
+    fn optional_recovery_variants_keep_the_install_variant_first() {
+        let variants = test_variants();
+        assert_eq!(
+            variants.os_order(),
+            vec!["Customer Erase Install (IPSW)", "macOS Customer"]
+        );
+        assert_eq!(variants.recovery_order(), vec!["macOS Customer"]);
+        let install = RestoreVariants {
+            install: "Customer Erase Install (IPSW)".to_string(),
+            recovery_os: None,
+        };
+        assert_eq!(install.os_order(), vec!["Customer Erase Install (IPSW)"]);
     }
 
     fn identity_manifest() -> plist::Dictionary {
@@ -3474,6 +3900,155 @@ mod tests {
             0.0,
             &reporter(),
         )
+    }
+
+    #[test]
+    fn the_install_identity_is_served_with_optional_recovery() {
+        for recovery_variant in [None, Some("macOS Customer".to_string())] {
+            let mut manifest = identity_manifest();
+            if recovery_variant.is_none() {
+                manifest
+                    .get_mut("BuildIdentities")
+                    .and_then(plist::Value::as_array_mut)
+                    .unwrap()
+                    .truncate(1);
+            }
+            let mut provider = BuildIdentityProvider::new(
+                manifest,
+                "J274AP".to_string(),
+                "Customer Erase Install (IPSW)".to_string(),
+                recovery_variant,
+                Vec::new(),
+                62078,
+                0.0,
+                &reporter(),
+            );
+            let body = provider
+                .supply(&data_request(DataType::BuildIdentityDict))
+                .unwrap();
+            assert_eq!(
+                body.get(crate::ramrod::message::KEY_VARIANT)
+                    .and_then(plist::Value::as_string),
+                Some("Customer Erase Install (IPSW)")
+            );
+            let identity = body
+                .get(crate::ramrod::message::KEY_BUILD_IDENTITY_DICT)
+                .and_then(plist::Value::as_dictionary)
+                .unwrap();
+            assert_eq!(
+                identity
+                    .get("MarkerForTheTest")
+                    .and_then(plist::Value::as_signed_integer),
+                Some(1)
+            );
+            assert_eq!(
+                provider.last_variant(),
+                Some("Customer Erase Install (IPSW)")
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_identity_variant_is_used_with_undeclared_recovery() {
+        let mut provider = test_identity_provider();
+        provider.recovery_variant = None;
+        let request = data_request_with(
+            DataType::BuildIdentityDict,
+            vec![
+                (
+                    crate::ramrod::message::KEY_VARIANT,
+                    plist::Value::String("macOS Customer".into()),
+                ),
+                (
+                    crate::ramrod::KEY_IS_RECOVERY_OS,
+                    plist::Value::Boolean(true),
+                ),
+            ],
+        );
+        let body = provider.supply(&request).unwrap();
+        assert_eq!(
+            body.get(crate::ramrod::message::KEY_VARIANT)
+                .and_then(plist::Value::as_string),
+            Some("macOS Customer")
+        );
+        assert_eq!(provider.last_variant(), Some("macOS Customer"));
+    }
+
+    #[test]
+    fn recovery_identity_and_version_requests_record_the_undeclared_recovery_refusal() {
+        let (reporter, lines) = capturing();
+        let mut provider = BuildIdentityProvider::new(
+            identity_manifest(),
+            "J274AP".to_string(),
+            "Customer Erase Install (IPSW)".to_string(),
+            None,
+            Vec::new(),
+            62078,
+            0.0,
+            &reporter,
+        );
+        provider
+            .supply(&data_request_with(
+                DataType::BuildIdentityDict,
+                vec![(
+                    crate::ramrod::KEY_IS_RECOVERY_OS,
+                    plist::Value::Boolean(true),
+                )],
+            ))
+            .unwrap();
+        provider
+            .supply(&data_request(DataType::RecoveryOSVersionData))
+            .unwrap();
+        let lines = lines.lock().unwrap();
+        for event in ["build-identity-absent", "recovery-os-version-absent"] {
+            assert!(
+                lines.iter().any(|line| {
+                    line.contains(&format!("result={event}"))
+                        && line.contains("no recovery OS variant was declared in this restore")
+                }),
+                "{lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_recovery_variant_request_records_the_identity_refusal() {
+        let (reporter, lines) = capturing();
+        let mut manifest = identity_manifest();
+        manifest
+            .get_mut("BuildIdentities")
+            .and_then(plist::Value::as_array_mut)
+            .unwrap()
+            .truncate(1);
+        let mut provider = BuildIdentityProvider::new(
+            manifest,
+            "J274AP".to_string(),
+            "Customer Erase Install (IPSW)".to_string(),
+            None,
+            Vec::new(),
+            62078,
+            0.0,
+            &reporter,
+        );
+        provider
+            .supply(&data_request_with(
+                DataType::BuildIdentityDict,
+                vec![(
+                    crate::ramrod::message::KEY_VARIANT,
+                    plist::Value::String("macOS Customer".into()),
+                )],
+            ))
+            .unwrap();
+        let lines = lines.lock().unwrap();
+        assert!(
+            lines.iter().any(|line| {
+                line.contains("result=build-identity-absent")
+                    && line.contains("variant_requested=\"macOS Customer\"")
+                    && line
+                        .contains("the requested variant has no readable identity for this model")
+            }),
+            "{lines:?}"
+        );
     }
 
     fn test_personalized_provider() -> PersonalizedFirmwareProvider {
@@ -3645,6 +4220,110 @@ mod tests {
     }
 
     #[test]
+    fn install_firmware_lists_are_served_with_optional_recovery() {
+        let mut provider = flagged_personalized_provider();
+        provider.recovery_variant = None;
+        provider
+            .manifest
+            .get_mut("BuildIdentities")
+            .and_then(plist::Value::as_array_mut)
+            .unwrap()
+            .truncate(1);
+        let body = provider
+            .supply(&image_list_request("IsiBootEANFirmware"))
+            .unwrap();
+        assert_eq!(served_names(&body), vec!["Ap,CIO", "Ap,TMU"]);
+    }
+
+    #[test]
+    fn explicit_firmware_variants_are_served_with_undeclared_recovery() {
+        let mut provider = flagged_personalized_provider();
+        provider.recovery_variant = None;
+        let mut request = image_list_request("IsFUDFirmware");
+        request.arguments.insert(
+            crate::ramrod::message::KEY_VARIANT.into(),
+            plist::Value::String("macOS Customer".into()),
+        );
+        request.arguments.insert(
+            crate::ramrod::KEY_IS_RECOVERY_OS.into(),
+            plist::Value::Boolean(true),
+        );
+        let body = provider.supply(&request).unwrap();
+        assert_eq!(served_names(&body), vec!["SIO"]);
+    }
+
+    #[test]
+    fn recovery_firmware_requests_record_the_undeclared_recovery_refusal() {
+        let (reporter, lines) = capturing();
+        let mut provider = PersonalizedFirmwareProvider::new(
+            flagged_identity_manifest(),
+            "J274AP".to_string(),
+            "Customer Erase Install (IPSW)".to_string(),
+            None,
+            None,
+            None,
+            None,
+            62078,
+            0.0,
+            &reporter,
+        );
+        let mut request = image_list_request("IsFUDFirmware");
+        request.arguments.insert(
+            crate::ramrod::KEY_IS_RECOVERY_OS.into(),
+            plist::Value::Boolean(true),
+        );
+        provider.supply(&request).unwrap();
+        let lines = lines.lock().unwrap();
+        assert!(
+            lines.iter().any(|line| {
+                line.contains("result=personalized-recovery-identity-unavailable")
+                    && line
+                        .contains("no recovery OS variant was declared for J274AP in this restore")
+            }),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_ticket_requests_record_the_undeclared_recovery_refusal() {
+        let root = tempfile::tempdir().unwrap();
+        let (reporter, lines) = capturing();
+        let mut provider = GlobalManifestProvider::new(
+            root.path().to_path_buf(),
+            RestoreVariants {
+                install: "Customer Erase Install (IPSW)".to_string(),
+                recovery_os: None,
+            },
+            "J274AP".to_string(),
+            false,
+            62078,
+            0.0,
+            None,
+            None,
+            None,
+            &reporter,
+        );
+        let error = provider
+            .supply(&data_request(DataType::RecoveryOSRootTicketData))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no recovery OS variant was declared for J274AP in this restore")
+        );
+        let lines = lines.lock().unwrap();
+        assert!(
+            lines.iter().any(|line| {
+                line.contains("result=ticket-manifest-missing")
+                    && line.contains("role=recovery-os")
+                    && line
+                        .contains("no recovery OS variant was declared for J274AP in this restore")
+            }),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
     fn an_image_list_is_read_off_the_info_flag_the_request_names() {
         let mut provider = flagged_personalized_provider();
         let body = provider
@@ -3751,6 +4430,7 @@ mod tests {
             source_boot_objects: test_source_boot_object_provider(dir.path()),
             fdr: test_fdr_provider(&reporter()),
             local_policy_signer: None,
+            firmware_updater_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
             device_hardware_info: no_hardware_info_query(),
             port: 62078,
@@ -3915,6 +4595,7 @@ mod tests {
             source_boot_objects: test_source_boot_object_provider(dir.path()),
             fdr: test_fdr_provider(&reporter()),
             local_policy_signer: None,
+            firmware_updater_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
             device_hardware_info: no_hardware_info_query(),
             port: 62078,
@@ -4039,6 +4720,7 @@ mod tests {
             source_boot_objects: test_source_boot_object_provider(dir.path()),
             fdr: test_fdr_provider(&reporter()),
             local_policy_signer: None,
+            firmware_updater_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
             device_hardware_info: no_hardware_info_query(),
             port: 62078,
@@ -4186,7 +4868,10 @@ mod tests {
         let mut provider = NorFirmwareProvider::prepare(
             &firmware_identity(dir.path()),
             dir.path().to_path_buf(),
-            dir.path().join("apticket.j274ap.im4m"),
+            dir.path()
+                .join("apticket.j274ap.im4m")
+                .display()
+                .to_string(),
             &board_manifest,
             62078,
             0.0,
@@ -4238,6 +4923,7 @@ mod tests {
             fdr: test_fdr_provider(&trace),
             port: 62078,
             local_policy_signer: None,
+            firmware_updater_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
             device_hardware_info: no_hardware_info_query(),
             armed_at_secs: 0.0,
@@ -4443,6 +5129,7 @@ mod tests {
             source_boot_objects: test_source_boot_object_provider(dir.path()),
             fdr: test_fdr_provider(&reporter()),
             local_policy_signer: None,
+            firmware_updater_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
             device_hardware_info: no_hardware_info_query(),
             port: 62078,
@@ -4490,7 +5177,10 @@ mod tests {
             firmware: Some(NorFirmwareProvider::prepare(
                 &firmware_identity(firmware_root.path()),
                 firmware_root.path().to_path_buf(),
-                dir.path().join("apticket.j274ap.im4m"),
+                dir.path()
+                    .join("apticket.j274ap.im4m")
+                    .display()
+                    .to_string(),
                 &board_manifest,
                 62078,
                 0.0,
@@ -4501,6 +5191,7 @@ mod tests {
             source_boot_objects: test_source_boot_object_provider(dir.path()),
             fdr: test_fdr_provider(&reporter()),
             local_policy_signer: None,
+            firmware_updater_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
             device_hardware_info: no_hardware_info_query(),
             port: 62078,
@@ -4805,6 +5496,7 @@ mod tests {
             fdr: test_fdr_provider(&reporter),
             port: 62078,
             local_policy_signer: None,
+            firmware_updater_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
             device_hardware_info: no_hardware_info_query(),
             armed_at_secs: 0.0,
@@ -4892,6 +5584,7 @@ mod tests {
             fdr: test_fdr_provider(&reporter),
             port: 62078,
             local_policy_signer: None,
+            firmware_updater_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
             device_hardware_info: no_hardware_info_query(),
             armed_at_secs: 0.0,
@@ -5010,6 +5703,7 @@ mod tests {
             local_policy_signer: Some(Arc::new(RecordingSigner {
                 requests: Arc::clone(requests),
             })),
+            firmware_updater_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
             device_hardware_info,
             armed_at_secs: 0.0,
@@ -5322,6 +6016,7 @@ mod tests {
             fdr: test_fdr_provider(&reporter),
             port: 62078,
             local_policy_signer: None,
+            firmware_updater_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
             device_hardware_info: no_hardware_info_query(),
             armed_at_secs: 0.0,
@@ -5402,6 +6097,7 @@ mod tests {
             fdr: test_fdr_provider(&reporter),
             port: 62078,
             local_policy_signer: None,
+            firmware_updater_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
             device_hardware_info: no_hardware_info_query(),
             armed_at_secs: 0.0,
@@ -5521,6 +6217,7 @@ mod tests {
             local_policy_signer: Some(Arc::new(RecordingSigner {
                 requests: Arc::clone(&requests),
             })),
+            firmware_updater_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
             device_hardware_info: no_hardware_info_query(),
             armed_at_secs: 0.0,
@@ -5890,6 +6587,34 @@ mod tests {
     }
 
     fn splat_request(updater: &str) -> DataRequest {
+        let info = plist::Dictionary::from_iter([
+            (
+                "ApECID".to_string(),
+                plist::Value::Integer(0x1234_u64.into()),
+            ),
+            (
+                "ApChipID".to_string(),
+                plist::Value::Integer(0x8103_u64.into()),
+            ),
+            (
+                "ApBoardID".to_string(),
+                plist::Value::Integer(0x22_u64.into()),
+            ),
+            (
+                "ApSecurityDomain".to_string(),
+                plist::Value::Integer(1_u64.into()),
+            ),
+            ("ApSecurityMode".to_string(), plist::Value::Boolean(true)),
+            ("ApProductionMode".to_string(), plist::Value::Boolean(true)),
+        ]);
+        let generated = plist::Dictionary::from_iter([(
+            "Cryptex1,Nonce".to_string(),
+            plist::Value::Data(vec![0x5a; 32]),
+        )]);
+        let tags = plist::Dictionary::from_iter([(
+            "ResponseTags".to_string(),
+            plist::Value::Array(vec![plist::Value::String(KEY_CRYPTEX1_TICKET.to_string())]),
+        )]);
         data_request_with(
             DataType::from_wire(FIRMWARE_UPDATER_DATA_TYPE),
             vec![
@@ -5903,16 +6628,33 @@ mod tests {
                 ),
                 ("MessageForceRepersonalization", plist::Value::Boolean(true)),
                 ("DataChunkSize", plist::Value::Integer(0x20000_i64.into())),
+                ("MessageArgInfo", plist::Value::Dictionary(info)),
                 (
                     "DeviceGeneratedRequest",
-                    plist::Value::Dictionary(plist::Dictionary::new()),
+                    plist::Value::Dictionary(generated),
                 ),
-                (
-                    "DeviceGeneratedTags",
-                    plist::Value::Dictionary(plist::Dictionary::new()),
-                ),
+                ("DeviceGeneratedTags", plist::Value::Dictionary(tags)),
             ],
         )
+    }
+
+    struct RecordingFirmwareUpdaterSigner {
+        requests: Arc<std::sync::Mutex<Vec<plist::Dictionary>>>,
+        ticket: Vec<u8>,
+    }
+
+    impl crate::restore::local_policy::FirmwareUpdaterSigner for RecordingFirmwareUpdaterSigner {
+        fn source(&self) -> &'static str {
+            "recording-test-signer"
+        }
+
+        fn personalize(&self, request: &plist::Dictionary) -> Result<plist::Dictionary, String> {
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(plist::Dictionary::from_iter([(
+                KEY_CRYPTEX1_TICKET.to_string(),
+                plist::Value::Data(self.ticket.clone()),
+            )]))
+        }
     }
 
     fn splat_answers(
@@ -5940,6 +6682,7 @@ mod tests {
             fdr: test_fdr_provider(reporter),
             port: 62078,
             local_policy_signer: None,
+            firmware_updater_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
             device_hardware_info: no_hardware_info_query(),
             armed_at_secs: 0.0,
@@ -6295,91 +7038,121 @@ mod tests {
     }
 
     #[test]
-    fn the_cryptex1_personalization_request_is_answered_with_the_boards_own_manifest() {
+    fn the_cryptex1_nonce_reaches_signing_and_the_ticket_reaches_the_guest() {
         let dir = tempfile::tempdir().unwrap();
-        let cryptex = image4_element("IM4M", &[]);
-        manifests_tree(dir.path(), "j274ap", &[0x30, 0x02, 0x16, 0x00], &cryptex);
+        let ticket = image4_element("IM4M", &[]);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (reporter, lines) = capturing();
         let mut answers = splat_answers(dir.path(), None, &reporter);
+        answers.firmware_updater_signer = Some(Arc::new(RecordingFirmwareUpdaterSigner {
+            requests: Arc::clone(&requests),
+            ticket: ticket.clone(),
+        }));
         let body = answers
             .supply(&splat_request(UPDATER_NAME_CRYPTEX1))
             .unwrap();
-        let response = body
-            .get(KEY_FIRMWARE_RESPONSE_DATA)
-            .and_then(plist::Value::as_dictionary)
-            .expect("the reply carries the personalisation response as a dictionary");
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 1);
         assert_eq!(
-            response
-                .get(KEY_CRYPTEX1_TICKET)
+            sent[0]
+                .get("Cryptex1,Nonce")
                 .and_then(plist::Value::as_data),
-            Some(cryptex.as_slice()),
-            "the ticket key must carry the manifest bytes verbatim"
+            Some([0x5a; 32].as_slice()),
         );
-        assert_eq!(KEY_CRYPTEX1_TICKET, "Cryptex1,Ticket");
-        let lines = lines.lock().unwrap();
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("result=splat-ticket-served")
-                    && line.contains("updater=Cryptex1")
-                    && line.contains("device_generated=true")
-                    && line.contains("repersonalize=true")
-                    && line.contains("DEVIATION FROM A REAL DEVICE")
-                    && line.contains("STATIC GLOBAL")),
-            "{lines:?}"
+        assert_eq!(
+            sent[0]
+                .get("ApECID")
+                .and_then(plist::Value::as_unsigned_integer),
+            Some(0x1234),
         );
-        assert!(
-            !lines
-                .iter()
-                .any(|line| line.contains("result=data-declined")
-                    && line.contains("FirmwareUpdaterData")),
-            "the personalisation request must not fall through to the generic decline: {lines:?}"
+        assert_eq!(
+            sent[0]
+                .get("@Cryptex1,Ticket")
+                .and_then(plist::Value::as_boolean),
+            Some(true),
+        );
+        assert_eq!(
+            body.get(KEY_FIRMWARE_RESPONSE_DATA)
+                .and_then(plist::Value::as_dictionary)
+                .and_then(|response| response.get(KEY_CRYPTEX1_TICKET))
+                .and_then(plist::Value::as_data),
+            Some(ticket.as_slice()),
+        );
+        assert!(lines.lock().unwrap().iter().any(|line| {
+            line.contains("result=firmware-updater-ticket-served")
+                && line.contains("updater=Cryptex1")
+                && line.contains("source=recording-test-signer")
+        }));
+    }
+
+    #[test]
+    fn cryptex1_signing_uses_the_devices_modes_when_the_request_omits_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (reporter, _) = capturing();
+        let mut answers = splat_answers(dir.path(), None, &reporter);
+        let DeviceHardwareInfo::Answered(mut hardware) = device_hardware_info(0x1234, 0x8103, 0x22)
+        else {
+            unreachable!();
+        };
+        hardware.insert(
+            "SecurityMode".to_string(),
+            plist::Value::Integer(0_u64.into()),
+        );
+        hardware.insert(
+            "ProductionMode".to_string(),
+            plist::Value::Integer(1_u64.into()),
+        );
+        answers.device_hardware_info = DeviceHardwareInfo::Answered(hardware);
+        answers.firmware_updater_signer = Some(Arc::new(RecordingFirmwareUpdaterSigner {
+            requests: Arc::clone(&requests),
+            ticket: image4_element("IM4M", &[]),
+        }));
+        let mut request = splat_request(UPDATER_NAME_CRYPTEX1);
+        let info = request
+            .arguments
+            .get_mut("MessageArgInfo")
+            .and_then(plist::Value::as_dictionary_mut)
+            .unwrap();
+        info.remove("ApSecurityMode");
+        info.remove("ApProductionMode");
+        answers.supply(&request).unwrap();
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0]
+                .get("ApSecurityMode")
+                .and_then(plist::Value::as_boolean),
+            Some(false),
+        );
+        assert_eq!(
+            sent[0]
+                .get("ApProductionMode")
+                .and_then(plist::Value::as_boolean),
+            Some(true),
         );
     }
 
     #[test]
-    fn the_served_splat_ticket_is_apples_bytes_unmodified() {
+    fn the_personalized_ticket_is_passed_through_with_the_ap_nonce_staged() {
         let dir = tempfile::tempdir().unwrap();
-        let cryptex = manifest_with_properties();
-        manifests_tree(dir.path(), "j274ap", &[0x30, 0x02, 0x16, 0x00], &cryptex);
-        let nonce = [0x5Au8; BOOT_NONCE_HASH_BYTES];
-        let (reporter, lines) = capturing();
-        let mut answers = splat_answers(dir.path(), Some(nonce), &reporter);
+        let ticket = manifest_with_properties();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (reporter, _) = capturing();
+        let mut answers = splat_answers(dir.path(), Some([0x7b; BOOT_NONCE_HASH_BYTES]), &reporter);
+        answers.firmware_updater_signer = Some(Arc::new(RecordingFirmwareUpdaterSigner {
+            requests,
+            ticket: ticket.clone(),
+        }));
         let body = answers
             .supply(&splat_request(UPDATER_NAME_CRYPTEX1))
             .unwrap();
-        let served = body
-            .get(KEY_FIRMWARE_RESPONSE_DATA)
-            .and_then(plist::Value::as_dictionary)
-            .and_then(|response| response.get(KEY_CRYPTEX1_TICKET))
-            .and_then(plist::Value::as_data)
-            .expect("the reply carries the ticket");
         assert_eq!(
-            served,
-            cryptex.as_slice(),
-            "the grafted manifest must be Apple's file byte for byte"
-        );
-        assert_eq!(
-            crate::ramrod::ticket::read_manifest(served)
-                .unwrap()
-                .boot_nonce_hash(),
-            None,
-            "no BNCH may be written into the manifest that is grafted and re-verified"
-        );
-        let stapled = crate::ramrod::ticket::set_boot_nonce_hash(&cryptex, &nonce)
-            .expect("the fixture is rewritable, so an ungated staple would have landed");
-        assert_ne!(
-            stapled, cryptex,
-            "the fixture must be one the staple actually changes"
-        );
-        let lines = lines.lock().unwrap();
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("result=splat-ticket-served")
-                    && line.contains("boot_nonce=unstaged")
-                    && line.contains("signature=apple-intact")),
-            "{lines:?}"
+            body.get(KEY_FIRMWARE_RESPONSE_DATA)
+                .and_then(plist::Value::as_dictionary)
+                .and_then(|response| response.get(KEY_CRYPTEX1_TICKET))
+                .and_then(plist::Value::as_data),
+            Some(ticket.as_slice()),
         );
     }
 
@@ -6463,27 +7236,134 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_cryptex_manifest_is_named_and_no_ticket_is_substituted() {
+    fn cryptex1_build_identity_tags_are_sent_with_the_generated_request() {
         let dir = tempfile::tempdir().unwrap();
-        let os_path = dir
-            .path()
-            .join("macOS Customer")
-            .join("apticket.j274ap.im4m");
-        std::fs::create_dir_all(os_path.parent().unwrap()).unwrap();
-        std::fs::write(os_path, [0x30, 0x02, 0x16, 0x00]).unwrap();
-        let (reporter, lines) = capturing();
+        let ticket = image4_element("IM4M", &[]);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (reporter, _) = capturing();
         let mut answers = splat_answers(dir.path(), None, &reporter);
-        let body = answers
-            .supply(&splat_request(UPDATER_NAME_CRYPTEX1))
+        let identities = answers
+            .identities
+            .manifest
+            .get_mut("BuildIdentities")
+            .and_then(plist::Value::as_array_mut)
             .unwrap();
-        assert!(body.is_empty());
-        let lines = lines.lock().unwrap();
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("result=splat-ticket-manifest-missing")),
-            "{lines:?}"
+        identities[0].as_dictionary_mut().unwrap().insert(
+            "UniqueBuildID".to_string(),
+            plist::Value::Data(vec![0x72, 0x10]),
         );
+        answers.firmware_updater_signer = Some(Arc::new(RecordingFirmwareUpdaterSigner {
+            requests: Arc::clone(&requests),
+            ticket,
+        }));
+        let mut request = splat_request(UPDATER_NAME_CRYPTEX1);
+        request
+            .arguments
+            .get_mut("DeviceGeneratedTags")
+            .and_then(plist::Value::as_dictionary_mut)
+            .unwrap()
+            .insert(
+                "BuildIdentityTags".to_string(),
+                plist::Value::Array(vec![plist::Value::String("UniqueBuildID".to_string())]),
+            );
+        answers.supply(&request).unwrap();
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].get("UniqueBuildID").and_then(plist::Value::as_data),
+            Some([0x72, 0x10].as_slice()),
+        );
+    }
+
+    #[test]
+    fn cryptex1_signing_continues_when_a_requested_manifest_tag_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticket = image4_element("IM4M", &[]);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (reporter, _) = capturing();
+        let mut answers = splat_answers(dir.path(), None, &reporter);
+        answers.firmware_updater_signer = Some(Arc::new(RecordingFirmwareUpdaterSigner {
+            requests: Arc::clone(&requests),
+            ticket: ticket.clone(),
+        }));
+        let mut request = splat_request(UPDATER_NAME_CRYPTEX1);
+        request
+            .arguments
+            .get_mut("DeviceGeneratedTags")
+            .and_then(plist::Value::as_dictionary_mut)
+            .unwrap()
+            .insert(
+                "BuildIdentityTags".to_string(),
+                plist::Value::Array(vec![
+                    plist::Value::String("UniqueBuildID".to_string()),
+                    plist::Value::String("Cryptex1,UseProductClass".to_string()),
+                ]),
+            );
+        let body = answers.supply(&request).unwrap();
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0]
+                .get("Cryptex1,Nonce")
+                .and_then(plist::Value::as_data),
+            Some([0x5a; 32].as_slice()),
+        );
+        assert_eq!(
+            body.get(KEY_FIRMWARE_RESPONSE_DATA)
+                .and_then(plist::Value::as_dictionary)
+                .and_then(|response| response.get(KEY_CRYPTEX1_TICKET))
+                .and_then(plist::Value::as_data),
+            Some(ticket.as_slice()),
+        );
+    }
+
+    #[test]
+    fn cryptex1_manifest_ids_are_numeric_in_the_signing_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (reporter, _) = capturing();
+        let mut answers = splat_answers(dir.path(), None, &reporter);
+        let identities = answers
+            .identities
+            .manifest
+            .get_mut("BuildIdentities")
+            .and_then(plist::Value::as_array_mut)
+            .unwrap();
+        let identity = identities[0].as_dictionary_mut().unwrap();
+        for (key, value) in [
+            ("ApChipID", "0x8112"),
+            ("ApBoardID", "0x0C"),
+            ("ApSecurityDomain", "0x01"),
+        ] {
+            identity.insert(key.to_string(), plist::Value::String(value.to_string()));
+        }
+        answers.firmware_updater_signer = Some(Arc::new(RecordingFirmwareUpdaterSigner {
+            requests: Arc::clone(&requests),
+            ticket: image4_element("IM4M", &[]),
+        }));
+        let mut request = splat_request(UPDATER_NAME_CRYPTEX1);
+        let info = request
+            .arguments
+            .get_mut("MessageArgInfo")
+            .and_then(plist::Value::as_dictionary_mut)
+            .unwrap();
+        info.remove("ApChipID");
+        info.remove("ApBoardID");
+        info.remove("ApSecurityDomain");
+        answers.supply(&request).unwrap();
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        for (key, expected) in [
+            ("ApChipID", 0x8112),
+            ("ApBoardID", 0x0c),
+            ("ApSecurityDomain", 1),
+        ] {
+            assert_eq!(
+                sent[0].get(key).and_then(plist::Value::as_unsigned_integer),
+                Some(expected),
+                "{key} must use the numeric identity value",
+            );
+        }
     }
 
     #[test]
@@ -6511,6 +7391,7 @@ mod tests {
             fdr: test_fdr_provider(&reporter),
             port: 62078,
             local_policy_signer: None,
+            firmware_updater_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
             device_hardware_info: no_hardware_info_query(),
             armed_at_secs: 0.0,
@@ -6558,6 +7439,7 @@ mod tests {
             source_boot_objects: test_source_boot_object_provider(dir.path()),
             fdr: test_fdr_provider(&reporter()),
             local_policy_signer: None,
+            firmware_updater_signer: None,
             local_policy_census: LocalPolicyCensus::default(),
             device_hardware_info: no_hardware_info_query(),
             port: 62078,
@@ -6713,6 +7595,51 @@ mod tests {
     }
 
     #[test]
+    fn received_updater_output_reports_its_persisted_path_and_receive_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("baseband-updater-output-1.cpio");
+        let (reporter, lines) = capturing();
+        let mut observer = RamrodTrace::new(62078, 0.0, reporter);
+        let request = data_request(DataType::Other("BasebandUpdaterOutputData".to_string()));
+        observer.on_bulk_receiving(&request, 9420);
+        observer.on_bulk_received(&request, 9420, 76, &path);
+        let lines = lines.lock().unwrap();
+        let receiving = lines
+            .iter()
+            .find(|line| line.contains("result=bulk-receiving"))
+            .unwrap();
+        assert!(receiving.contains("BasebandUpdaterOutputData"));
+        let received = lines
+            .iter()
+            .find(|line| line.contains("result=bulk-received"))
+            .unwrap();
+        assert!(received.contains("data_port=9420"));
+        assert!(received.contains("received_bytes=76"));
+        assert!(received.contains(&path.display().to_string()));
+        assert!(received.contains("host shut down its write half"));
+    }
+
+    #[test]
+    fn a_cancelled_transfer_reports_the_terminal_control_event_and_delivery_bound() {
+        let (reporter, lines) = capturing();
+        let mut observer = RamrodTrace::new(62078, 0.0, reporter);
+        let request = data_request(DataType::SystemImageData);
+        observer.on_bulk_cancelled(&request, 9420, "cancelled during cleanup");
+        let lines = lines.lock().unwrap();
+        let line = lines
+            .iter()
+            .find(|line| line.contains("result=bulk-cancelled"))
+            .expect("the cancelled transfer is reported under its own name");
+        assert!(line.contains("SystemImageData"), "{line}");
+        assert!(line.contains("data_port=9420"), "{line}");
+        assert!(line.contains("restore control session ended"), "{line}");
+        assert!(
+            line.contains("does not measure how many payload bytes had already been delivered"),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn an_unanswered_request_names_its_own_argument_values_and_data_port() {
         let (reporter, lines) = capturing();
         let mut observer = RamrodTrace::new(62078, 0.0, reporter);
@@ -6790,6 +7717,115 @@ mod tests {
         assert!(
             checkpoint.contains("detail=\"UnverifiedStepKey=1558\""),
             "{checkpoint}"
+        );
+    }
+    #[test]
+    fn personalized_root_ticket_preserves_signed_bytes_with_local_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticket = manifest_with_properties_naming_a_part();
+        manifests_tree(dir.path(), "j274ap", &ticket, &[9]);
+        let mut provider = GlobalManifestProvider::new(
+            dir.path().to_path_buf(),
+            test_variants(),
+            "J274AP".to_string(),
+            false,
+            62078,
+            0.0,
+            None,
+            None,
+            Some([0x55; BOOT_NONCE_HASH_BYTES]),
+            &reporter(),
+        )
+        .with_personalized_source(dir.path().to_path_buf());
+        let reply = provider
+            .supply(&data_request(DataType::RootTicket))
+            .unwrap();
+        assert_eq!(
+            reply.get("RootTicketData").and_then(plist::Value::as_data),
+            Some(ticket.as_slice())
+        );
+        assert_eq!(provider.served_os_root_ticket(), Some(ticket.as_slice()));
+    }
+
+    #[test]
+    fn os_root_ticket_uses_the_manifest_measured_at_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = manifest_with_properties_naming_a_part();
+        let mut provider = GlobalManifestProvider::new(
+            dir.path().to_path_buf(),
+            test_variants(),
+            "J274AP".to_string(),
+            false,
+            62078,
+            0.0,
+            Some(sha384(&staged)),
+            None,
+            None,
+            &reporter(),
+        )
+        .with_staged_boot_manifest(Some(staged.clone()));
+        let reply = provider
+            .supply(&data_request(DataType::RootTicket))
+            .unwrap();
+        assert_eq!(
+            reply.get("RootTicketData").and_then(plist::Value::as_data),
+            Some(staged.as_slice())
+        );
+        assert_eq!(provider.served_os_root_ticket(), Some(staged.as_slice()));
+    }
+
+    #[test]
+    fn firmware_images_carry_the_manifest_measured_at_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = image4_element("IM4M", &[0x02, 0x01, 0x01]);
+        let separately_signed = image4_element("IM4M", &[0x02, 0x01, 0x02]);
+        manifests_tree(dir.path(), "j274ap", &separately_signed, &[9]);
+        let selected = super::board_manifest_for_firmware(
+            dir.path(),
+            &test_variants(),
+            "J274AP",
+            Some(&staged),
+            Some(sha384(&staged)),
+            false,
+            62078,
+            0.0,
+            &reporter(),
+        )
+        .unwrap();
+        let payload = image4_element("IM4P", &[0x02, 0x01, 0x03]);
+        let image = wrap_image4(&payload, &selected.bytes).unwrap();
+        assert_eq!(selected.source, "staged-boot-manifest");
+        assert_eq!(selected.bytes, staged);
+        assert!(image.windows(staged.len()).any(|bytes| bytes == staged));
+    }
+
+    #[test]
+    fn personalized_ap_cache_keeps_other_manifest_sources_reachable() {
+        let source = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let ticket = manifest_with_properties_naming_a_part();
+        manifests_tree(source.path(), "j274ap", &[1], &[2, 3, 4]);
+        manifests_tree(cache.path(), "j274ap", &ticket, &[9]);
+        let mut provider = GlobalManifestProvider::new(
+            source.path().to_path_buf(),
+            test_variants(),
+            "J274AP".to_string(),
+            false,
+            62078,
+            0.0,
+            None,
+            None,
+            None,
+            &reporter(),
+        )
+        .with_personalized_source(cache.path().to_path_buf());
+        assert_eq!(provider.cryptex1_ticket_bytes(), Some(vec![2, 3, 4]));
+        let reply = provider
+            .supply(&data_request(DataType::RootTicket))
+            .unwrap();
+        assert_eq!(
+            reply.get("RootTicketData").and_then(plist::Value::as_data),
+            Some(ticket.as_slice())
         );
     }
 }

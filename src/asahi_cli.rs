@@ -134,6 +134,7 @@ struct CliOpts {
     target_calibration: Option<PathBuf>,
     requires_als_calibration: Option<bool>,
     kernel_console: Option<KernelConsole>,
+    scratch: std::cell::OnceCell<crate::scratch::ScratchDir>,
 }
 
 impl CliOpts {
@@ -306,7 +307,7 @@ impl CliOpts {
         requirements: &asahi_ops::FirmwareRequirements,
     ) -> Result<crate::asahi_firmware_download::ResolvedFirmwareArchives, String> {
         let (board, chip_id, _) = self.provisioning_inputs()?;
-        let workdir = self.workdir();
+        let workdir = self.workdir()?;
         let mut last_url = String::new();
         let mut last_percent = None;
         resolve_firmware_archives(
@@ -355,7 +356,7 @@ impl CliOpts {
             .firmware_requirements
             .as_ref()
             .ok_or("firmware provisioning requires package metadata")?;
-        let workdir = self.workdir();
+        let workdir = self.workdir()?;
         let archives = match preflight {
             Some(archives) => archives,
             None => self.resolve_archives(requirements)?,
@@ -392,10 +393,20 @@ impl CliOpts {
         Ok(bytes)
     }
 
-    fn workdir(&self) -> PathBuf {
-        self.workdir.clone().unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("apple-utils-asahi-{}", std::process::id()))
-        })
+    /// The user-supplied `--workdir`, or a private scratch directory that is
+    /// removed when the options are dropped at the end of the command.
+    fn workdir(&self) -> Result<PathBuf, String> {
+        if let Some(dir) = &self.workdir {
+            return Ok(dir.clone());
+        }
+        if let Some(dir) = self.scratch.get() {
+            return Ok(dir.path().to_path_buf());
+        }
+        let dir = crate::scratch::ScratchDir::new("apple-utils-asahi-")
+            .map_err(|e| format!("cannot create scratch directory: {e}"))?;
+        let path = dir.path().to_path_buf();
+        let _ = self.scratch.set(dir);
+        Ok(path)
     }
 
     fn disc_options(&self) -> DiscOptions {
@@ -435,7 +446,7 @@ impl CliOpts {
                 preflight =
                     Some(self.resolve_archives(&asahi_ops::FirmwareRequirements::from(&resolved))?);
             }
-            let work = self.workdir();
+            let work = self.workdir()?;
             std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
             let package = if let Some(path) = &self.package {
                 path.clone()

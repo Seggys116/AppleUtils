@@ -66,8 +66,7 @@ impl std::fmt::Display for CheckpointError {
             Self::NotInPublishedCheckpoint { oid } => write!(
                 f,
                 "ephemeral object {oid} is not named by the currently published checkpoint, so \
-                 its mapping size cannot be read; this writer republishes an existing ephemeral \
-                 set, it does not place a new object"
+                 its mapping size cannot be read and no complete new object body was supplied"
             ),
             Self::MultiBlockEphemeralObject { oid, size } => write!(
                 f,
@@ -235,6 +234,7 @@ pub fn collect_ephemeral_objects(
 #[derive(Clone, Debug, Default)]
 pub struct CheckpointPublish {
     pub omap_oid: Option<u64>,
+    pub next_oid: Option<u64>,
     pub ephemeral_bodies: Vec<(u64, Vec<u8>)>,
 }
 
@@ -295,12 +295,33 @@ pub fn append_with(
     }
 
     let published = published_mapping_sizes(disc, &geometry)?;
+    let old_next_oid = u64_at(&old_sb, 0x58);
+    let mut next_oid = publish.next_oid.unwrap_or(old_next_oid);
+    if next_oid < old_next_oid {
+        return Err(CheckpointError::Malformed(
+            "published next object ID precedes the existing container object ID bound",
+        ));
+    }
+    for entry in ephemeral_objects {
+        if !published.iter().any(|(oid, _)| *oid == entry.oid) {
+            next_oid = next_oid.max(entry.oid.checked_add(1).ok_or(CheckpointError::Malformed(
+                "new ephemeral object ID overflows the container object ID space",
+            ))?);
+        }
+    }
     let mut sizes = Vec::with_capacity(ephemeral_objects.len());
     for entry in ephemeral_objects {
         let size = published
             .iter()
             .find(|(oid, _)| *oid == entry.oid)
             .map(|(_, size)| *size)
+            .or_else(|| {
+                publish
+                    .ephemeral_bodies
+                    .iter()
+                    .find(|(oid, _)| *oid == entry.oid)
+                    .and_then(|(_, body)| u32::try_from(body.len()).ok())
+            })
             .ok_or(CheckpointError::NotInPublishedCheckpoint { oid: entry.oid })?;
         if size != block_size {
             return Err(CheckpointError::MultiBlockEphemeralObject {
@@ -414,6 +435,7 @@ pub fn append_with(
         ((new_data_index + data_len) % geometry.data_blocks) as u32,
     );
     put_u64(&mut sb, NX_NEXT_XID_OFFSET, new_xid.saturating_add(1));
+    put_u64(&mut sb, 0x58, next_oid);
     if let Some(omap_oid) = publish.omap_oid {
         put_u64(&mut sb, NX_OMAP_OID_OFFSET, omap_oid);
     }

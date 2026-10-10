@@ -577,12 +577,16 @@ pub(crate) fn record_sort_key(key: &[u8]) -> (u64, u64, Vec<u8>) {
     let obj_id = header & J_OBJ_ID_MASK;
     let kind = header >> 60;
     let tail = if kind == J_DIR_REC && key.len() >= 12 {
-        let prefix = u32::from_le_bytes(key[8..12].try_into().unwrap());
-        let mut tail = prefix.to_be_bytes().to_vec();
+        let hash = u32::from_le_bytes(key[8..12].try_into().unwrap()) >> 10;
+        let mut tail = hash.to_be_bytes().to_vec();
         tail.extend_from_slice(&key[12..]);
         tail
-    } else if kind == J_SNAP_NAME && key.len() >= 10 {
+    } else if (kind == 4 || kind == J_SNAP_NAME) && key.len() >= 10 {
         key[10..].to_vec()
+    } else if (kind == 5 || kind == J_FILE_EXTENT) && key.len() >= 16 {
+        u64::from_le_bytes(key[8..16].try_into().unwrap())
+            .to_be_bytes()
+            .to_vec()
     } else {
         key[8..].to_vec()
     };

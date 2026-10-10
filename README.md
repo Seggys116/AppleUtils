@@ -13,6 +13,14 @@ Recovery talks to a local Unix-domain restore bridge. Asahi `--latest` /
 `--package` downloads use `curl`, and extracting the official installer archive
 uses `tar`.
 
+Optional: the [`ipsw`](https://github.com/blacktop/ipsw) command (for example
+`brew install blacktop/tap/ipsw`). With it installed, Recovery accepts an `.ipsw`
+wherever it asks for a restore folder. The archive's file tree is indexed in
+memory and only the files a restore needs are written to a private temp
+directory, when the manifest asks for them. macOS `.aea` images are decrypted
+there with `ipsw fw aea`, and the directory is removed when the session ends.
+Without `ipsw`, extract the IPSW and hand over the folder as before.
+
 Apple's `fsck_apfs` is used only in CI on macOS. It is not required to build or
 run the toolkit. APFS and FAT image work is done in-process.
 
@@ -45,8 +53,6 @@ are written and checked in-process; validation does not call host filesystem
 tools.
 
 `--m1n1` is the EFI stage-two image. Stage one comes from the official Asahi installer archive, which builds m1n1 with chainloading support. Use `--stage1 FILE` to supply that raw image offline. OS packages retain all `esp/` files and their separate boot image. Updates preserve the installed root filesystem unless a root payload is requested, and regular image files are replaced only after the staged update validates.
-
-Images with 512-byte GPT logical blocks must be regenerated; inspection can still read them, but validation and updates reject them before mutation. Images made by the former synthetic APFS writer must also be regenerated. Repair now reports their container-structure failure; changing header fields alone cannot reconstruct missing allocation and checkpoint metadata.
 
 ```
 apple-utils asahi flavors [--metadata FILE]

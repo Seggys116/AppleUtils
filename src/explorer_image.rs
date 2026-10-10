@@ -335,21 +335,21 @@ pub fn extract_selected_paths(
     image_path: &Path,
     volume_name: &str,
     paths: &[String],
-) -> Result<tempfile::TempDir, ExplorerError> {
+) -> Result<crate::scratch::ScratchDir, ExplorerError> {
     extract_paths_at_container(image_path, volume_name, None, paths, false)
 }
 
 pub fn extract_paths_from_unique_volume(
     image_path: &Path,
     paths: &[String],
-) -> Result<tempfile::TempDir, ExplorerError> {
+) -> Result<crate::scratch::ScratchDir, ExplorerError> {
     extract_unique_paths(image_path, paths, false)
 }
 
 pub fn extract_paths_with_link_metadata(
     image_path: &Path,
     paths: &[String],
-) -> Result<tempfile::TempDir, ExplorerError> {
+) -> Result<crate::scratch::ScratchDir, ExplorerError> {
     extract_unique_paths(image_path, paths, true)
 }
 
@@ -357,7 +357,7 @@ fn extract_unique_paths(
     image_path: &Path,
     paths: &[String],
     preserve_links: bool,
-) -> Result<tempfile::TempDir, ExplorerError> {
+) -> Result<crate::scratch::ScratchDir, ExplorerError> {
     if paths.is_empty() {
         return Err(ExplorerError::Format("no extraction paths supplied".into()));
     }
@@ -403,7 +403,7 @@ fn extract_paths_at_container(
     container: Option<usize>,
     paths: &[String],
     preserve_links: bool,
-) -> Result<tempfile::TempDir, ExplorerError> {
+) -> Result<crate::scratch::ScratchDir, ExplorerError> {
     let mut selected = BTreeSet::new();
     for path in paths {
         if !path.starts_with('/')
@@ -442,7 +442,7 @@ fn extract_paths_at_container(
     let mut blocks = ImageBlocks { image: &mut image };
     let mut apfs = ApfsContainer::mount(&mut blocks, block_size, block_count)?;
     let volume = apfs.open_volume_chosen(&VolumeChoice::Named(volume_name.into()))?;
-    let output = tempfile::tempdir()?;
+    let output = crate::scratch::ScratchDir::new("apple-utils-explorer-")?;
     let mut pending: Vec<_> = selected
         .iter()
         .filter(|path| {

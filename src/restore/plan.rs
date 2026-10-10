@@ -39,7 +39,9 @@ pub struct RestorePlan {
     pub bootability_bundle: Option<PathBuf>,
     pub corrupt_manifest: bool,
     pub staged_boot_manifest_sha384: Option<[u8; 48]>,
+    pub staged_boot_manifest: Option<Vec<u8>>,
     pub fdr_trust_digest: Option<FdrTrustDigest>,
+    pub restore_ramdisk: Option<PathBuf>,
     pub fdr_material_dir: Option<PathBuf>,
     pub sign_recovery_os_local_policy: bool,
 }
@@ -213,6 +215,56 @@ pub fn fdr_trust_digest_from_ramdisk_payload(payload: &[u8]) -> Result<FdrTrustD
     })
 }
 
+pub fn stock_fdr_trust_from_ramdisk_and_ticket(
+    ramdisk: &[u8],
+    ticket: &[u8],
+) -> Result<FdrTrustDigest, String> {
+    let manifest = crate::ramrod::read_manifest(ticket)
+        .map_err(|error| format!("stock-fdr-ticket-unreadable: {error}"))?;
+    let digest = manifest
+        .object(crate::ramrod::ticket::RESTORE_FDR_TRUST_OBJECT_TAG)
+        .and_then(|object| object.digest())
+        .ok_or("stock-fdr-ticket-rfta-missing: signed AP ticket has no rfta digest")?;
+    let digest: [u8; 32] = digest
+        .try_into()
+        .map_err(|_| "stock-fdr-ticket-rfta-unreadable: digest is not SHA-256".to_string())?;
+    let decoded = crate::asahi_kernel::decode_im4p(ramdisk, usize::MAX)
+        .map_err(|error| format!("stock-fdr-ramdisk-unreadable: {error}"))?;
+    if decoded.payload_type != *b"rdsk" {
+        return Err(format!(
+            "stock-fdr-ramdisk-type-mismatch: expected rdsk, got {:?}",
+            decoded.payload_type
+        ));
+    }
+    let file = crate::apfs_read::read_file_from_container(&decoded.bytes, FDR_TRUST_OBJECT_PATH)
+        .map_err(|error| format!("stock-fdr-trust-file-unreadable: {error}"))?;
+    stock_fdr_trust_from_file_and_digest(&file, digest)
+}
+
+fn stock_fdr_trust_from_file_and_digest(
+    file: &[u8],
+    digest: [u8; 32],
+) -> Result<FdrTrustDigest, String> {
+    let spans = top_level_elements(file).map_err(|error| error.to_string())?;
+    let matches = crate::ramrod::fdr_trust::digest_top_level_elements(file)
+        .map_err(|error| error.to_string())?;
+    let Some(index) = matches.iter().position(|candidate| *candidate == digest) else {
+        return Err(format!(
+            "stock-fdr-trust-digest-mismatch: ticket rfta {} matches none of {} ramdisk elements",
+            hex_digest(&digest),
+            spans.len()
+        ));
+    };
+    let (start, end) = spans[index];
+    Ok(FdrTrustDigest {
+        digest,
+        element_index: index,
+        element_count: spans.len(),
+        trust_object: file[start..end].to_vec(),
+        instance: None,
+    })
+}
+
 pub fn host_fdr_trust_digest(
     chip_id: Option<&str>,
     unique_chip_id: Option<u64>,
@@ -220,9 +272,27 @@ pub fn host_fdr_trust_digest(
 ) -> Result<FdrTrustDigest, String> {
     validate_bundle_directory(bundle_dir)?;
     let directory = bundle_dir.join(FDR_TRUST_MATERIAL_DIR_NAME);
-    let material =
-        FdrTrustMaterial::load_or_generate(&directory, FDR_TRUST_NOT_BEFORE, FDR_TRUST_NOT_AFTER)
-            .map_err(|error| format!("{error} (material directory {})", directory.display()))?;
+    let material = FdrTrustMaterial::load_or_generate_portable(
+        &directory,
+        FDR_TRUST_NOT_BEFORE,
+        FDR_TRUST_NOT_AFTER,
+    )
+    .or_else(|error| match error {
+        crate::ramrod::FdrObjectError::UnrecordedMaterial { .. } => {
+            let descriptor = crate::ramrod::fdr_object::sdk_material_descriptor(
+                FDR_TRUST_NOT_BEFORE,
+                FDR_TRUST_NOT_AFTER,
+            );
+            let expected = FdrTrustMaterial::load_with_descriptor(&directory, &descriptor)?;
+            FdrTrustMaterial::adopt_legacy_material(
+                &directory,
+                &descriptor,
+                expected.trust_object(),
+            )
+        }
+        error => Err(error),
+    })
+    .map_err(|error| format!("{error} (material directory {})", directory.display()))?;
     Ok(FdrTrustDigest {
         digest: material.digest(),
         element_index: 0,
@@ -337,7 +407,139 @@ fn validate_bundle_directory(bundle_dir: &Path) -> Result<(), String> {
 mod tests {
     use std::path::Path;
 
-    use super::{host_fdr_trust_digest, resolve_bundle_relative_path};
+    use super::{
+        host_fdr_trust_digest, resolve_bundle_relative_path, stock_fdr_trust_from_file_and_digest,
+    };
+
+    #[test]
+    fn stock_trust_selects_the_element_signed_by_the_ticket_digest() {
+        let file = [0x04, 0x01, 0x11, 0x04, 0x02, 0x22, 0x33];
+        let digest = crate::crypto::sha256(&file[3..]);
+        let selected = stock_fdr_trust_from_file_and_digest(&file, digest)
+            .expect("signed element in the ramdisk trust file");
+        assert_eq!(selected.element_index, 1);
+        assert_eq!(selected.element_count, 2);
+        assert_eq!(selected.trust_object, file[3..]);
+        assert_eq!(selected.digest, digest);
+    }
+
+    #[test]
+    fn sdk_trust_producer_hands_exact_material_to_the_readonly_consumer() {
+        let bundle = tempfile::tempdir().unwrap();
+        let produced = host_fdr_trust_digest(None, None, bundle.path()).unwrap();
+        let directory = bundle.path().join(super::FDR_TRUST_MATERIAL_DIR_NAME);
+        let consumed = crate::ramrod::FdrTrustMaterial::load_from_directory(&directory).unwrap();
+        assert_eq!(consumed.trust_object(), produced.trust_object.as_slice());
+        assert_eq!(consumed.digest(), produced.digest);
+    }
+
+    #[test]
+    fn sdk_trust_producer_adopts_its_complete_existing_authority() {
+        let bundle = tempfile::tempdir().unwrap();
+        let directory = bundle.path().join(super::FDR_TRUST_MATERIAL_DIR_NAME);
+        let expected = crate::ramrod::FdrTrustMaterial::load_or_generate(
+            &directory,
+            super::FDR_TRUST_NOT_BEFORE,
+            super::FDR_TRUST_NOT_AFTER,
+        )
+        .unwrap();
+        let produced = host_fdr_trust_digest(None, None, bundle.path()).unwrap();
+        let consumed = crate::ramrod::FdrTrustMaterial::load_from_directory(&directory).unwrap();
+        assert_eq!(produced.trust_object, expected.trust_object());
+        assert_eq!(consumed.trust_object(), expected.trust_object());
+        assert_eq!(consumed.digest(), produced.digest);
+    }
+
+    #[test]
+    fn sdk_trust_producer_recovers_the_foreign_profile_selected_by_a_pending_record() {
+        use crate::ramrod::fdr_material_format::{
+            FDR_MATERIAL_CREATION_FILE_NAME, FdrAuthorityDescriptor, FdrMaterialDescriptor,
+        };
+        use crate::ramrod::fdr_pki::{CertificateIdentity, DistinguishedName, FdrKeyPair};
+        let bundle = tempfile::tempdir().unwrap();
+        let directory = bundle.path().join(super::FDR_TRUST_MATERIAL_DIR_NAME);
+        std::fs::create_dir(&directory).unwrap();
+        let root_domain = b"fixture owner root domain";
+        let tls_domain = b"fixture owner TLS domain";
+        let root_subject = DistinguishedName::new()
+            .organization("fixture owner")
+            .common_name("fixture sealing root");
+        let tls_subject = DistinguishedName::new()
+            .common_name("fixture TLS root")
+            .organization("fixture owner");
+        let descriptor = FdrMaterialDescriptor::new(
+            FdrAuthorityDescriptor::new(
+                root_domain,
+                &root_subject,
+                super::FDR_TRUST_NOT_BEFORE,
+                super::FDR_TRUST_NOT_AFTER,
+            ),
+            FdrAuthorityDescriptor::new(
+                tls_domain,
+                &tls_subject,
+                super::FDR_TRUST_NOT_BEFORE,
+                super::FDR_TRUST_NOT_AFTER,
+            ),
+        );
+        let descriptor_json = format!("\n{}\n", serde_json::to_string_pretty(&descriptor).unwrap());
+        let record = serde_json::json!({
+            "creationVersion": 1, "descriptorJson": descriptor_json,
+            "rootCaSeedHex": "41".repeat(32), "tlsRootSeedHex": "52".repeat(32),
+            "rootCaSerialHex": "010203", "tlsRootSerialHex": "040506",
+        });
+        std::fs::write(
+            directory.join(FDR_MATERIAL_CREATION_FILE_NAME),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let expected = crate::ramrod::FdrTrustMaterial::issue(
+            FdrKeyPair::from_seed([0x41; 32], root_domain),
+            FdrKeyPair::from_seed([0x52; 32], tls_domain),
+            &CertificateIdentity {
+                subject: root_subject,
+                serial: vec![1, 2, 3],
+                not_before: super::FDR_TRUST_NOT_BEFORE,
+                not_after: super::FDR_TRUST_NOT_AFTER,
+            },
+            &CertificateIdentity {
+                subject: tls_subject,
+                serial: vec![4, 5, 6],
+                not_before: super::FDR_TRUST_NOT_BEFORE,
+                not_after: super::FDR_TRUST_NOT_AFTER,
+            },
+        )
+        .unwrap();
+        let produced = host_fdr_trust_digest(None, None, bundle.path()).unwrap();
+        assert_eq!(produced.trust_object, expected.trust_object());
+        assert_eq!(produced.digest, expected.digest());
+        let loaded = crate::ramrod::FdrTrustMaterial::load_from_directory(&directory).unwrap();
+        assert_eq!(
+            loaded.root_ca_key().public_uncompressed(),
+            expected.root_ca_key().public_uncompressed()
+        );
+        assert_eq!(
+            loaded.tls_root_certificate(),
+            expected.tls_root_certificate()
+        );
+        assert_eq!(
+            std::fs::read(directory.join(crate::ramrod::FDR_MATERIAL_FILE_NAME)).unwrap(),
+            record["descriptorJson"].as_str().unwrap().as_bytes()
+        );
+    }
+
+    #[test]
+    fn sdk_trust_producer_names_a_malformed_pending_record() {
+        let bundle = tempfile::tempdir().unwrap();
+        let directory = bundle.path().join(super::FDR_TRUST_MATERIAL_DIR_NAME);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join(crate::ramrod::fdr_material_format::FDR_MATERIAL_CREATION_FILE_NAME),
+            b"{",
+        )
+        .unwrap();
+        let error = host_fdr_trust_digest(None, None, bundle.path()).unwrap_err();
+        assert!(error.contains("fdr-material-creation-invalid"), "{error}");
+    }
 
     #[test]
     fn current_directory_is_not_accepted_as_a_bundle_directory() {

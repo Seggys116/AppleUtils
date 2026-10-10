@@ -1,7 +1,8 @@
 use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 use plist::{Dictionary, Value};
@@ -55,9 +56,12 @@ impl Inbound {
 pub struct RestoreSummary {
     pub data_requests: u64,
     pub bulk_transfers: u64,
+    pub bulk_received: u64,
+    pub bulk_received_bytes: u64,
     pub async_data_requests: u64,
     pub async_waits: u64,
     pub bulk_declined: u64,
+    pub bulk_cancelled: u64,
     pub bulk_empty: u64,
     pub progress_messages: u64,
     pub status_messages: u64,
@@ -159,6 +163,10 @@ impl<T> RamrodClient<T> {
         self
     }
 
+    pub fn crash_log_directory(&self) -> &Path {
+        &self.crash_log_directory
+    }
+
     pub fn with_format(mut self, format: PlistFormat) -> Self {
         self.format = format;
         self
@@ -177,8 +185,8 @@ impl<T> RamrodClient<T> {
     }
 }
 
-type InFlightTransfer<'scope> = (
-    thread::ScopedJoinHandle<'scope, Result<BulkOutcome, ProviderError>>,
+type InFlightTransfer = (
+    thread::JoinHandle<Result<BulkOutcome, ProviderError>>,
     DataRequest,
     u16,
 );
@@ -194,6 +202,11 @@ where
     O: SessionObserver + ?Sized,
 {
     match result {
+        Ok(BulkOutcome::Received { bytes, path }) => {
+            summary.bulk_received += 1;
+            summary.bulk_received_bytes += bytes;
+            observer.on_bulk_received(request, port, bytes, &path);
+        }
         Ok(outcome @ BulkOutcome::Served { bytes: 0, .. }) => {
             summary.bulk_empty += 1;
             observer.on_bulk_served_empty(request, port, &outcome);
@@ -227,12 +240,26 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+fn transfer_cleanup_cancelled(error: &ProviderError) -> bool {
+    match error {
+        ProviderError::Io(error) => {
+            super::dial::DialCancellation::from_io_error(error)
+                == Some(super::dial::DialCancellation::TransferFailed)
+        }
+        ProviderError::Other(reason) => {
+            reason.contains(crate::usbmux::stream::TRANSFER_CANCELLED_MARKER)
+        }
+        _ => false,
+    }
+}
+
 fn join_bulk_transfer<O>(
-    handle: thread::ScopedJoinHandle<'_, Result<BulkOutcome, ProviderError>>,
+    handle: thread::JoinHandle<Result<BulkOutcome, ProviderError>>,
     request: &DataRequest,
     port: u16,
     observer: &mut O,
     summary: &mut RestoreSummary,
+    terminal_cleanup: bool,
 ) -> Result<(), RamrodError>
 where
     O: SessionObserver + ?Sized,
@@ -242,10 +269,21 @@ where
         Err(payload) => Err(ProviderError::Other(format!(
             "the {} transfer on port {port} panicked: {}",
             request.data_type,
-            panic_message(&payload)
+            panic_message(payload.as_ref())
         ))),
     };
-    report_bulk_outcome(result, request, port, observer, summary)
+    match result {
+        Err(source) if terminal_cleanup && transfer_cleanup_cancelled(&source) => {
+            let reason = format!(
+                "the restore control session ended; the outstanding {} transfer on port {port} was cancelled during cleanup: {source}",
+                request.data_type
+            );
+            summary.bulk_cancelled += 1;
+            observer.on_bulk_cancelled(request, port, &reason);
+            Ok(())
+        }
+        result => report_bulk_outcome(result, request, port, observer, summary),
+    }
 }
 
 impl<T: Read + Write> RamrodClient<T> {
@@ -366,246 +404,352 @@ impl<T: Read + Write> RamrodClient<T> {
     ) -> Result<RestoreSummary, RamrodError>
     where
         P: RestoreDataProvider + ?Sized,
-        B: BulkTransferService + Send + ?Sized,
+        B: BulkTransferService + ?Sized,
         O: SessionObserver + ?Sized,
     {
         if !self.restore_started {
             return Err(RamrodError::RestoreNotStarted);
         }
-        let bulk = Mutex::new(bulk);
-        std::thread::scope(|scope| {
-            let mut summary = RestoreSummary::default();
-            let mut in_flight: Option<InFlightTransfer<'_>> = None;
+        self.run_restore_with_cancellation(
+            provider,
+            bulk,
+            observer,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
 
-            let loop_result = (|| -> Result<(), RamrodError> {
-                loop {
-                    if let Some((handle, _, _)) = in_flight.as_ref()
-                        && handle.is_finished()
-                    {
-                        let (handle, request, port) =
-                            in_flight.take().expect("checked is_finished above");
-                        join_bulk_transfer(handle, &request, port, observer, &mut summary)?;
-                    }
-
-                    let Some(inbound) = self.receive()? else {
-                        return Ok(());
-                    };
-                    let message = match inbound {
-                        Inbound::Device(message) => message,
-                        Inbound::Untyped(body) => {
-                            summary.untyped_messages += 1;
-                            observer.on_message("", &body);
-                            continue;
+    // Blocking control transports and bulk diallers must observe the same cancellation flag.
+    pub fn run_restore_with_cancellation<P, B, O>(
+        &mut self,
+        provider: &mut P,
+        bulk: &mut B,
+        observer: &mut O,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<RestoreSummary, RamrodError>
+    where
+        P: RestoreDataProvider + ?Sized,
+        B: BulkTransferService + ?Sized,
+        O: SessionObserver + ?Sized,
+    {
+        if !self.restore_started {
+            return Err(RamrodError::RestoreNotStarted);
+        }
+        let first_failure = Arc::new(AtomicUsize::new(usize::MAX));
+        let terminal_cleanup = Arc::new(AtomicBool::new(false));
+        let mut next_id = 0usize;
+        let mut summary = RestoreSummary::default();
+        let mut active: Vec<(usize, InFlightTransfer)> = Vec::new();
+        let mut failures = Vec::new();
+        let loop_result = (|| -> Result<(), RamrodError> {
+            loop {
+                let mut index = 0;
+                while index < active.len() {
+                    if active[index].1.0.is_finished() {
+                        let (id, (handle, request, port)) = active.remove(index);
+                        if let Err(error) = join_bulk_transfer(
+                            handle,
+                            &request,
+                            port,
+                            observer,
+                            &mut summary,
+                            false,
+                        ) {
+                            failures.push((id, error));
                         }
-                    };
+                    } else {
+                        index += 1;
+                    }
+                }
+                if first_failure.load(Ordering::Acquire) != usize::MAX {
+                    return Ok(());
+                }
 
-                    match message.msg_type {
-                        MsgType::DataRequestMsg | MsgType::AsyncDataRequestMsg => {
-                            let request = message.as_data_request().ok_or_else(|| {
-                                RamrodError::MalformedDataRequest {
-                                    msg_type: message.msg_type.wire_name().to_string(),
-                                }
-                            })?;
-                            if request.asynchronous {
-                                summary.async_data_requests += 1;
+                let Some(inbound) = self.receive()? else {
+                    return Ok(());
+                };
+                let message = match inbound {
+                    Inbound::Device(message) => message,
+                    Inbound::Untyped(body) => {
+                        summary.untyped_messages += 1;
+                        observer.on_message("", &body);
+                        continue;
+                    }
+                };
+
+                match message.msg_type {
+                    MsgType::DataRequestMsg | MsgType::AsyncDataRequestMsg => {
+                        let request = message.as_data_request().ok_or_else(|| {
+                            RamrodError::MalformedDataRequest {
+                                msg_type: message.msg_type.wire_name().to_string(),
                             }
-                            observer.on_data_request(&request);
-                            match request.data_port {
-                                Some(port) if request.asynchronous => {
-                                    if let Some((handle, prior_request, prior_port)) =
-                                        in_flight.take()
-                                    {
-                                        join_bulk_transfer(
-                                            handle,
-                                            &prior_request,
-                                            prior_port,
-                                            observer,
-                                            &mut summary,
-                                        )?;
-                                    }
+                        })?;
+                        if request.asynchronous {
+                            summary.async_data_requests += 1;
+                        }
+                        observer.on_data_request(&request);
+                        match request.data_port {
+                            Some(port) if request.asynchronous => {
+                                if super::updater_output::is_updater_output(&request.data_type) {
+                                    observer.on_bulk_receiving(&request, port);
+                                } else {
                                     observer.on_bulk_serving(&request, port);
-                                    let for_thread = request.clone();
-                                    let bulk = &bulk;
-                                    let handle = scope.spawn(move || {
-                                        let mut guard = bulk
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                        guard.serve(port, &for_thread)
-                                    });
-                                    in_flight = Some((handle, request, port));
                                 }
-                                _ => {
-                                    self.answer_data_request(
-                                        &request,
-                                        provider,
-                                        &bulk,
-                                        observer,
-                                        &mut summary,
-                                    )?;
-                                }
-                            }
-                        }
-                        MsgType::AsyncWait => {
-                            summary.async_waits += 1;
-                            observer.on_async_wait(message.async_context_uuid(), &message.body);
-                        }
-                        MsgType::ProgressMsg => {
-                            summary.progress_messages += 1;
-                            let progress =
-                                message.as_progress().unwrap_or(super::message::Progress {
-                                    operation: None,
-                                    fraction: None,
-                                });
-                            observer.on_progress(progress.operation, progress.fraction);
-                        }
-                        MsgType::StatusMsg => {
-                            summary.status_messages += 1;
-                            let status = message.as_status();
-                            if let Some(final_status) = message.as_final_status() {
-                                summary.final_status = Some(final_status);
-                                observer.on_final_status(&final_status, &message.body);
-                            }
-                            if let Some(log) = message.body.get(KEY_LOG).and_then(Value::as_string)
-                            {
-                                summary.guest_log = Some(log.to_string());
-                            }
-                            match status {
-                                Some(status) => {
-                                    summary.last_status = Some(status);
-                                    observer.on_status(status, &message.body);
-                                }
-                                None => {
-                                    observer.on_message(message.msg_type.wire_name(), &message.body)
-                                }
-                            }
-                            acknowledge_final_status(
-                                &mut self.transport,
-                                self.format,
-                                &mut summary,
-                                observer,
-                                status,
-                            )?;
-                        }
-                        MsgType::CheckpointMsg => {
-                            summary.checkpoints += 1;
-                            match message.as_checkpoint() {
-                                Some(checkpoint) => {
-                                    if checkpoint.ends_step() {
-                                        summary.checkpoints_ended += 1;
-                                    } else {
-                                        summary.checkpoints_begun += 1;
-                                        let name =
-                                            checkpoint.name.map(str::to_string).or_else(|| {
-                                                checkpoint.id.map(|id| format!("0x{id:04X}"))
-                                            });
-                                        if name
-                                            .as_deref()
-                                            .is_none_or(|name| !name.starts_with("cleanup_"))
-                                        {
-                                            summary.open_checkpoint = name;
-                                        }
-                                    }
-                                    observer.on_checkpoint(&checkpoint, &message.body);
-                                    if let Some(text) = message
-                                        .body
-                                        .get(KEY_CHECKPOINT_ERROR)
-                                        .and_then(checkpoint_error_text)
-                                    {
-                                        let endured =
-                                            checkpoint_result_is_endured(checkpoint.result);
-                                        if summary.checkpoint_error.is_none()
-                                            || (summary.checkpoint_error_endured && !endured)
-                                        {
-                                            summary.checkpoint_error = Some(text);
-                                            summary.checkpoint_error_endured = endured;
-                                        }
-                                    }
-                                    if summary.final_status_acks_sent == 0
-                                        && checkpoint_is_final_status_wait(&checkpoint)
-                                    {
-                                        let status = summary.last_status;
-                                        acknowledge_final_status(
-                                            &mut self.transport,
-                                            self.format,
-                                            &mut summary,
+                                let task = match bulk.prepare(port, &request) {
+                                    Ok(task) => task,
+                                    Err(error) => {
+                                        report_bulk_outcome(
+                                            Err(error),
+                                            &request,
+                                            port,
                                             observer,
-                                            status,
+                                            &mut summary,
                                         )?;
+                                        unreachable!(
+                                            "a failed preparation is reported as an error"
+                                        );
                                     }
-                                }
-                                None => {
-                                    observer.on_message(message.msg_type.wire_name(), &message.body)
-                                }
+                                };
+                                let id = next_id;
+                                next_id += 1;
+                                let worker_cancel = Arc::clone(&cancel);
+                                let worker_failure = Arc::clone(&first_failure);
+                                let worker_cleanup = Arc::clone(&terminal_cleanup);
+                                let handle = thread::Builder::new().spawn(move || {
+                                    let result = std::panic::catch_unwind(
+                                        std::panic::AssertUnwindSafe(task),
+                                    )
+                                    .unwrap_or_else(|payload| {
+                                        Err(ProviderError::Other(format!(
+                                            "bulk transfer worker panicked: {}",
+                                            panic_message(payload.as_ref())
+                                        )))
+                                    });
+                                    if let Err(error) = &result {
+                                        if !worker_cleanup.load(Ordering::Acquire)
+                                            || !transfer_cleanup_cancelled(error)
+                                        {
+                                            let _ = worker_failure.compare_exchange(
+                                                usize::MAX,
+                                                id,
+                                                Ordering::AcqRel,
+                                                Ordering::Acquire,
+                                            );
+                                        }
+                                        worker_cancel.store(true, Ordering::Release);
+                                    }
+                                    result
+                                });
+                                let handle = match handle {
+                                    Ok(handle) => handle,
+                                    Err(error) => {
+                                        report_bulk_outcome(
+                                            Err(ProviderError::Io(error)),
+                                            &request,
+                                            port,
+                                            observer,
+                                            &mut summary,
+                                        )?;
+                                        unreachable!(
+                                            "a worker startup failure is reported as an error"
+                                        );
+                                    }
+                                };
+                                active.push((id, (handle, request, port)));
+                            }
+                            _ => {
+                                self.answer_data_request(
+                                    &request,
+                                    provider,
+                                    bulk,
+                                    observer,
+                                    &mut summary,
+                                )?;
                             }
                         }
-                        MsgType::CrashLog => {
-                            summary.crash_logs += 1;
-                            let crash = message.as_crash_log().unwrap_or(message::CrashLog {
-                                filename: None,
-                                data: None,
-                            });
-                            let name = crash_log_file_name(crash.filename, summary.crash_logs);
-                            match write_crash_log(&self.crash_log_directory, &name, crash.data) {
-                                Ok(path) => {
-                                    summary.crash_logs_written += 1;
-                                    observer.on_crash_log(
-                                        crash.filename.unwrap_or(&name),
-                                        crash.data.map_or(0, <[u8]>::len),
-                                        Some(&path),
-                                        None,
-                                    );
-                                }
-                                Err(reason) => observer.on_crash_log(
-                                    crash.filename.unwrap_or(&name),
-                                    crash.data.map_or(0, <[u8]>::len),
-                                    None,
-                                    Some(&reason),
-                                ),
-                            }
-                        }
-                        MsgType::ReceivedFinalStatusMsg => {
-                            summary.guest_echoed_final_status = true;
-                            observer.on_message(message.msg_type.wire_name(), &message.body);
-                            return Ok(());
-                        }
-                        _ => observer.on_message(message.msg_type.wire_name(), &message.body),
                     }
-                }
-            })();
-
-            let join_result = match in_flight.take() {
-                Some((handle, request, port)) => {
-                    join_bulk_transfer(handle, &request, port, observer, &mut summary)
-                }
-                None => Ok(()),
-            };
-
-            match (loop_result, join_result) {
-                (Ok(()), Ok(())) => Ok(summary),
-                (Err(error), _) if connection_gone_ramrod(&error) => {
-                    if summary.final_status_acks_sent == 0 {
-                        let status = summary.last_status;
-                        let _ = acknowledge_final_status(
+                    MsgType::AsyncWait => {
+                        summary.async_waits += 1;
+                        observer.on_async_wait(message.async_context_uuid(), &message.body);
+                    }
+                    MsgType::ProgressMsg => {
+                        summary.progress_messages += 1;
+                        let progress = message.as_progress().unwrap_or(super::message::Progress {
+                            operation: None,
+                            fraction: None,
+                        });
+                        observer.on_progress(progress.operation, progress.fraction);
+                    }
+                    MsgType::StatusMsg => {
+                        summary.status_messages += 1;
+                        let status = message.as_status();
+                        if let Some(final_status) = message.as_final_status() {
+                            summary.final_status = Some(final_status);
+                            observer.on_final_status(&final_status, &message.body);
+                        }
+                        if let Some(log) = message.body.get(KEY_LOG).and_then(Value::as_string) {
+                            summary.guest_log = Some(log.to_string());
+                        }
+                        match status {
+                            Some(status) => {
+                                summary.last_status = Some(status);
+                                observer.on_status(status, &message.body);
+                            }
+                            None => {
+                                observer.on_message(message.msg_type.wire_name(), &message.body)
+                            }
+                        }
+                        acknowledge_final_status(
                             &mut self.transport,
                             self.format,
                             &mut summary,
                             observer,
                             status,
-                        );
+                        )?;
                     }
-                    Ok(summary)
+                    MsgType::CheckpointMsg => {
+                        summary.checkpoints += 1;
+                        match message.as_checkpoint() {
+                            Some(checkpoint) => {
+                                if checkpoint.ends_step() {
+                                    summary.checkpoints_ended += 1;
+                                } else {
+                                    summary.checkpoints_begun += 1;
+                                    let name = checkpoint
+                                        .name
+                                        .map(str::to_string)
+                                        .or_else(|| checkpoint.id.map(|id| format!("0x{id:04X}")));
+                                    if name
+                                        .as_deref()
+                                        .is_none_or(|name| !name.starts_with("cleanup_"))
+                                    {
+                                        summary.open_checkpoint = name;
+                                    }
+                                }
+                                observer.on_checkpoint(&checkpoint, &message.body);
+                                if let Some(text) = message
+                                    .body
+                                    .get(KEY_CHECKPOINT_ERROR)
+                                    .and_then(checkpoint_error_text)
+                                {
+                                    let endured = checkpoint_result_is_endured(checkpoint.result);
+                                    if summary.checkpoint_error.is_none()
+                                        || (summary.checkpoint_error_endured && !endured)
+                                        || (summary.checkpoint_error_endured
+                                            && checkpoint.ends_step()
+                                            && checkpoint
+                                                .name
+                                                .is_some_and(|name| !name.starts_with("cleanup_"))
+                                            && summary.checkpoint_error.as_deref()
+                                                != Some(text.as_str()))
+                                    {
+                                        summary.checkpoint_error = Some(text);
+                                        summary.checkpoint_error_endured = endured;
+                                    }
+                                }
+                                if summary.final_status_acks_sent == 0
+                                    && checkpoint_is_final_status_wait(&checkpoint)
+                                {
+                                    let status = summary.last_status;
+                                    acknowledge_final_status(
+                                        &mut self.transport,
+                                        self.format,
+                                        &mut summary,
+                                        observer,
+                                        status,
+                                    )?;
+                                }
+                            }
+                            None => {
+                                observer.on_message(message.msg_type.wire_name(), &message.body)
+                            }
+                        }
+                    }
+                    MsgType::CrashLog => {
+                        summary.crash_logs += 1;
+                        let crash = message.as_crash_log().unwrap_or(message::CrashLog {
+                            filename: None,
+                            data: None,
+                        });
+                        let name = crash_log_file_name(crash.filename, summary.crash_logs);
+                        match write_crash_log(&self.crash_log_directory, &name, crash.data) {
+                            Ok(path) => {
+                                summary.crash_logs_written += 1;
+                                observer.on_crash_log(
+                                    crash.filename.unwrap_or(&name),
+                                    crash.data.map_or(0, <[u8]>::len),
+                                    Some(&path),
+                                    None,
+                                );
+                            }
+                            Err(reason) => observer.on_crash_log(
+                                crash.filename.unwrap_or(&name),
+                                crash.data.map_or(0, <[u8]>::len),
+                                None,
+                                Some(&reason),
+                            ),
+                        }
+                    }
+                    MsgType::ReceivedFinalStatusMsg => {
+                        summary.guest_echoed_final_status = true;
+                        observer.on_message(message.msg_type.wire_name(), &message.body);
+                        return Ok(());
+                    }
+                    _ => observer.on_message(message.msg_type.wire_name(), &message.body),
                 }
-                (Err(error), _) => Err(error),
-                (Ok(()), Err(error)) => Err(error),
             }
-        })
+        })();
+
+        let failed_worker = first_failure.load(Ordering::Acquire);
+        let fatal_control = loop_result
+            .as_ref()
+            .err()
+            .is_some_and(|error| !connection_gone_ramrod(error));
+        let cleanup = !fatal_control && failed_worker == usize::MAX;
+        terminal_cleanup.store(cleanup, Ordering::Release);
+        cancel.store(true, Ordering::Release);
+        for (id, (handle, request, port)) in active {
+            if let Err(error) =
+                join_bulk_transfer(handle, &request, port, observer, &mut summary, cleanup)
+            {
+                failures.push((id, error));
+                cancel.store(true, Ordering::Release);
+            }
+        }
+        let root_worker = if failed_worker != usize::MAX {
+            failed_worker
+        } else if !fatal_control {
+            first_failure.load(Ordering::Acquire)
+        } else {
+            usize::MAX
+        };
+        if let Some(index) = failures.iter().position(|(id, _)| *id == root_worker) {
+            return Err(failures.remove(index).1);
+        }
+        match loop_result {
+            Err(error) if !connection_gone_ramrod(&error) => Err(error),
+            _ if !failures.is_empty() => Err(failures.remove(0).1),
+            Err(_) => {
+                if summary.final_status_acks_sent == 0 {
+                    let status = summary.last_status;
+                    let _ = acknowledge_final_status(
+                        &mut self.transport,
+                        self.format,
+                        &mut summary,
+                        observer,
+                        status,
+                    );
+                }
+                Ok(summary)
+            }
+            Ok(()) => Ok(summary),
+        }
     }
 
     fn answer_data_request<P, B, O>(
         &mut self,
         request: &DataRequest,
         provider: &mut P,
-        bulk: &Mutex<&mut B>,
+        bulk: &mut B,
         observer: &mut O,
         summary: &mut RestoreSummary,
     ) -> Result<(), RamrodError>
@@ -616,13 +760,12 @@ impl<T: Read + Write> RamrodClient<T> {
     {
         match request.data_port {
             Some(port) => {
-                observer.on_bulk_serving(request, port);
-                let result = {
-                    let mut guard = bulk
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    guard.serve(port, request)
-                };
+                if super::updater_output::is_updater_output(&request.data_type) {
+                    observer.on_bulk_receiving(request, port);
+                } else {
+                    observer.on_bulk_serving(request, port);
+                }
+                let result = bulk.serve(port, request);
                 report_bulk_outcome(result, request, port, observer, summary)?;
             }
             None => {
@@ -868,6 +1011,7 @@ fn connection_gone(error: &CodecError) -> bool {
             error.kind(),
             std::io::ErrorKind::BrokenPipe
                 | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::NotConnected
                 | std::io::ErrorKind::UnexpectedEof
         ),
         CodecError::Truncated { .. } => true,
@@ -882,7 +1026,6 @@ fn connection_gone_ramrod(error: &RamrodError) -> bool {
     }
 }
 
-// Negative checkpoint result = CHECKPOINT ENDURED; positive ends the restore.
 fn checkpoint_result_is_endured(result: Option<i64>) -> bool {
     matches!(result, Some(result) if result < 0)
 }
@@ -999,7 +1142,7 @@ mod tests {
         KEY_SUCCESSFUL, KEY_SUPPORTED_HOST_PROTOCOLS, KEY_WILL_SEND_EOF, PROTOCOL_MUX_SOCKET,
         RESULT_SUCCESS, SERVICE_TYPE, SystemImageFormat,
     };
-    use crate::ramrod::provider::{NoBulkTransfers, PreparedAnswers};
+    use crate::ramrod::provider::{BulkTransferTask, NoBulkTransfers, PreparedAnswers};
     use plist::Integer;
     use std::io;
     use std::time::{Duration, Instant};
@@ -1094,29 +1237,31 @@ mod tests {
         }
     }
 
-    struct BrokenPipeAfterMessages {
+    struct DisconnectAfterMessages {
         inner: ScriptedTransport,
+        kind: io::ErrorKind,
     }
 
-    impl BrokenPipeAfterMessages {
-        fn new(messages: &[Value]) -> Self {
+    impl DisconnectAfterMessages {
+        fn new(messages: &[Value], kind: io::ErrorKind) -> Self {
             Self {
                 inner: ScriptedTransport::new(messages),
+                kind,
             }
         }
     }
 
-    impl Read for BrokenPipeAfterMessages {
+    impl Read for DisconnectAfterMessages {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             let count = self.inner.read(buf)?;
             if count == 0 {
-                return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+                return Err(io::Error::from(self.kind));
             }
             Ok(count)
         }
     }
 
-    impl Write for BrokenPipeAfterMessages {
+    impl Write for DisconnectAfterMessages {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.inner.write(buf)
         }
@@ -1213,6 +1358,7 @@ mod tests {
         fn on_bulk_served(&mut self, request: &DataRequest, port: u16, outcome: &BulkOutcome) {
             let bytes = match outcome {
                 BulkOutcome::Served { bytes, .. } => *bytes,
+                BulkOutcome::Received { bytes, .. } => *bytes,
                 BulkOutcome::Declined { .. } => 0,
             };
             self.events.push(format!(
@@ -1245,21 +1391,23 @@ mod tests {
     }
 
     impl BulkTransferService for RecordingBulk {
-        fn serve(
+        fn prepare(
             &mut self,
             port: u16,
             request: &DataRequest,
-        ) -> Result<BulkOutcome, ProviderError> {
+        ) -> Result<BulkTransferTask, ProviderError> {
             self.served
                 .push((port, request.data_type.wire_name().to_string()));
-            Ok(BulkOutcome::Served {
-                bytes: 4096,
-                blocks: 4,
-                initiates: 1,
-                metadata_requests: 0,
-                oob_requests: 0,
-                oob_bytes: 0,
-            })
+            Ok(Box::new(|| {
+                Ok(BulkOutcome::Served {
+                    bytes: 4096,
+                    blocks: 4,
+                    initiates: 1,
+                    metadata_requests: 0,
+                    oob_requests: 0,
+                    oob_bytes: 0,
+                })
+            }))
         }
     }
 
@@ -1269,16 +1417,15 @@ mod tests {
     }
 
     impl BulkTransferService for DecliningBulk {
-        fn serve(
+        fn prepare(
             &mut self,
             port: u16,
             request: &DataRequest,
-        ) -> Result<BulkOutcome, ProviderError> {
+        ) -> Result<BulkTransferTask, ProviderError> {
             self.declined
                 .push((port, request.data_type.wire_name().to_string()));
-            Ok(BulkOutcome::Declined {
-                reason: format!("no image is configured for {}", request.data_type),
-            })
+            let reason = format!("no image is configured for {}", request.data_type);
+            Ok(Box::new(move || Ok(BulkOutcome::Declined { reason })))
         }
     }
 
@@ -1678,6 +1825,145 @@ mod tests {
     }
 
     #[test]
+    fn updater_output_reception_releases_the_guest_and_control_progress_continues() {
+        use crate::ramrod::dial::ShutdownWrite;
+        use crate::ramrod::{CpioEntry, CpioWriter, UpdaterOutputRouter, UpdaterOutputTransfer};
+
+        struct GuestOutput {
+            inbound: io::Cursor<Vec<u8>>,
+            released: Arc<AtomicBool>,
+        }
+
+        impl Read for GuestOutput {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.inbound.read(buffer)
+            }
+        }
+
+        impl Write for GuestOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl ShutdownWrite for GuestOutput {
+            fn shutdown_write(&mut self) -> io::Result<()> {
+                self.released.store(true, Ordering::Release);
+                Ok(())
+            }
+        }
+
+        #[derive(Clone)]
+        struct OutputDialer {
+            archive: Vec<u8>,
+            released: Arc<AtomicBool>,
+        }
+
+        impl GuestDialer for OutputDialer {
+            type Stream = GuestOutput;
+            fn dial(&mut self, port: u16, _timeout: Duration) -> io::Result<Self::Stream> {
+                assert_eq!(port, 9420);
+                Ok(GuestOutput {
+                    inbound: io::Cursor::new(self.archive.clone()),
+                    released: Arc::clone(&self.released),
+                })
+            }
+        }
+
+        struct ReceiveObserver {
+            released: Arc<AtomicBool>,
+            events: Vec<&'static str>,
+            bytes: u64,
+            path: Option<PathBuf>,
+        }
+
+        impl SessionObserver for ReceiveObserver {
+            fn on_bulk_receiving(&mut self, request: &DataRequest, port: u16) {
+                assert_eq!(request.data_type.wire_name(), "BasebandUpdaterOutputData");
+                assert_eq!(port, 9420);
+                self.events.push("receiving");
+            }
+            fn on_bulk_received(
+                &mut self,
+                _request: &DataRequest,
+                port: u16,
+                bytes: u64,
+                path: &Path,
+            ) {
+                assert_eq!(port, 9420);
+                assert!(self.released.load(Ordering::Acquire));
+                self.events.push("received");
+                self.bytes = bytes;
+                self.path = Some(path.to_path_buf());
+            }
+            fn on_progress(&mut self, operation: Option<i64>, _fraction: Option<f64>) {
+                assert!(self.released.load(Ordering::Acquire));
+                assert_eq!(operation, Some(28));
+                self.events.push("progress");
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut writer = CpioWriter::new(Vec::new());
+        writer
+            .write_entry(&CpioEntry::regular_file(
+                "updater.log",
+                b"updater output".to_vec(),
+                0o644,
+                0,
+                0,
+                1,
+            ))
+            .unwrap();
+        writer.finish().unwrap();
+        let archive = writer.into_inner();
+        let released = Arc::new(AtomicBool::new(false));
+        let mut client = RamrodClient::new(ScriptedTransport::new(&[
+            data_request("BasebandUpdaterOutputData", Some(9420)),
+            dict(vec![
+                (KEY_MSG_TYPE, Value::String("ProgressMsg".into())),
+                (KEY_OPERATION, Value::Integer(Integer::from(28))),
+            ]),
+            data_request("RootTicket", None),
+            successful_final_status(),
+        ]))
+        .with_crash_log_directory(directory.path().to_path_buf());
+        let receiver = UpdaterOutputTransfer::new(
+            OutputDialer {
+                archive: archive.clone(),
+                released: Arc::clone(&released),
+            },
+            client.crash_log_directory().to_path_buf(),
+        );
+        let mut bulk = UpdaterOutputRouter::new(receiver, NoBulkTransfers);
+        let mut answers =
+            PreparedAnswers::new().with_ticket(DataType::RootTicket, b"ticket".to_vec());
+        let mut observer = ReceiveObserver {
+            released,
+            events: Vec::new(),
+            bytes: 0,
+            path: None,
+        };
+        client.start_restore(RestoreOptions::new()).unwrap();
+        let summary = client
+            .run_restore(&mut answers, &mut bulk, &mut observer)
+            .unwrap();
+        assert_eq!(summary.bulk_received, 1);
+        assert_eq!(summary.bulk_received_bytes, archive.len() as u64);
+        assert_eq!(summary.data_requests, 1);
+        assert_eq!(summary.progress_messages, 1);
+        assert!(summary.final_status_acknowledged());
+        assert_eq!(observer.events, vec!["receiving", "received", "progress"]);
+        assert_eq!(observer.bytes, archive.len() as u64);
+        let path = directory.path().join("baseband-updater-output-1.cpio");
+        assert_eq!(observer.path, Some(path.clone()));
+        assert_eq!(std::fs::read(path).unwrap(), archive);
+    }
+
+    #[test]
     fn a_data_request_carrying_a_port_is_served_by_dialling_and_gets_no_plist_reply() {
         let mut client = RamrodClient::new(ScriptedTransport::new(&[
             data_request("RecoveryOSASRImage", Some(12345)),
@@ -1754,26 +2040,29 @@ mod tests {
         use std::time::Duration;
 
         struct BlockingBulk {
-            release: mpsc::Receiver<()>,
+            release: Option<mpsc::Receiver<()>>,
         }
 
         impl BulkTransferService for BlockingBulk {
-            fn serve(
+            fn prepare(
                 &mut self,
                 _port: u16,
                 _request: &DataRequest,
-            ) -> Result<BulkOutcome, ProviderError> {
-                self.release
-                    .recv()
-                    .expect("the test always releases this, whether or not its assertion holds");
-                Ok(BulkOutcome::Served {
-                    bytes: 4096,
-                    blocks: 1,
-                    initiates: 1,
-                    metadata_requests: 0,
-                    oob_requests: 0,
-                    oob_bytes: 0,
-                })
+            ) -> Result<BulkTransferTask, ProviderError> {
+                let release = self.release.take().expect("one image request");
+                Ok(Box::new(move || {
+                    release.recv().expect(
+                        "the test always releases this, whether or not its assertion holds",
+                    );
+                    Ok(BulkOutcome::Served {
+                        bytes: 4096,
+                        blocks: 1,
+                        initiates: 1,
+                        metadata_requests: 0,
+                        oob_requests: 0,
+                        oob_bytes: 0,
+                    })
+                }))
             }
         }
 
@@ -1798,7 +2087,7 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let (answered_tx, answered_rx) = mpsc::channel();
         let mut bulk = BlockingBulk {
-            release: release_rx,
+            release: Some(release_rx),
         };
         let mut answers =
             PreparedAnswers::new().with_ticket(DataType::RecoveryOSRootTicketData, ticket.clone());
@@ -1820,7 +2109,7 @@ mod tests {
         assert!(
             answered_in_time,
             "the control-connection request must be answered while the asynchronous bulk \
-             transfer is still blocked in serve(), or the host stops reading the control \
+             transfer is still blocked in its prepared task, or the host stops reading the control \
              connection for the whole duration of the transfer"
         );
         let summary = result.unwrap();
@@ -2256,10 +2545,10 @@ mod tests {
 
     #[test]
     fn a_broken_pipe_after_restore_starts_still_acks_and_keeps_the_failed_step() {
-        let mut client = RamrodClient::new(BrokenPipeAfterMessages::new(&[checkpoint_begin(
-            "verify_storage_for_update",
-            0x067E,
-        )]));
+        let mut client = RamrodClient::new(DisconnectAfterMessages::new(
+            &[checkpoint_begin("verify_storage_for_update", 0x067E)],
+            io::ErrorKind::BrokenPipe,
+        ));
         client.start_restore(RestoreOptions::new()).unwrap();
         let mut recorder = Recorder::default();
         let summary = client
@@ -2375,6 +2664,47 @@ mod tests {
         "003fcRx0088Rx00000000000000000000000000000000000000000000)";
 
     const TERMINAL_RESTORE_ERROR: &str = "[0]D(failed to persist original boot objects)";
+
+    #[test]
+    fn disconnected_restore_reports_the_later_protected_volume_failure() {
+        let protected_volume_error = "[0]D(Creating protected volumes failed.)";
+        let messages = vec![
+            checkpoint_begin("update_usbcretimer", 0x1318),
+            checkpoint_failed(
+                "update_usbcretimer",
+                0x1318,
+                -1,
+                "[0]D(failed to execute queryInfo on Type-C retimer updater)",
+            ),
+            checkpoint_begin("create_protected_filesystems", 0x0674),
+            checkpoint_failed(
+                "create_protected_filesystems",
+                0x0674,
+                -1,
+                protected_volume_error,
+            ),
+            checkpoint_failed(
+                "perform_restore_installing",
+                0x067B,
+                -1,
+                protected_volume_error,
+            ),
+            checkpoint_begin("cleanup_wait_status_received", 0x0649),
+        ];
+        let mut client = RamrodClient::new(DisconnectAfterMessages::new(
+            &messages,
+            io::ErrorKind::NotConnected,
+        ));
+        client.start_restore(RestoreOptions::new()).unwrap();
+        let summary = client
+            .run_restore(&mut PreparedAnswers::new(), &mut NoBulkTransfers, &mut ())
+            .expect("a disconnected control socket preserves the guest checkpoint result");
+        assert_eq!(
+            summary.checkpoint_error.as_deref(),
+            Some(protected_volume_error)
+        );
+        assert_eq!(summary.final_status_acks_sent, 1);
+    }
 
     #[test]
     fn a_failing_checkpoint_error_replaces_the_one_the_guest_endured() {
@@ -2572,9 +2902,12 @@ mod tests {
             RestoreSummary {
                 data_requests: 4,
                 bulk_transfers: 0,
+                bulk_received: 0,
+                bulk_received_bytes: 0,
                 async_data_requests: 0,
                 async_waits: 0,
                 bulk_declined: 0,
+                bulk_cancelled: 0,
                 bulk_empty: 0,
                 progress_messages: 2,
                 status_messages: 1,
@@ -2965,21 +3298,23 @@ mod tests {
     }
 
     impl BulkTransferService for EmptyBulk {
-        fn serve(
+        fn prepare(
             &mut self,
             port: u16,
             request: &DataRequest,
-        ) -> Result<BulkOutcome, ProviderError> {
+        ) -> Result<BulkTransferTask, ProviderError> {
             self.served
                 .push((port, request.data_type.wire_name().to_string()));
-            Ok(BulkOutcome::Served {
-                bytes: 0,
-                blocks: 0,
-                initiates: 1,
-                metadata_requests: 1,
-                oob_requests: 0,
-                oob_bytes: 0,
-            })
+            Ok(Box::new(|| {
+                Ok(BulkOutcome::Served {
+                    bytes: 0,
+                    blocks: 0,
+                    initiates: 1,
+                    metadata_requests: 1,
+                    oob_requests: 0,
+                    oob_bytes: 0,
+                })
+            }))
         }
     }
 
@@ -3071,5 +3406,440 @@ mod tests {
         );
         assert_eq!(seen.argument_string("Variant"), Some("Customer"));
         assert!(!seen.is_bulk_transfer());
+    }
+    struct CancellationControl {
+        script: ScriptedTransport,
+        cancel: Arc<AtomicBool>,
+        read_waiting: Option<std::sync::mpsc::Sender<()>>,
+        cancellation_observed: Arc<AtomicBool>,
+    }
+
+    impl Read for CancellationControl {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            if self.script.cursor < self.script.inbound.len() {
+                return self.script.read(bytes);
+            }
+            if let Some(waiting) = self.read_waiting.take() {
+                waiting.send(()).unwrap();
+            }
+            let began = Instant::now();
+            while !self.cancel.load(Ordering::Acquire) {
+                if began.elapsed() >= Duration::from_secs(5) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "test control cancellation did not arrive",
+                    ));
+                }
+                std::thread::yield_now();
+            }
+            self.cancellation_observed.store(true, Ordering::Release);
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                super::super::dial::DialCancellation::TransferFailed,
+            ))
+        }
+    }
+
+    impl Write for CancellationControl {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.script.write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.script.flush()
+        }
+    }
+
+    struct CompletedTransfer(Arc<AtomicUsize>);
+    impl Drop for CompletedTransfer {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    struct CancellationBulk {
+        cancel: Arc<AtomicBool>,
+        finished: Arc<AtomicUsize>,
+        control_waiting: Option<std::sync::mpsc::Receiver<()>>,
+        panic_worker: bool,
+    }
+    impl BulkTransferService for CancellationBulk {
+        fn prepare(
+            &mut self,
+            port: u16,
+            _request: &DataRequest,
+        ) -> Result<BulkTransferTask, ProviderError> {
+            let cancel = Arc::clone(&self.cancel);
+            let finished = Arc::clone(&self.finished);
+            if port == 9411 {
+                let waiting = self.control_waiting.take().unwrap();
+                let panic_worker = self.panic_worker;
+                Ok(Box::new(move || {
+                    let _completed = CompletedTransfer(finished);
+                    waiting
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("control read reached its wait");
+                    if panic_worker {
+                        panic!("guest key worker panic");
+                    }
+                    Err(ProviderError::Other("guest key HTTP returned 503".into()))
+                }))
+            } else {
+                Ok(Box::new(move || {
+                    let _completed = CompletedTransfer(finished);
+                    let began = Instant::now();
+                    while !cancel.load(Ordering::Acquire) {
+                        if began.elapsed() >= Duration::from_secs(5) {
+                            return Err(ProviderError::Other(format!(
+                                "test transfer on port {port} did not receive cancellation"
+                            )));
+                        }
+                        std::thread::yield_now();
+                    }
+                    Err(ProviderError::Io(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        super::super::dial::DialCancellation::TransferFailed,
+                    )))
+                }))
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FailureObserver {
+        failures: Vec<(u16, String)>,
+    }
+    impl SessionObserver for FailureObserver {
+        fn on_data_unanswered(&mut self, request: &DataRequest, _error: &ProviderError) {
+            self.failures.push((
+                request.data_port.unwrap(),
+                request.data_type.wire_name().into(),
+            ));
+        }
+    }
+
+    fn failed_worker_run(panic_worker: bool) -> (RamrodError, FailureObserver) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let mut client = RamrodClient::new(CancellationControl {
+            script: ScriptedTransport::new(&[
+                async_data_request("RecoveryOSASRImage", Some(9410)),
+                async_data_request("StreamedImageDecryptionKey", Some(9411)),
+                async_data_request("SystemImageData", Some(9412)),
+            ]),
+            cancel: Arc::clone(&cancel),
+            read_waiting: Some(waiting_tx),
+            cancellation_observed: Arc::clone(&observed),
+        });
+        client.start_restore(RestoreOptions::new()).unwrap();
+        let mut bulk = CancellationBulk {
+            cancel: Arc::clone(&cancel),
+            finished: Arc::clone(&finished),
+            control_waiting: Some(waiting_rx),
+            panic_worker,
+        };
+        let mut observer = FailureObserver::default();
+        let error = client
+            .run_restore_with_cancellation(
+                &mut PreparedAnswers::new(),
+                &mut bulk,
+                &mut observer,
+                Arc::clone(&cancel),
+            )
+            .unwrap_err();
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(observed.load(Ordering::Acquire));
+        assert_eq!(finished.load(Ordering::Acquire), 3);
+        observer.failures.sort();
+        assert_eq!(
+            observer.failures,
+            vec![
+                (9410, "RecoveryOSASRImage".into()),
+                (9411, "StreamedImageDecryptionKey".into()),
+                (9412, "SystemImageData".into())
+            ]
+        );
+        (error, observer)
+    }
+
+    #[test]
+    fn a_worker_failure_wakes_control_and_joins_every_transfer_with_root_attribution() {
+        let (error, _) = failed_worker_run(false);
+        match error {
+            RamrodError::Provider { data_type, source } => {
+                assert_eq!(data_type, "StreamedImageDecryptionKey");
+                assert_eq!(source.to_string(), "guest key HTTP returned 503");
+            }
+            other => panic!("expected the attributed HTTP failure, got {other}"),
+        }
+    }
+
+    #[test]
+    fn panic_strings_retain_their_actual_message() {
+        let borrowed = std::panic::catch_unwind(|| panic!("guest key worker panic")).unwrap_err();
+        assert_eq!(
+            super::panic_message(borrowed.as_ref()),
+            "guest key worker panic"
+        );
+        let owned = std::panic::catch_unwind(|| {
+            std::panic::panic_any(String::from("guest image worker panic"))
+        })
+        .unwrap_err();
+        assert_eq!(
+            super::panic_message(owned.as_ref()),
+            "guest image worker panic"
+        );
+    }
+
+    #[test]
+    fn a_worker_panic_wakes_control_and_preserves_its_request_and_reason() {
+        let (error, _) = failed_worker_run(true);
+        match error {
+            RamrodError::Provider { data_type, source } => {
+                assert_eq!(data_type, "StreamedImageDecryptionKey");
+                assert_eq!(
+                    source.to_string(),
+                    "bulk transfer worker panicked: guest key worker panic"
+                );
+            }
+            other => panic!("expected the attributed worker panic, got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_fatal_control_error_cancels_and_joins_all_owned_transfers() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let malformed = dict(vec![(KEY_MSG_TYPE, Value::String("DataRequestMsg".into()))]);
+        let mut client = RamrodClient::new(ScriptedTransport::new(&[
+            async_data_request("RecoveryOSASRImage", Some(9410)),
+            async_data_request("SystemImageData", Some(9412)),
+            malformed,
+        ]));
+        client.start_restore(RestoreOptions::new()).unwrap();
+        let mut bulk = CancellationBulk {
+            cancel: Arc::clone(&cancel),
+            finished: Arc::clone(&finished),
+            control_waiting: None,
+            panic_worker: false,
+        };
+        let mut observer = FailureObserver::default();
+        let error = client
+            .run_restore_with_cancellation(
+                &mut PreparedAnswers::new(),
+                &mut bulk,
+                &mut observer,
+                Arc::clone(&cancel),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, RamrodError::MalformedDataRequest { ref msg_type } if msg_type == "DataRequestMsg")
+        );
+        assert!(cancel.load(Ordering::Acquire));
+        assert_eq!(finished.load(Ordering::Acquire), 2);
+        observer.failures.sort();
+        assert_eq!(
+            observer.failures,
+            vec![
+                (9410, "RecoveryOSASRImage".into()),
+                (9412, "SystemImageData".into())
+            ]
+        );
+    }
+
+    struct TerminalControl {
+        script: ScriptedTransport,
+        terminal_at: usize,
+        started: Option<std::sync::mpsc::Receiver<()>>,
+        reset: bool,
+    }
+    impl Read for TerminalControl {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            if self.script.cursor == self.terminal_at
+                && let Some(started) = self.started.take()
+            {
+                for _ in 0..2 {
+                    started
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("both transfer tasks reached their waits");
+                }
+            }
+            if self.reset && self.script.cursor == self.script.inbound.len() {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "guest ended the control connection",
+                ))
+            } else {
+                self.script.read(bytes)
+            }
+        }
+    }
+    impl Write for TerminalControl {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.script.write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.script.flush()
+        }
+    }
+
+    struct TerminalBulk {
+        cancel: Arc<AtomicBool>,
+        started: std::sync::mpsc::Sender<()>,
+        finished: Arc<AtomicUsize>,
+        late_failure: bool,
+    }
+    impl BulkTransferService for TerminalBulk {
+        fn prepare(
+            &mut self,
+            port: u16,
+            _request: &DataRequest,
+        ) -> Result<BulkTransferTask, ProviderError> {
+            let cancel = Arc::clone(&self.cancel);
+            let started = self.started.clone();
+            let finished = Arc::clone(&self.finished);
+            let late_failure = self.late_failure && port == 9421;
+            Ok(Box::new(move || {
+                let _finished = CompletedTransfer(finished);
+                started.send(()).unwrap();
+                let began = Instant::now();
+                while !cancel.load(Ordering::Acquire) {
+                    if began.elapsed() >= Duration::from_secs(5) {
+                        return Err(ProviderError::Other(format!(
+                            "transfer {port} waited past the terminal control event"
+                        )));
+                    }
+                    std::thread::yield_now();
+                }
+                if late_failure {
+                    Err(ProviderError::Other(
+                        "guest key response was corrupt".into(),
+                    ))
+                } else {
+                    Err(ProviderError::Io(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        super::super::dial::DialCancellation::TransferFailed,
+                    )))
+                }
+            }))
+        }
+    }
+
+    #[derive(Default)]
+    struct CleanupObserver {
+        cancelled: Vec<(u16, String)>,
+    }
+    impl SessionObserver for CleanupObserver {
+        fn on_bulk_cancelled(&mut self, request: &DataRequest, port: u16, reason: &str) {
+            assert!(reason.contains("cancelled during cleanup"));
+            self.cancelled
+                .push((port, request.data_type.wire_name().into()));
+        }
+    }
+
+    fn terminal_worker_run(
+        final_message: bool,
+        reset: bool,
+        late_failure: bool,
+    ) -> (Result<RestoreSummary, RamrodError>, CleanupObserver) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let mut messages = vec![
+            async_data_request("RecoveryOSASRImage", Some(9420)),
+            async_data_request("StreamedImageDecryptionKey", Some(9421)),
+        ];
+        let terminal_at = ScriptedTransport::new(&messages).inbound.len();
+        if final_message {
+            messages.push(dict(vec![
+                (KEY_MSG_TYPE, Value::String("StatusMsg".into())),
+                (KEY_STATUS, Value::Integer(0.into())),
+            ]));
+            messages.push(final_status());
+        }
+        let mut client = RamrodClient::new(TerminalControl {
+            script: ScriptedTransport::new(&messages),
+            terminal_at,
+            started: Some(started_rx),
+            reset,
+        });
+        client.start_restore(RestoreOptions::new()).unwrap();
+        let mut bulk = TerminalBulk {
+            cancel: Arc::clone(&cancel),
+            started: started_tx,
+            finished: Arc::clone(&finished),
+            late_failure,
+        };
+        let mut observer = CleanupObserver::default();
+        let result = client.run_restore_with_cancellation(
+            &mut PreparedAnswers::new(),
+            &mut bulk,
+            &mut observer,
+            Arc::clone(&cancel),
+        );
+        assert!(cancel.load(Ordering::Acquire));
+        assert_eq!(finished.load(Ordering::Acquire), 2);
+        observer.cancelled.sort();
+        (result, observer)
+    }
+
+    #[test]
+    fn a_successful_final_status_cancels_and_drains_waiting_transfers() {
+        let (result, observer) = terminal_worker_run(true, false, false);
+        let summary = result.unwrap();
+        assert_eq!(summary.last_status, Some(0));
+        assert!(summary.guest_echoed_final_status);
+        assert_eq!(summary.final_status_acks_sent, 1);
+        assert_eq!(summary.bulk_cancelled, 2);
+        assert_eq!(
+            observer.cancelled,
+            vec![
+                (9420, "RecoveryOSASRImage".into()),
+                (9421, "StreamedImageDecryptionKey".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn control_eof_cancels_and_drains_waiting_transfers() {
+        let (result, observer) = terminal_worker_run(false, false, false);
+        assert_eq!(result.unwrap().bulk_cancelled, 2);
+        assert_eq!(
+            observer.cancelled,
+            vec![
+                (9420, "RecoveryOSASRImage".into()),
+                (9421, "StreamedImageDecryptionKey".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn control_reset_cancels_and_drains_waiting_transfers() {
+        let (result, observer) = terminal_worker_run(false, true, false);
+        assert_eq!(result.unwrap().bulk_cancelled, 2);
+        assert_eq!(
+            observer.cancelled,
+            vec![
+                (9420, "RecoveryOSASRImage".into()),
+                (9421, "StreamedImageDecryptionKey".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_genuine_late_worker_failure_keeps_its_attribution_during_terminal_cleanup() {
+        let (result, observer) = terminal_worker_run(true, false, true);
+        match result.unwrap_err() {
+            RamrodError::Provider { data_type, source } => {
+                assert_eq!(data_type, "StreamedImageDecryptionKey");
+                assert_eq!(source.to_string(), "guest key response was corrupt");
+            }
+            error => panic!("expected the attributed worker error, got {error}"),
+        }
+        assert_eq!(
+            observer.cancelled,
+            vec![(9420, "RecoveryOSASRImage".into())]
+        );
     }
 }

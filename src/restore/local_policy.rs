@@ -1116,6 +1116,12 @@ pub trait SigningTransport: Send + Sync {
     fn post(&self, url: &str, content_type: &str, body: &[u8]) -> Result<Vec<u8>, String>;
 }
 
+pub trait FirmwareUpdaterSigner: Send + Sync {
+    fn source(&self) -> &'static str;
+
+    fn personalize(&self, request: &plist::Dictionary) -> Result<plist::Dictionary, String>;
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct CurlSigningTransport {
     pub connect_timeout_secs: u32,
@@ -1210,14 +1216,8 @@ impl<T: SigningTransport> SigningServerSigner<T> {
         let base = self.base_url.trim_end_matches('/');
         format!("{base}/{SIGNING_SERVER_REQUEST_PATH}")
     }
-}
 
-impl<T: SigningTransport> RecoveryOsLocalPolicySigner for SigningServerSigner<T> {
-    fn source(&self) -> &'static str {
-        self.transport.name()
-    }
-
-    fn personalize(&self, request: &plist::Dictionary) -> Result<plist::Dictionary, String> {
+    fn submit(&self, request: &plist::Dictionary) -> Result<plist::Dictionary, String> {
         let mut body = request.clone();
         body.insert(
             KEY_HOST_PLATFORM_INFO.to_string(),
@@ -1227,7 +1227,6 @@ impl<T: SigningTransport> RecoveryOsLocalPolicySigner for SigningServerSigner<T>
             KEY_VERSION_INFO.to_string(),
             plist::Value::String(self.envelope.version_info.clone()),
         );
-        body.insert(KEY_BB_TICKET.to_string(), plist::Value::Boolean(true));
         if let Some(uuid) = &self.envelope.uuid {
             body.insert(KEY_UUID.to_string(), plist::Value::String(uuid.clone()));
         }
@@ -1239,12 +1238,45 @@ impl<T: SigningTransport> RecoveryOsLocalPolicySigner for SigningServerSigner<T>
     }
 }
 
+impl<T: SigningTransport> FirmwareUpdaterSigner for SigningServerSigner<T> {
+    fn source(&self) -> &'static str {
+        self.transport.name()
+    }
+
+    fn personalize(&self, request: &plist::Dictionary) -> Result<plist::Dictionary, String> {
+        self.submit(request)
+    }
+}
+
+impl<T: SigningTransport> RecoveryOsLocalPolicySigner for SigningServerSigner<T> {
+    fn source(&self) -> &'static str {
+        self.transport.name()
+    }
+
+    fn personalize(&self, request: &plist::Dictionary) -> Result<plist::Dictionary, String> {
+        let mut body = request.clone();
+        body.insert(KEY_BB_TICKET.to_string(), plist::Value::Boolean(true));
+        self.submit(&body)
+    }
+}
+
 pub const SIGNING_ENVELOPE_VERSION_INFO: &str =
     concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"));
 
 pub fn signing_server_signer(
     session_uuid: Option<String>,
 ) -> Result<std::sync::Arc<dyn RecoveryOsLocalPolicySigner>, String> {
+    let envelope = SigningEnvelope::for_this_host(SIGNING_ENVELOPE_VERSION_INFO, session_uuid)?;
+    Ok(std::sync::Arc::new(SigningServerSigner::new(
+        CurlSigningTransport::default(),
+        SIGNING_SERVER_DEFAULT_BASE_URL.to_string(),
+        envelope,
+    )))
+}
+
+pub fn firmware_updater_signer(
+    session_uuid: Option<String>,
+) -> Result<std::sync::Arc<dyn FirmwareUpdaterSigner>, String> {
     let envelope = SigningEnvelope::for_this_host(SIGNING_ENVELOPE_VERSION_INFO, session_uuid)?;
     Ok(std::sync::Arc::new(SigningServerSigner::new(
         CurlSigningTransport::default(),
@@ -1894,6 +1926,69 @@ mod tests {
         assert_eq!(
             signer.url(),
             "https://gs.apple.com:443/TSS/controller?action=2"
+        );
+    }
+
+    #[test]
+    fn the_firmware_updater_submit_preserves_the_guest_nonce_and_returns_the_ticket() {
+        let nonce = vec![0x5a; 32];
+        let ticket = vec![0x30, 0x02, 0x16, 0x00];
+        let mut answer = plist::Dictionary::new();
+        answer.insert(
+            "Cryptex1,Ticket".to_string(),
+            plist::Value::Data(ticket.clone()),
+        );
+        let mut answer_xml = Vec::new();
+        plist::Value::Dictionary(answer)
+            .to_writer_xml(&mut answer_xml)
+            .unwrap();
+        let signer = SigningServerSigner::new(
+            RecordingTransport {
+                answer: response_body(0, "SUCCESS", &String::from_utf8(answer_xml).unwrap()),
+                posted: std::sync::Mutex::new(Vec::new()),
+            },
+            SIGNING_SERVER_DEFAULT_BASE_URL.to_string(),
+            test_envelope(),
+        );
+        let request = plist::Dictionary::from_iter([
+            ("@Cryptex1,Ticket".to_string(), plist::Value::Boolean(true)),
+            (
+                "ApECID".to_string(),
+                plist::Value::Integer(0x1234_u64.into()),
+            ),
+            (
+                "Cryptex1,Nonce".to_string(),
+                plist::Value::Data(nonce.clone()),
+            ),
+        ]);
+        let response = FirmwareUpdaterSigner::personalize(&signer, &request).unwrap();
+        assert_eq!(
+            response
+                .get("Cryptex1,Ticket")
+                .and_then(plist::Value::as_data),
+            Some(ticket.as_slice()),
+        );
+        let posts = signer.transport.posted.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        let posted = plist::Value::from_reader_xml(std::io::Cursor::new(&posts[0].2))
+            .unwrap()
+            .into_dictionary()
+            .unwrap();
+        assert_eq!(
+            posted.get("Cryptex1,Nonce").and_then(plist::Value::as_data),
+            Some(nonce.as_slice()),
+        );
+        assert_eq!(
+            posted
+                .get("@Cryptex1,Ticket")
+                .and_then(plist::Value::as_boolean),
+            Some(true),
+        );
+        assert_eq!(
+            posted
+                .get("@HostPlatformInfo")
+                .and_then(plist::Value::as_string),
+            Some(test_envelope().host_platform_info.as_str()),
         );
     }
 

@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use plist::Dictionary;
 use plist::Value;
-use tempfile::{Builder as TempDirBuilder, TempDir};
 
 use crate::asr_server::AsrServerConfig;
 use crate::bridge_protocol::{
@@ -21,13 +20,13 @@ use crate::bridge_protocol::{
 };
 use crate::clip::{FileKind, inspect};
 use crate::crypto::{Sha256, Sha512};
-#[cfg(test)]
+use crate::ipsw_tree::{IpswStage, find_ipsw_cli};
 use crate::ramrod::BOOT_NONCE_HASH_BYTES;
 use crate::ramrod::{
     BUILD_MANIFEST_FILE_NAME, BUNDLE_ROOT_DIR, BuildIdentity, DeviceType, FinalStatus,
     RESTORE_PLIST_FILE_NAME, RESTORE_VERSION_FILE_NAME, RestoreBehavior, SYSTEM_VERSION_FILE_NAME,
     image_candidates, install_behaviors_for_board, load_build_manifest, load_restore_catalog,
-    select_install_identity, select_macos_identity,
+    select_install_identity, select_macos_identity, select_recovery_identity,
 };
 use crate::recovery_model::RestoreMode;
 use crate::recovery_model::{
@@ -130,7 +129,20 @@ trait RestoreBackend: Send + Sync {
 trait ClaimedRestore: Send + Sync {
     fn device_id(&self) -> &str;
     fn detail(&self) -> Option<&str>;
-    fn context(&self) -> ClaimedBootContext;
+    fn context(&self) -> Result<ClaimedBootContext, ClaimContextError>;
+    fn signing_context(&self) -> Result<Option<RestoreBootContext>, String> {
+        Ok(None)
+    }
+    fn ap_nonce(&self) -> Result<Option<[u8; BOOT_NONCE_HASH_BYTES]>, String> {
+        match self.context() {
+            Ok(context) => Ok(context.restore.ap_nonce),
+            Err(ClaimContextError::Unavailable(_)) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+    fn sep_nonce(&self) -> Result<Option<[u8; 20]>, String> {
+        Ok(None)
+    }
     fn identify(&self) -> Result<DeviceType, String>;
     fn abort(&self);
     fn detach_host(&self, disposition: HostDetachDisposition) -> HostDetachOutcome;
@@ -176,6 +188,20 @@ struct RealBackend {
 struct ClaimedBootContext {
     bridge: BridgeBootContext,
     restore: RestoreBootContext,
+}
+
+#[derive(Clone)]
+enum ClaimContextError {
+    Unavailable(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for ClaimContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(reason) | Self::Failed(reason) => f.write_str(reason),
+        }
+    }
 }
 
 impl RestoreBackend for RealBackend {
@@ -241,14 +267,12 @@ impl RestoreBackend for RealBackend {
         let claim = client
             .claim_device(route.device_id.clone(), route.generation)
             .map_err(|error| error.to_string())?;
-        let (claimed, control, bridge_context) = build_claimed_transport(claim, &reporter)?;
-        let context = claimed_boot_context(control.clone(), bridge_context)?;
+        let (claimed, control) = build_claimed_transport(claim, &reporter)?;
         Ok(Arc::new(RealClaimedRestore {
             device_id: device_id.to_string(),
             detail: route.detail,
             claimed,
             control,
-            context,
         }))
     }
 }
@@ -258,7 +282,6 @@ struct RealClaimedRestore {
     detail: Option<String>,
     claimed: ClaimedMuxTransport<SocketBulkTransport>,
     control: ClaimedSessionControl,
-    context: ClaimedBootContext,
 }
 
 impl ClaimedRestore for RealClaimedRestore {
@@ -270,8 +293,70 @@ impl ClaimedRestore for RealClaimedRestore {
         self.detail.as_deref()
     }
 
-    fn context(&self) -> ClaimedBootContext {
-        self.context.clone()
+    fn context(&self) -> Result<ClaimedBootContext, ClaimContextError> {
+        let response = self
+            .control
+            .get_boot_context_response()
+            .map_err(|error| ClaimContextError::Failed(error.to_string()))?;
+        let bridge_context = match response {
+            Ok(context) => context,
+            Err(error) => {
+                let reason = format!("{}: {}", error.code, error.detail);
+                return Err(if error.code == "bootContextUnavailable" && !error.fatal {
+                    ClaimContextError::Unavailable(reason)
+                } else {
+                    ClaimContextError::Failed(reason)
+                });
+            }
+        };
+        claimed_boot_context(self.control.clone(), bridge_context)
+            .map_err(ClaimContextError::Failed)
+    }
+
+    fn signing_context(&self) -> Result<Option<RestoreBootContext>, String> {
+        let key = match self
+            .control
+            .get_signer_public_key_response()
+            .map_err(|error| error.to_string())?
+        {
+            Ok(key) => key,
+            Err(error) if error.code == "signerUnavailable" && !error.fatal => return Ok(None),
+            Err(error) => return Err(format!("{}: {}", error.code, error.detail)),
+        };
+        let broker: Arc<dyn SessionBroker> = Arc::new(ControlManifestBroker {
+            control: self.control.clone(),
+            expected_public_key: key,
+        });
+        Ok(Some(RestoreBootContext {
+            sep_public_key: Some(key),
+            remote_digest_signing: true,
+            manifest_signer: Some(Arc::new(RemoteManifestSigner::new(broker, key))),
+            ..RestoreBootContext::default()
+        }))
+    }
+
+    fn ap_nonce(&self) -> Result<Option<[u8; BOOT_NONCE_HASH_BYTES]>, String> {
+        match self
+            .control
+            .get_ap_nonce_response()
+            .map_err(|error| error.to_string())?
+        {
+            Ok(nonce) => Ok(Some(nonce)),
+            Err(error) if error.code == "apNonceUnavailable" && !error.fatal => Ok(None),
+            Err(error) => Err(format!("{}: {}", error.code, error.detail)),
+        }
+    }
+
+    fn sep_nonce(&self) -> Result<Option<[u8; 20]>, String> {
+        match self
+            .control
+            .get_sep_nonce_response()
+            .map_err(|error| error.to_string())?
+        {
+            Ok(nonce) => Ok(Some(nonce)),
+            Err(error) if error.code == "sepNonceUnavailable" && !error.fatal => Ok(None),
+            Err(error) => Err(format!("{}: {}", error.code, error.detail)),
+        }
     }
 
     fn identify(&self) -> Result<DeviceType, String> {
@@ -353,21 +438,18 @@ fn build_claimed_transport(
     (
         ClaimedMuxTransport<SocketBulkTransport>,
         ClaimedSessionControl,
-        BridgeBootContext,
     ),
     String,
 > {
     let out_max_packet_size = claim.out_max_packet_size;
     let transport = claim.into_transport().map_err(|error| error.to_string())?;
     let control = transport.control_handle();
-    let bridge_context = control
-        .get_boot_context()
-        .map_err(|error| error.to_string())?;
     // Held directly off the transport, before it moves into the link, so the watchdog never has
     // to take the link mutex it exists to watch in order to sample it.
     let watchdog_metrics = transport.watchdog_metrics();
     let link = SharedLink::new(
         MuxLink::new(transport)
+            .with_trace(Arc::new(MuxReportTrace::new(reporter.clone())))
             .with_roundtrip_meter(mux_roundtrip_meter(reporter.clone(), LineBudget::process())),
     );
     // Started before the version exchange, not after it, so the one exchange that is allowed to
@@ -396,7 +478,7 @@ fn build_claimed_transport(
     )
     .with_detacher(detacher)
     .with_watchdog(watchdog);
-    Ok((claimed, control, bridge_context))
+    Ok((claimed, control))
 }
 
 fn stable_device_id(broker_id: &str, device_id: &str) -> String {
@@ -445,7 +527,7 @@ fn discovered_state(state: BridgeDeviceState) -> crate::recovery_model::DeviceSt
 
 struct ControlManifestBroker {
     control: ClaimedSessionControl,
-    boot_context: BridgeBootContext,
+    expected_public_key: [u8; 65],
 }
 
 impl SessionBroker for ControlManifestBroker {
@@ -458,7 +540,7 @@ impl SessionBroker for ControlManifestBroker {
         let request = SignFdrManifestRequest::decode(body).map_err(|error| error.to_string())?;
         let signature = self
             .control
-            .sign_fdr_manifest(&request.signed_body, &self.boot_context)
+            .sign_fdr_manifest_with_key(&request.signed_body, &self.expected_public_key)
             .map_err(|error| error.to_string())?;
         Ok(SessionReply {
             response_code: BRIDGE_SIGN_MANB_RESPONSE,
@@ -477,6 +559,7 @@ fn claimed_boot_context(
         remote_digest_signing: bridge.remote_signer_available,
         manifest_signer: None,
         local_test_signing_key: None,
+        ..RestoreBootContext::default()
     };
     if bridge.remote_signer_available {
         let public_key = bridge.sep_public_key_uncompressed.ok_or_else(|| {
@@ -484,7 +567,7 @@ fn claimed_boot_context(
         })?;
         let broker: Arc<dyn SessionBroker> = Arc::new(ControlManifestBroker {
             control,
-            boot_context: bridge.clone(),
+            expected_public_key: public_key,
         });
         restore.manifest_signer = Some(Arc::new(RemoteManifestSigner::new(broker, public_key)));
     }
@@ -545,10 +628,15 @@ struct ServiceWorker {
     last_discovery: Option<BackendDiscovery>,
     last_devices: HashMap<String, RecoveryDevice>,
     last_discovery_error: Option<String>,
+    last_missing_active_device: Option<String>,
     discovery_failures: u32,
     session: Option<ClaimedSession>,
     prepared: Option<PreparedRestore>,
     sign_recovery_os_local_policy: bool,
+    vm_local_signing_enabled: bool,
+    skip_tcon_firmware: bool,
+    fdr_material_directory: Option<PathBuf>,
+    ipsw: Option<Arc<IpswStage>>,
 }
 
 impl ServiceWorker {
@@ -564,10 +652,15 @@ impl ServiceWorker {
             last_discovery: None,
             last_devices: HashMap::new(),
             last_discovery_error: None,
+            last_missing_active_device: None,
             discovery_failures: 0,
             session: None,
             prepared: None,
             sign_recovery_os_local_policy: false,
+            vm_local_signing_enabled: true,
+            skip_tcon_firmware: false,
+            fdr_material_directory: None,
+            ipsw: None,
         }
     }
 
@@ -578,7 +671,10 @@ impl ServiceWorker {
             self.poll_restore_outcome();
             let wait = next_discovery.saturating_duration_since(Instant::now());
             match self.command_rx.recv_timeout(wait) {
-                Ok(ServiceCommand::User(command)) => self.handle_command(command),
+                Ok(ServiceCommand::User(command)) => {
+                    self.handle_command(command);
+                    self.reap_ipsw();
+                }
                 Ok(ServiceCommand::Shutdown) => {
                     self.shutdown();
                     break;
@@ -598,6 +694,8 @@ impl ServiceWorker {
 
     fn shutdown(&mut self) {
         self.cleanup_session(HostDetachDisposition::Cancelled);
+        self.prepared = None;
+        self.reap_ipsw();
     }
 
     fn handle_command(&mut self, command: RecoveryCommand) {
@@ -616,6 +714,13 @@ impl ServiceWorker {
             RecoveryCommand::SelectRestoreMode { mode } => self.select_restore_mode(mode),
             RecoveryCommand::SetLocalPolicySigning { enabled } => {
                 self.set_local_policy_signing(enabled);
+            }
+            RecoveryCommand::SetVmLocalSigning { enabled } => self.set_vm_local_signing(enabled),
+            RecoveryCommand::SetSkipTconFirmware { enabled } => {
+                self.set_skip_tcon_firmware(enabled)
+            }
+            RecoveryCommand::SetFdrMaterialDirectory { path } => {
+                self.set_fdr_material_directory(path)
             }
             RecoveryCommand::Autosearch { device_id, path } => self.autosearch(&device_id, &path),
         }
@@ -641,7 +746,33 @@ impl ServiceWorker {
             .session
             .as_ref()
             .map(|session| session.claim.device_id());
-        let mapped = map_devices(&discovery.devices, claimed);
+        let mut mapped = map_devices(&discovery.devices, claimed);
+        let missing_active = self.session.as_ref().and_then(|session| {
+            session.restore_run.as_ref().and_then(|run| {
+                (!mapped.contains_key(&run.device_id)).then(|| run.device_id.clone())
+            })
+        });
+        if let Some(device_id) = missing_active {
+            if self.last_missing_active_device.as_ref() != Some(&device_id) {
+                self.try_emit(RecoveryEvent::Log {
+                    level: LogLevel::Warn,
+                    message: format!(
+                        "Recovery inventory omitted active device {device_id}; awaiting the claimed restore transport's outcome"
+                    ),
+                });
+            }
+            self.last_missing_active_device = Some(device_id.clone());
+            if let Some(device) = self.last_devices.get(&device_id) {
+                mapped.insert(device_id, device.clone());
+            }
+        } else if let Some(device_id) = self.last_missing_active_device.take()
+            && mapped.contains_key(&device_id)
+        {
+            self.try_emit(RecoveryEvent::Log {
+                level: LogLevel::Info,
+                message: format!("Active recovery device {device_id} returned to the inventory"),
+            });
+        }
 
         for device in mapped.values() {
             let changed = self.last_devices.get(&device.id) != Some(device);
@@ -661,16 +792,6 @@ impl ServiceWorker {
                 device_id: missing_id.clone(),
                 note: Some("Device left the recovery inventory".to_string()),
             });
-            if self
-                .session
-                .as_ref()
-                .is_some_and(|session| session.claim.device_id() == missing_id)
-                && let Some(session) = &mut self.session
-                && let Some(run) = &mut session.restore_run
-            {
-                run.stop.store(true, Ordering::Relaxed);
-                run.release_after = true;
-            }
         }
 
         self.last_devices = mapped;
@@ -719,9 +840,14 @@ impl ServiceWorker {
         self.cleanup_session(HostDetachDisposition::Cancelled);
         let reporter: crate::restore::SharedReporter =
             Arc::new(Mutex::new(UiReporter::new(self.event_tx.clone())));
-        let claim = match self.backend.claim(&entry.id, reporter) {
+        let claim = match self.backend.claim(&entry.id, reporter.clone()) {
             Ok(claim) => claim,
             Err(error) => {
+                crate::restore::report::report(
+                    &reporter,
+                    "claim-failed",
+                    &format!("{MUX_PREFIX} claim failed: {error}"),
+                );
                 self.emit(RecoveryEvent::ClaimRejected {
                     device_id: device_id.to_string(),
                     reason: error,
@@ -758,13 +884,49 @@ impl ServiceWorker {
                 }
                 self.emit(RecoveryEvent::ClaimRejected {
                     device_id: device_id.to_string(),
-                    reason: format!("this Mac is {model}, the restore set is for {class}"),
+                    reason: format!("this device is {model}, the restore set is for {class}"),
                 });
                 return;
             }
         }
-        let context = claim.context();
+        let context = match claim.context() {
+            Err(ClaimContextError::Failed(error)) => {
+                let detach = claim.detach_host(HostDetachDisposition::Failed);
+                self.try_emit(host_detach_log_event(HostDetachDisposition::Failed, detach));
+                if should_abort_after_detach(detach) {
+                    claim.abort();
+                }
+                crate::restore::report::report(
+                    &reporter,
+                    "claim-failed",
+                    &format!("{MUX_PREFIX} boot context request failed: {error}"),
+                );
+                self.emit(RecoveryEvent::ClaimRejected {
+                    device_id: device_id.to_string(),
+                    reason: error,
+                });
+                return;
+            }
+            context => context,
+        };
+        if let Err(error) = &context {
+            crate::restore::report::report(
+                &reporter,
+                "boot-context-unavailable",
+                &format!(
+                    "{MUX_PREFIX} Connected to restored; restore metadata unavailable: {error}"
+                ),
+            );
+        }
         self.session = Some(ClaimedSession::new(claim, context, identified));
+        let had_prepared_manifest = self
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.accepted.contains_key(MANIFEST_REQUEST_ID));
+        self.emit(RecoveryEvent::FileRequestCleared {
+            request_id: MANIFEST_REQUEST_ID.to_string(),
+            note: Some("Validating BuildManifest for the claimed device".to_string()),
+        });
         self.emit(RecoveryEvent::ClaimAccepted {
             device_id: device_id.to_string(),
             note: Some(
@@ -774,8 +936,22 @@ impl ServiceWorker {
                     .unwrap_or_else(|| "Exclusive claim accepted".to_string()),
             ),
         });
-        if self.apply_prepared_to_session().is_err() {
+        if let Err(error) = self.apply_prepared_to_session() {
             self.emit_manifest_request();
+            if had_prepared_manifest {
+                let note = format!("Could not prepare restore: {error}");
+                crate::restore::report::report(
+                    &reporter,
+                    "restore-preparation-failed",
+                    &format!("[restore] {note}"),
+                );
+                self.emit(RecoveryEvent::Failed { note });
+            }
+        } else {
+            self.emit(RecoveryEvent::FileAccepted {
+                request_id: MANIFEST_REQUEST_ID.to_string(),
+                note: Some("BuildManifest validated for the claimed device".to_string()),
+            });
         }
         self.last_devices.clear();
         self.refresh_discovery();
@@ -812,7 +988,12 @@ impl ServiceWorker {
             Ok(derived) => derived,
             Err(error) => {
                 self.prepared = Some(prepared);
-                return Err(error.detail());
+                return Err(format!(
+                    "{}: {} ({})",
+                    error.label(),
+                    error.meaning(),
+                    error.detail(),
+                ));
             }
         };
         let session = self.session.as_mut().expect("session");
@@ -829,7 +1010,17 @@ impl ServiceWorker {
     }
 
     fn provide_prepared_file(&mut self, request_id: &str, path: &str) {
-        let path_buf = PathBuf::from(path);
+        let path_buf = match self.hand_over_ipsw(path) {
+            Ok(Some(root)) => {
+                self.provide_prepared_directory(request_id, &root);
+                return;
+            }
+            Ok(None) => PathBuf::from(path),
+            Err(reason) => {
+                self.reject_and_reask_for(request_id, reason);
+                return;
+            }
+        };
         if path_buf.is_dir() {
             self.provide_prepared_directory(request_id, &path_buf);
             return;
@@ -1051,7 +1242,24 @@ impl ServiceWorker {
                     prepared
                         .accepted
                         .values()
-                        .find(|file| file.source == resolved.path)
+                        .find(|file| {
+                            file.source == resolved.path
+                                && pending
+                                    .expected_hash
+                                    .as_ref()
+                                    .is_some_and(|hash| file.expected_hash.as_ref() == Some(hash))
+                                && validate_regular_source(
+                                    &file.source,
+                                    pending.source_root.as_deref(),
+                                )
+                                .is_ok()
+                                && sniff_payload_kind(&file.source).is_ok_and(|kind| {
+                                    kinds_compatible(
+                                        payload_kind_from_name(&pending.manifest_file_name),
+                                        kind,
+                                    )
+                                })
+                        })
                         .cloned()
                 }) {
                     if let Some(prepared) = self.prepared.as_mut() {
@@ -1061,7 +1269,7 @@ impl ServiceWorker {
                             AcceptedFile {
                                 source: existing.source,
                                 overlay_relative: pending.overlay_relative.clone(),
-                                expected_hash: existing.expected_hash,
+                                expected_hash: pending.expected_hash.clone(),
                                 source_root: existing
                                     .source_root
                                     .or_else(|| Some(dir.to_path_buf())),
@@ -1176,7 +1384,15 @@ impl ServiceWorker {
     }
 
     fn autosearch_prepared(&mut self, path: &str) {
-        let dir = match fs::canonicalize(path) {
+        let path = match self.hand_over_ipsw(path) {
+            Ok(Some(root)) => root.to_string_lossy().into_owned(),
+            Ok(None) => path.to_string(),
+            Err(reason) => {
+                self.autosearch_reject(&reason);
+                return;
+            }
+        };
+        let dir = match fs::canonicalize(&path) {
             Ok(dir) if dir.is_dir() => dir,
             Ok(dir) => {
                 self.autosearch_reject(&format!("{} is not a folder", dir.display()));
@@ -1237,7 +1453,15 @@ impl ServiceWorker {
     }
 
     fn autosearch_session(&mut self, path: &str) {
-        let dir = match fs::canonicalize(path) {
+        let path = match self.hand_over_ipsw(path) {
+            Ok(Some(root)) => root.to_string_lossy().into_owned(),
+            Ok(None) => path.to_string(),
+            Err(reason) => {
+                self.autosearch_reject(&reason);
+                return;
+            }
+        };
+        let dir = match fs::canonicalize(&path) {
             Ok(dir) if dir.is_dir() => dir,
             Ok(dir) => {
                 self.autosearch_reject(&format!("{} is not a folder", dir.display()));
@@ -1338,6 +1562,97 @@ impl ServiceWorker {
         };
         let request_id = spec.request_id.clone();
         self.reject_and_reask(&request_id, spec, reason.to_string());
+    }
+
+    fn reject_and_reask_for(&mut self, request_id: &str, reason: String) {
+        let spec = self
+            .session
+            .as_ref()
+            .and_then(|session| session.pending_requests.get(request_id))
+            .or_else(|| {
+                self.prepared
+                    .as_ref()
+                    .and_then(|prepared| prepared.pending.get(request_id))
+            })
+            .map(|pending| pending.spec.clone());
+        match spec {
+            Some(spec) => self.reject_and_reask(request_id, spec, reason),
+            None => self.emit(RecoveryEvent::FileRejected {
+                request_id: request_id.to_string(),
+                reason,
+                keep_claim: true,
+            }),
+        }
+    }
+
+    /// An `.ipsw` handed over in place of a folder stands in for its extracted root: the archive's
+    /// tree is indexed, only the catalog files are written, and every payload is pulled out when
+    /// the manifest resolves it. Returns the staging root, or `None` when `path` is not an IPSW.
+    fn hand_over_ipsw(&mut self, path: &str) -> Result<Option<PathBuf>, String> {
+        let archive = PathBuf::from(path);
+        if !is_ipsw_path(&archive) {
+            return Ok(None);
+        }
+        if let Some(stage) = &self.ipsw
+            && stage.tree().archive_path() == archive
+        {
+            return Ok(Some(stage.root().to_path_buf()));
+        }
+        if find_ipsw_cli().is_none() {
+            return Err(format!(
+                "{} is an IPSW. Install the ipsw command (brew install blacktop/tap/ipsw) to restore from it directly, or extract it and hand over the folder.",
+                archive.display()
+            ));
+        }
+        self.emit(RecoveryEvent::Progress(RestoreProgress {
+            stage: "indexing".into(),
+            detail: archive
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("IPSW")
+                .to_string(),
+            fraction: None,
+        }));
+        let stage = IpswStage::open(&archive).map_err(|error| error.to_string())?;
+        stage_ipsw_catalog(&stage)?;
+        let root = stage.root().to_path_buf();
+        self.emit(RecoveryEvent::Log {
+            level: LogLevel::Info,
+            message: format!(
+                "Indexed {} files in {}; payloads are unpacked only when a restore needs them",
+                stage.tree().len(),
+                archive.display()
+            ),
+        });
+        self.ipsw = Some(Arc::new(stage));
+        Ok(Some(root))
+    }
+
+    fn is_ipsw_root(&self, root: &Path) -> bool {
+        self.ipsw.as_ref().is_some_and(|stage| stage.root() == root)
+    }
+
+    /// Drops the unpacked IPSW files once neither the file collection nor a claimed session still
+    /// reads from them.
+    fn reap_ipsw(&mut self) {
+        let Some(stage) = &self.ipsw else {
+            return;
+        };
+        let under = |root: &Option<PathBuf>| {
+            root.as_deref()
+                .is_some_and(|root| root.starts_with(stage.root()))
+        };
+        let in_use = self
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| under(&prepared.manifest_root))
+            || self
+                .session
+                .as_ref()
+                .is_some_and(|session| under(&session.manifest_root));
+        if !in_use {
+            self.ipsw = None;
+        }
     }
 
     fn reject_and_reask(&mut self, request_id: &str, spec: FileRequestSpec, reason: String) {
@@ -1456,6 +1771,79 @@ impl ServiceWorker {
         }
     }
 
+    fn set_vm_local_signing(&mut self, enabled: bool) {
+        let running = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.restore_run.is_some());
+        if running {
+            self.emit(RecoveryEvent::Log {
+                level: LogLevel::Warn,
+                message: "VM local signing stays fixed for the active restore".to_string(),
+            });
+        } else {
+            self.vm_local_signing_enabled = enabled;
+            self.emit(RecoveryEvent::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "VM local signing {}",
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+            });
+        }
+        self.emit(RecoveryEvent::VmLocalSigning {
+            enabled: self.vm_local_signing_enabled,
+        });
+    }
+
+    fn set_skip_tcon_firmware(&mut self, enabled: bool) {
+        let running = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.restore_run.is_some());
+        if running {
+            self.emit(RecoveryEvent::Log {
+                level: LogLevel::Warn,
+                message: "Skip TCON firmware stays fixed for the active restore".to_string(),
+            });
+        } else {
+            self.skip_tcon_firmware = enabled;
+            self.emit(RecoveryEvent::Log {
+                level: if enabled {
+                    LogLevel::Warn
+                } else {
+                    LogLevel::Info
+                },
+                message: crate::recovery_model::skip_tcon_firmware_status(enabled),
+            });
+        }
+        self.emit(RecoveryEvent::SkipTconFirmware {
+            enabled: self.skip_tcon_firmware,
+        });
+    }
+
+    fn set_fdr_material_directory(&mut self, path: Option<PathBuf>) {
+        let running = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.restore_run.is_some());
+        if running {
+            self.emit(RecoveryEvent::Log {
+                level: LogLevel::Warn,
+                message: "FDR material directory stays fixed for the active restore".to_string(),
+            });
+            return;
+        }
+        self.fdr_material_directory = path;
+        self.emit(RecoveryEvent::Log {
+            level: LogLevel::Info,
+            message: match &self.fdr_material_directory {
+                Some(path) => format!("FDR material directory selected: {}", path.display()),
+                None => "FDR material directory cleared".to_string(),
+            },
+        });
+    }
+
     fn set_local_policy_signing(&mut self, enabled: bool) {
         let running = self
             .session
@@ -1465,7 +1853,7 @@ impl ServiceWorker {
             self.emit(RecoveryEvent::Log {
                 level: LogLevel::Warn,
                 message: format!(
-                    "recoveryOS LocalPolicy signing stays {} for this restore: the run's plan was fixed when it started",
+                    "Apple restore signing stays {} for this restore: the run's plan was fixed when it started",
                     if self.sign_recovery_os_local_policy {
                         "armed"
                     } else {
@@ -1481,11 +1869,10 @@ impl ServiceWorker {
         self.sign_recovery_os_local_policy = enabled;
         let message = if enabled {
             format!(
-                "recoveryOS LocalPolicy signing armed: a restore will send this Mac's ECID, chip and board to {SIGNING_SERVER_DEFAULT_BASE_URL} to have its LocalPolicy signed"
+                "Apple restore signing armed: LocalPolicy and Cryptex requests can send device identity and guest signing terms to {SIGNING_SERVER_DEFAULT_BASE_URL}"
             )
         } else {
-            "recoveryOS LocalPolicy signing off: no restore will contact Apple's signing server"
-                .to_string()
+            "Apple restore signing off: no restore will contact Apple's signing server".to_string()
         };
         self.emit(RecoveryEvent::Log {
             level: LogLevel::Info,
@@ -1550,16 +1937,18 @@ impl ServiceWorker {
         }
         let mut pending = BTreeMap::new();
         let mut seen = BTreeSet::new();
+        let ipsw = self.ipsw.clone();
+        let events = self.event_tx.clone();
         for identity in &identities {
             for name in identity_component_names(identity) {
-                let request_id = component_request_id(&name);
+                let request_id = identity_component_request_id(&identities[0], identity, &name);
                 if !seen.insert(request_id.clone()) {
                     continue;
                 }
                 if accepted.contains_key(&request_id) {
                     continue;
                 }
-                match resolve_identity_component(&root, identity, &name) {
+                match resolve_staged_component(ipsw.as_deref(), &events, &root, identity, &name) {
                     Ok(ComponentResolution::Present {
                         source,
                         relative,
@@ -1576,11 +1965,12 @@ impl ServiceWorker {
                         );
                     }
                     Ok(ComponentResolution::Missing {
-                        spec,
+                        mut spec,
                         relative,
                         expected_hash,
                         manifest_file_name,
                     }) => {
+                        spec.request_id = request_id.clone();
                         pending.insert(
                             request_id,
                             PendingRequest {
@@ -1601,12 +1991,15 @@ impl ServiceWorker {
                             ),
                         });
                         pending.insert(
-                            request_id,
-                            pending_request_for_unresolved_component(&name, &error),
+                            request_id.clone(),
+                            pending_request_for_identity_component(&name, &error, &request_id),
                         );
                     }
                 }
             }
+        }
+        if self.is_ipsw_root(&root) && !pending.is_empty() {
+            return Err(ipsw_missing_message(pending.values()));
         }
         let pending_specs = pending
             .values()
@@ -1628,8 +2021,19 @@ impl ServiceWorker {
         self.emit(RecoveryEvent::ModeSelected {
             mode: mode_from_behavior(behavior),
         });
+        let files_ready = pending_specs.is_empty();
         for spec in pending_specs {
             self.emit(RecoveryEvent::FileRequested(spec));
+        }
+        if files_ready {
+            self.emit(RecoveryEvent::PhaseChanged {
+                phase: SessionPhase::Ready,
+                note: Some(if self.session.is_some() {
+                    "Restore files ready".to_string()
+                } else {
+                    "Restore files ready; waiting for a recovery device".to_string()
+                }),
+            });
         }
         Ok(())
     }
@@ -1639,6 +2043,10 @@ impl ServiceWorker {
             return;
         };
         session.reset_for_manifest_request();
+        self.emit(RecoveryEvent::FileRequestCleared {
+            request_id: MANIFEST_REQUEST_ID.to_string(),
+            note: Some("BuildManifest needs validation for the claimed device".to_string()),
+        });
         self.emit(RecoveryEvent::FileRequested(manifest_request_spec()));
     }
 
@@ -1700,7 +2108,17 @@ impl ServiceWorker {
             self.provide_prepared_file(request_id, path);
             return;
         }
-        let path_buf = PathBuf::from(path);
+        let path_buf = match self.hand_over_ipsw(path) {
+            Ok(Some(root)) => {
+                self.provide_session_directory(request_id, &root);
+                return;
+            }
+            Ok(None) => PathBuf::from(path),
+            Err(reason) => {
+                self.reject_and_reask_for(request_id, reason);
+                return;
+            }
+        };
         if path_buf.is_dir() {
             self.provide_session_directory(request_id, &path_buf);
             return;
@@ -1895,7 +2313,24 @@ impl ServiceWorker {
                     session
                         .accepted_files
                         .values()
-                        .find(|file| file.source == resolved.path)
+                        .find(|file| {
+                            file.source == resolved.path
+                                && pending
+                                    .expected_hash
+                                    .as_ref()
+                                    .is_some_and(|hash| file.expected_hash.as_ref() == Some(hash))
+                                && validate_regular_source(
+                                    &file.source,
+                                    pending.source_root.as_deref(),
+                                )
+                                .is_ok()
+                                && sniff_payload_kind(&file.source).is_ok_and(|kind| {
+                                    kinds_compatible(
+                                        payload_kind_from_name(&pending.manifest_file_name),
+                                        kind,
+                                    )
+                                })
+                        })
                         .cloned()
                 }) {
                     if let Some(session) = self.session.as_mut() {
@@ -1905,7 +2340,7 @@ impl ServiceWorker {
                             AcceptedFile {
                                 source: existing.source,
                                 overlay_relative: pending.overlay_relative.clone(),
-                                expected_hash: existing.expected_hash,
+                                expected_hash: pending.expected_hash.clone(),
                                 source_root: existing
                                     .source_root
                                     .or_else(|| Some(dir.to_path_buf())),
@@ -1962,6 +2397,21 @@ impl ServiceWorker {
                                 validated.metadata.len()
                             )),
                         });
+                        if request_id == MANIFEST_REQUEST_ID {
+                            // Same follow-up as a manifest handed over as a file: the other requests derive from it.
+                            if let Err(error) = self.derive_manifest_assets() {
+                                if let Some(session) = &mut self.session {
+                                    session.accepted_files.remove(MANIFEST_REQUEST_ID);
+                                }
+                                self.emit(RecoveryEvent::FileRejected {
+                                    request_id: MANIFEST_REQUEST_ID.to_string(),
+                                    reason: error,
+                                    keep_claim: true,
+                                });
+                                self.emit_manifest_request();
+                            }
+                            return found;
+                        }
                         break;
                     }
                     Err(error) => {
@@ -2013,13 +2463,15 @@ impl ServiceWorker {
             .collect::<BTreeSet<_>>();
         seen.extend(session.pending_requests.keys().cloned());
         let mut missing = Vec::new();
+        let ipsw = self.ipsw.clone();
+        let events = self.event_tx.clone();
         for identity in &identities {
             for name in identity_component_names(identity) {
-                let request_id = component_request_id(&name);
+                let request_id = identity_component_request_id(&identities[0], identity, &name);
                 if !seen.insert(request_id.clone()) {
                     continue;
                 }
-                match resolve_identity_component(&root, identity, &name) {
+                match resolve_staged_component(ipsw.as_deref(), &events, &root, identity, &name) {
                     Ok(ComponentResolution::Present {
                         source,
                         relative,
@@ -2038,11 +2490,12 @@ impl ServiceWorker {
                         }
                     }
                     Ok(ComponentResolution::Missing {
-                        spec,
+                        mut spec,
                         relative,
                         expected_hash,
                         manifest_file_name,
                     }) => {
+                        spec.request_id = request_id.clone();
                         missing.push((
                             request_id,
                             PendingRequest {
@@ -2057,8 +2510,8 @@ impl ServiceWorker {
                     }
                     Err(error) => {
                         missing.push((
-                            request_id,
-                            pending_request_for_unresolved_component(&name, &error),
+                            request_id.clone(),
+                            pending_request_for_identity_component(&name, &error, &request_id),
                         ));
                     }
                 }
@@ -2135,6 +2588,7 @@ impl ServiceWorker {
 
     fn collect_identity_payloads(&mut self, manifest_root: &Path) -> Result<(), String> {
         let event_tx = self.event_tx.clone();
+        let ipsw = self.ipsw.clone();
         let session = self
             .session
             .as_mut()
@@ -2149,14 +2603,21 @@ impl ServiceWorker {
         for identity in identities {
             let names = identity_component_names(identity);
             for name in names {
-                let request_id = component_request_id(&name);
+                let request_id =
+                    identity_component_request_id(&derived.install_identity, identity, &name);
                 if !seen.insert(request_id.clone()) {
                     continue;
                 }
                 if session.accepted_files.contains_key(&request_id) {
                     continue;
                 }
-                match resolve_identity_component(manifest_root, identity, &name) {
+                match resolve_staged_component(
+                    ipsw.as_deref(),
+                    &event_tx,
+                    manifest_root,
+                    identity,
+                    &name,
+                ) {
                     Ok(ComponentResolution::Present {
                         source,
                         relative,
@@ -2173,11 +2634,12 @@ impl ServiceWorker {
                         );
                     }
                     Ok(ComponentResolution::Missing {
-                        spec,
+                        mut spec,
                         relative,
                         expected_hash,
                         manifest_file_name,
                     }) => {
+                        spec.request_id = request_id.clone();
                         missing.push((
                             request_id,
                             PendingRequest {
@@ -2192,12 +2654,21 @@ impl ServiceWorker {
                     }
                     Err(error) => {
                         missing.push((
-                            request_id,
-                            pending_request_for_unresolved_component(&name, &error),
+                            request_id.clone(),
+                            pending_request_for_identity_component(&name, &error, &request_id),
                         ));
                     }
                 }
             }
+        }
+        if ipsw
+            .as_ref()
+            .is_some_and(|stage| stage.root() == manifest_root)
+            && !missing.is_empty()
+        {
+            return Err(ipsw_missing_message(
+                missing.iter().map(|(_, pending)| pending),
+            ));
         }
         for (request_id, pending) in missing {
             let spec = pending.spec.clone();
@@ -2209,6 +2680,7 @@ impl ServiceWorker {
 
     fn try_fill_pending_from(&mut self, roots: &[PathBuf]) {
         let event_tx = self.event_tx.clone();
+        let ipsw = self.ipsw.clone();
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -2223,9 +2695,11 @@ impl ServiceWorker {
             let identity = identity_payload_sources(&derived)
                 .into_iter()
                 .find(|identity| {
-                    identity_component_names(identity)
-                        .iter()
-                        .any(|name| name == &pending.component)
+                    identity_component_request_id(
+                        &derived.install_identity,
+                        identity,
+                        &pending.component,
+                    ) == request_id
                 });
             let Some(identity) = identity else {
                 continue;
@@ -2234,8 +2708,13 @@ impl ServiceWorker {
                 if !root.is_dir() {
                     continue;
                 }
-                let Ok(resolved) = resolve_identity_component(root, identity, &pending.component)
-                else {
+                let Ok(resolved) = resolve_staged_component(
+                    ipsw.as_deref(),
+                    &event_tx,
+                    root,
+                    identity,
+                    &pending.component,
+                ) else {
                     continue;
                 };
                 if let ComponentResolution::Present {
@@ -2284,14 +2763,13 @@ impl ServiceWorker {
             .session
             .as_mut()
             .expect("claimed session")
-            .build_restore_plan(sign_recovery_os_local_policy)
-        {
+            .build_restore_plan(
+                sign_recovery_os_local_policy,
+                self.fdr_material_directory.as_deref(),
+            ) {
             Ok(plan) => plan,
             Err(error) => {
-                if self.emit_pending_file_requests() {
-                    return;
-                }
-                self.emit(RecoveryEvent::Failed { note: error });
+                self.restore_start_failed(device_id, error);
                 return;
             }
         };
@@ -2315,7 +2793,15 @@ impl ServiceWorker {
             Arc::new(Mutex::new(UiReporter::new(self.event_tx.clone())));
         let (outcome_tx, outcome_rx) = mpsc::channel();
         let claim = Arc::clone(&session.claim);
-        let boot = session.boot.clone();
+        let mut boot = match session.restore_boot_context() {
+            Ok(boot) => boot,
+            Err(note) => {
+                self.restore_start_failed(device_id, note);
+                return;
+            }
+        };
+        boot.vm_local_signing_enabled = self.vm_local_signing_enabled;
+        boot.skip_tcon_firmware = self.skip_tcon_firmware;
         let plan_for_thread = plan;
         let stop_for_thread = Arc::clone(&stop);
         let join = thread::spawn(move || {
@@ -2335,6 +2821,25 @@ impl ServiceWorker {
             phase: SessionPhase::Starting,
             note: Some("Starting restore".to_string()),
         });
+    }
+
+    fn restore_start_failed(&mut self, device_id: &str, note: String) {
+        let terminal_context_failure = self
+            .session
+            .as_ref()
+            .is_some_and(|session| matches!(session.context, Err(ClaimContextError::Failed(_))));
+        if terminal_context_failure {
+            self.cleanup_session(HostDetachDisposition::Failed);
+            self.emit(RecoveryEvent::Released {
+                device_id: device_id.to_string(),
+                note: Some("Connection closed after restore context request failed".to_string()),
+            });
+            self.last_devices.clear();
+            self.refresh_discovery();
+        } else if self.emit_pending_file_requests() {
+            return;
+        }
+        self.emit(RecoveryEvent::Failed { note });
     }
 
     fn emit_pending_file_requests(&mut self) -> bool {
@@ -2464,7 +2969,9 @@ impl ServiceWorker {
 
 fn guest_failure_note(summary: &crate::ramrod::RestoreSummary) -> String {
     if let Some(log) = summary.guest_log.as_deref()
-        && let Some(line) = notable_guest_error(log)
+        && let Some(line) = terminal_cf_error(log)
+            .or_else(|| terminal_checkpoint_error(log))
+            .or_else(|| notable_guest_error(log))
     {
         return line;
     }
@@ -2477,14 +2984,35 @@ fn guest_failure_note(summary: &crate::ramrod::RestoreSummary) -> String {
             return trimmed.to_string();
         }
     }
-    if let Some(checkpoint) = summary.open_checkpoint.as_deref() {
-        return format!("{checkpoint} failed");
+    if let Some(status) = summary.final_status.as_ref() {
+        return format!("Restore ended with {}", status.outcome());
     }
-    summary
-        .final_status
-        .as_ref()
-        .map(|status| format!("Restore ended with {}", status.outcome()))
-        .unwrap_or_else(|| "Restore ended without a final status".to_string())
+    if let Some(checkpoint) = summary.open_checkpoint.as_deref() {
+        return format!(
+            "Restore session closed while {checkpoint} was open; no final status received"
+        );
+    }
+    "Restore ended without a final status".to_string()
+}
+
+fn terminal_cf_error(log: &str) -> Option<String> {
+    let final_failure = log.rsplit_once("restore failed with CFError:")?.1;
+    final_failure
+        .lines()
+        .map(str::trim)
+        .find(|line| line.contains("AMRestoreErrorDomain/"))
+        .map(|line| {
+            line.rsplit_once(": ")
+                .map_or(line, |(_, detail)| detail)
+                .to_string()
+        })
+}
+
+fn terminal_checkpoint_error(log: &str) -> Option<String> {
+    log.lines()
+        .rev()
+        .filter(|line| line.contains("CHECKPOINT FAILURE:"))
+        .find_map(|line| cf_error_descriptions(line).into_iter().last())
 }
 
 fn notable_guest_error(log: &str) -> Option<String> {
@@ -2541,11 +3069,11 @@ impl ServiceWorker {
     }
 
     fn emit(&self, event: RecoveryEvent) {
-        let _ = self.event_tx.send(event);
+        let _ = self.event_tx.send(present_request(event));
     }
 
     fn try_emit(&self, event: RecoveryEvent) {
-        let _ = self.event_tx.try_send(event);
+        let _ = self.event_tx.try_send(present_request(event));
     }
 }
 
@@ -2650,8 +3178,7 @@ struct ValidatedSelection {
 
 struct ClaimedSession {
     claim: Arc<dyn ClaimedRestore>,
-    boot: RestoreBootContext,
-    bridge_context: BridgeBootContext,
+    context: Result<ClaimedBootContext, ClaimContextError>,
     device: DeviceType,
     host_detached: bool,
     request_global_manifest: bool,
@@ -2660,20 +3187,19 @@ struct ClaimedSession {
     selected_behavior: Option<RestoreBehavior>,
     accepted_files: HashMap<String, AcceptedFile>,
     pending_requests: BTreeMap<String, PendingRequest>,
-    overlay_root: Option<TempDir>,
+    overlay_root: Option<crate::scratch::ScratchDir>,
     restore_run: Option<ActiveRestore>,
 }
 
 impl ClaimedSession {
     fn new(
         claim: Arc<dyn ClaimedRestore>,
-        context: ClaimedBootContext,
+        context: Result<ClaimedBootContext, ClaimContextError>,
         device: DeviceType,
     ) -> Self {
         Self {
             claim,
-            boot: context.restore,
-            bridge_context: context.bridge,
+            context,
             device,
             host_detached: false,
             request_global_manifest: false,
@@ -2708,10 +3234,45 @@ impl ClaimedSession {
         );
     }
 
+    fn restore_boot_context(&mut self) -> Result<RestoreBootContext, String> {
+        let is_mobile = self
+            .derived
+            .as_ref()
+            .is_some_and(|derived| !derived.is_macos);
+        let mut boot = match &self.context {
+            Ok(context) => context.restore.clone(),
+            Err(ClaimContextError::Unavailable(reason)) if is_mobile => {
+                let mut boot = self.claim.signing_context()?.unwrap_or_default();
+                boot.metadata_unavailable = Some(reason.clone());
+                boot
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        if boot.ap_nonce.is_none() && is_mobile {
+            boot.ap_nonce = match self.claim.ap_nonce() {
+                Ok(nonce) => nonce,
+                Err(error) => {
+                    self.context = Err(ClaimContextError::Failed(error.clone()));
+                    return Err(error);
+                }
+            };
+        }
+        if boot.sep_nonce.is_none() && is_mobile {
+            boot.sep_nonce = self.claim.sep_nonce()?;
+        }
+        Ok(boot)
+    }
+
     fn build_restore_plan(
         &mut self,
         sign_recovery_os_local_policy: bool,
+        fdr_material_directory: Option<&Path>,
     ) -> Result<RestorePlan, String> {
+        if self.context.is_err() {
+            self.context = self.claim.context();
+        }
+        self.restore_boot_context()?;
+        let context = self.context.as_ref().ok().cloned();
         if !self.pending_requests.is_empty() {
             return Err("More files are still required before restore can start".to_string());
         }
@@ -2789,10 +3350,64 @@ impl ClaimedSession {
             };
             let firmware_root = Some(overlay_path.clone());
 
+            let recovery_image = self.derived.as_ref().and_then(|derived| {
+                if derived.is_macos {
+                    Some(image_path.clone())
+                } else {
+                    derived.recovery_identity.as_ref().and_then(|identity| {
+                        let id = identity_component_request_id(
+                            &derived.install_identity,
+                            identity,
+                            "OS",
+                        );
+                        self.accepted_files
+                            .get(&id)
+                            .map(|accepted| overlay_path.join(&accepted.overlay_relative))
+                    })
+                }
+            });
+            let restore_ramdisk = self
+                .derived
+                .as_ref()
+                .and_then(|derived| {
+                    if derived.is_macos {
+                        return None;
+                    }
+                    let path = derived
+                        .install_identity
+                        .components
+                        .as_ref()?
+                        .get("RestoreRamDisk")?
+                        .as_dictionary()?
+                        .get("Info")?
+                        .as_dictionary()?
+                        .get("Path")?
+                        .as_string()?;
+                    Some((derived, path))
+                })
+                .map(|(derived, path)| {
+                    let request_id = identity_component_request_id(
+                        &derived.install_identity,
+                        &derived.install_identity,
+                        "RestoreRamDisk",
+                    );
+                    if let Some(accepted) = self.accepted_files.get(&request_id) {
+                        return validate_regular_source(
+                            &accepted.source,
+                            accepted.source_root.as_deref(),
+                        )
+                        .map(|(source, _)| source);
+                    }
+                    let relative =
+                        validate_manifest_relative_path(path, "RestoreRamDisk.Info.Path")?;
+                    validate_regular_source(&manifest_root.join(relative), Some(&manifest_root))
+                        .map(|(source, _)| source)
+                })
+                .transpose()?;
             let plan = RestorePlan {
                 image: image_path.clone(),
                 system_image: Some(image_path.clone()),
-                recovery_image: Some(image_path),
+                recovery_image,
                 image_root: Some(overlay_path.clone()),
                 manifest: Some(manifest_path),
                 behavior: self
@@ -2809,14 +3424,22 @@ impl ClaimedSession {
                 firmware_root,
                 bootability_bundle,
                 corrupt_manifest: false,
-                staged_boot_manifest_sha384: Some(self.bridge_context.staged_boot_manifest_sha384),
-                fdr_trust_digest: fdr_trust_digest_from_context(&self.bridge_context),
-                fdr_material_dir: self
-                    .bridge_context
-                    .fdr_material_path
-                    .clone()
-                    .map(PathBuf::from)
-                    .filter(|path| path.is_dir()),
+                staged_boot_manifest_sha384: context
+                    .as_ref()
+                    .map(|context| context.bridge.staged_boot_manifest_sha384),
+                staged_boot_manifest: context
+                    .as_ref()
+                    .and_then(|context| context.bridge.staged_boot_manifest.clone()),
+                fdr_trust_digest: context
+                    .as_ref()
+                    .and_then(|context| fdr_trust_digest_from_context(&context.bridge)),
+                restore_ramdisk,
+                fdr_material_dir: selected_fdr_material_directory(
+                    context
+                        .as_ref()
+                        .and_then(|context| context.bridge.fdr_material_path.as_deref()),
+                    fdr_material_directory,
+                )?,
                 sign_recovery_os_local_policy,
             };
             let prepared = prepare_restore_session_with_branching(
@@ -2897,6 +3520,38 @@ fn is_transient_discovery_error(error: &str) -> bool {
         || lower.contains("would block")
         || lower.contains("interrupted")
         || lower.contains("connection refused")
+}
+
+/// With the `ipsw` command installed the first thing asked for is the IPSW itself, since nothing
+/// needs unpacking or decrypting by hand. The request keeps its id and its plist spec inside the
+/// service, which still resolves the manifest from the staged tree; only what the user sees changes.
+fn ipsw_request_spec() -> FileRequestSpec {
+    FileRequestSpec {
+        request_id: MANIFEST_REQUEST_ID.to_string(),
+        role: "IPSW".to_string(),
+        preferred_name: None,
+        accepted_names: Vec::new(),
+        allowed_extensions: vec!["ipsw".to_string()],
+        accept_directory: false,
+        expected_size: None,
+        expected_hash: None,
+        detail: Some(
+            "Select the IPSW. Nothing needs extracting or decrypting first; files are unpacked only when the restore needs them."
+                .to_string(),
+        ),
+        required: true,
+    }
+}
+
+fn present_request(event: RecoveryEvent) -> RecoveryEvent {
+    match event {
+        RecoveryEvent::FileRequested(spec)
+            if spec.request_id == MANIFEST_REQUEST_ID && find_ipsw_cli().is_some() =>
+        {
+            RecoveryEvent::FileRequested(ipsw_request_spec())
+        }
+        other => other,
+    }
 }
 
 fn manifest_request_spec() -> FileRequestSpec {
@@ -3081,6 +3736,44 @@ fn component_request_id(component: &str) -> String {
     } else {
         format!("component:{component}")
     }
+}
+
+fn identity_component_request_id(
+    install: &BuildIdentity,
+    identity: &BuildIdentity,
+    name: &str,
+) -> String {
+    if identity.index == install.index
+        || path_for_component(identity, name)
+            .is_some_and(|path| Some(path) == path_for_component(install, name))
+    {
+        component_request_id(name)
+    } else {
+        format!("identity:{}:{name}", identity.index)
+    }
+}
+
+fn path_for_component(identity: &BuildIdentity, name: &str) -> Option<String> {
+    identity
+        .components
+        .as_ref()?
+        .get(name)?
+        .as_dictionary()?
+        .get("Info")?
+        .as_dictionary()?
+        .get("Path")?
+        .as_string()
+        .map(str::to_string)
+}
+
+fn pending_request_for_identity_component(
+    name: &str,
+    reason: &str,
+    request_id: &str,
+) -> PendingRequest {
+    let mut pending = pending_request_for_unresolved_component(name, reason);
+    pending.spec.request_id = request_id.to_string();
+    pending
 }
 
 fn pending_request_for_unresolved_component(name: &str, reason: &str) -> PendingRequest {
@@ -3277,11 +3970,21 @@ fn identities_for_board(
 ) -> Result<Vec<BuildIdentity>, String> {
     let install =
         select_install_identity(dict, device_class, behavior).map_err(|error| error.to_string())?;
+    let recovery = if let Some(macos) = select_macos_identity(dict, device_class) {
+        Some(macos)
+    } else if let Some(variant) = install.info_string("RecoveryVariant") {
+        Some(
+            select_recovery_identity(dict, device_class, variant)
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
     let mut identities = vec![install];
-    if let Some(macos) = select_macos_identity(dict, device_class)
-        && identities[0].index != macos.index
+    if let Some(recovery) = recovery
+        && identities[0].index != recovery.index
     {
-        identities.push(macos);
+        identities.push(recovery);
     }
     Ok(identities)
 }
@@ -3411,8 +4114,10 @@ fn identity_payload_sources(
     derived: &crate::restore::DerivedRestoreOptions,
 ) -> Vec<&BuildIdentity> {
     let mut identities = vec![&derived.install_identity];
-    if derived.macos_identity.index != derived.install_identity.index {
-        identities.push(&derived.macos_identity);
+    if let Some(recovery) = derived.recovery_identity.as_ref()
+        && recovery.index != derived.install_identity.index
+    {
+        identities.push(recovery);
     }
     identities
 }
@@ -3449,6 +4154,121 @@ fn resolve_system_image(
     identity: &BuildIdentity,
 ) -> Result<ComponentResolution, String> {
     resolve_identity_component(root, identity, "OS")
+}
+
+/// Files at the top of an IPSW that the catalog and version lookups read. They are small, so they
+/// are written as soon as the archive is opened.
+const IPSW_CATALOG_FILES: [&str; 4] = [
+    BUILD_MANIFEST_FILE_NAME,
+    RESTORE_PLIST_FILE_NAME,
+    RESTORE_VERSION_FILE_NAME,
+    SYSTEM_VERSION_FILE_NAME,
+];
+
+/// Directories the restore walks as trees rather than naming file by file.
+const IPSW_CATALOG_TREES: [&str; 2] = ["Firmware/Manifests", BUNDLE_ROOT_DIR];
+
+fn ipsw_missing_message<'a>(missing: impl Iterator<Item = &'a PendingRequest>) -> String {
+    let names = missing
+        .map(|pending| pending.component.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("The IPSW does not contain what this device needs: {names}")
+}
+
+fn is_ipsw_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ipsw"))
+        && path.is_file()
+}
+
+fn stage_ipsw_catalog(stage: &IpswStage) -> Result<(), String> {
+    for name in IPSW_CATALOG_FILES {
+        if stage.tree().contains_file(name) {
+            stage.stage(name).map_err(|error| error.to_string())?;
+        }
+    }
+    for prefix in IPSW_CATALOG_TREES {
+        if stage.tree().is_directory(prefix) {
+            stage
+                .stage_tree(prefix)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Writes the file `name` resolves to out of the IPSW, if `root` is the IPSW's staging root. A
+/// macOS image shipped as `.aea` is decrypted instead, since its restore options do not declare
+/// the wrapped format. A name the archive does not carry is left for the resolver to report.
+fn stage_ipsw_component(
+    ipsw: Option<&IpswStage>,
+    events: &SyncSender<RecoveryEvent>,
+    root: &Path,
+    identity: &BuildIdentity,
+    name: &str,
+) -> Result<(), String> {
+    let Some(stage) = ipsw.filter(|stage| stage.root() == root) else {
+        return Ok(());
+    };
+    let Some(path) = path_for_component(identity, name) else {
+        return Ok(());
+    };
+    let relative = validate_manifest_relative_path(&path, &format!("{name} Info/Path"))?;
+    let Some(entry) = relative.to_str() else {
+        return Ok(());
+    };
+    if !stage.tree().contains_file(entry) {
+        return Ok(());
+    }
+    let detail = relative
+        .file_name()
+        .and_then(|file| file.to_str())
+        .unwrap_or(entry)
+        .to_string();
+    let decrypt = entry.ends_with(".aea")
+        && identity.info_string("MacOSVariant").is_some()
+        && stage.has_cli();
+    if decrypt {
+        let plain = entry.strip_suffix(".aea").unwrap_or(entry);
+        if stage.staged_path(plain).is_file() {
+            return Ok(());
+        }
+        let _ = events.try_send(RecoveryEvent::Progress(RestoreProgress {
+            stage: "decrypting".into(),
+            detail,
+            fraction: None,
+        }));
+        return stage
+            .decrypt(entry)
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+    }
+    if stage.is_staged(entry) {
+        return Ok(());
+    }
+    stage
+        .stage_with_progress(entry, &mut |done, total| {
+            let _ = events.try_send(RecoveryEvent::Progress(RestoreProgress {
+                stage: "extracting".into(),
+                detail: detail.clone(),
+                fraction: (total > 0).then(|| done as f64 / total as f64),
+            }));
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn resolve_staged_component(
+    ipsw: Option<&IpswStage>,
+    events: &SyncSender<RecoveryEvent>,
+    root: &Path,
+    identity: &BuildIdentity,
+    component_name: &str,
+) -> Result<ComponentResolution, String> {
+    stage_ipsw_component(ipsw, events, root, identity, component_name)?;
+    resolve_identity_component(root, identity, component_name)
 }
 
 fn resolve_identity_component(
@@ -3586,6 +4406,75 @@ fn resolve_identity_component(
         manifest_file_name,
         spec,
     })
+}
+
+fn configured_fdr_material_directory(
+    configured: Option<&std::ffi::OsStr>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(configured) = configured else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(configured);
+    let metadata = std::fs::metadata(&path).map_err(|error| {
+        format!(
+            "fdr-material-path-unreadable: configured directory {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "fdr-material-path-not-directory: configured path {}",
+            path.display()
+        ));
+    }
+    Ok(Some(path))
+}
+
+fn selected_fdr_material_directory(
+    bridged: Option<&std::ffi::OsStr>,
+    selected: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    if let Some(bridged) = configured_fdr_material_directory(bridged)? {
+        if let Some(selected) = selected
+            && selected != bridged
+        {
+            return Err(format!(
+                "fdr-material-path-conflict: selected {} differs from bridged {}",
+                selected.display(),
+                bridged.display()
+            ));
+        }
+        return Ok(Some(bridged));
+    }
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    match std::fs::metadata(selected) {
+        Ok(metadata) if metadata.is_dir() => Ok(Some(selected.to_path_buf())),
+        Ok(_) => Err(format!(
+            "fdr-material-path-not-directory: selected path {}",
+            selected.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = selected.parent().ok_or_else(|| {
+                format!(
+                    "fdr-material-path-no-parent: selected path {}",
+                    selected.display()
+                )
+            })?;
+            if !parent.is_dir() {
+                return Err(format!(
+                    "fdr-material-parent-not-directory: selected path {}",
+                    parent.display()
+                ));
+            }
+            Ok(Some(selected.to_path_buf()))
+        }
+        Err(error) => Err(format!(
+            "fdr-material-path-unreadable: selected path {}: {error}",
+            selected.display()
+        )),
+    }
 }
 
 fn fdr_trust_digest_from_context(context: &BridgeBootContext) -> Option<FdrTrustDigest> {
@@ -4200,12 +5089,44 @@ fn materialize_accepted_file(
 }
 
 fn link_exact_file(source: &Path, destination: &Path) -> Result<(), String> {
-    link_exact_file_with(source, destination, |source, destination| {
-        fs::hard_link(source, destination)
-    })
+    use std::os::unix::fs::MetadataExt as _;
+
+    let source_device = fs::metadata(source)
+        .map_err(|error| {
+            format!(
+                "Could not inspect staged source {}: {error}",
+                source.display()
+            )
+        })?
+        .dev();
+    let destination_parent = destination.parent().ok_or_else(|| {
+        format!(
+            "Staged destination has no parent: {}",
+            destination.display()
+        )
+    })?;
+    let destination_device = fs::metadata(destination_parent)
+        .map_err(|error| {
+            format!(
+                "Could not inspect staged destination parent {}: {error}",
+                destination_parent.display()
+            )
+        })?
+        .dev();
+    link_exact_file_with(
+        source,
+        destination,
+        source_device == destination_device,
+        |source, destination| fs::hard_link(source, destination),
+    )
 }
 
-fn link_exact_file_with<F>(source: &Path, destination: &Path, hard_link: F) -> Result<(), String>
+fn link_exact_file_with<F>(
+    source: &Path,
+    destination: &Path,
+    same_device: bool,
+    hard_link: F,
+) -> Result<(), String>
 where
     F: FnOnce(&Path, &Path) -> io::Result<()>,
 {
@@ -4228,6 +5149,15 @@ where
                 destination.display()
             ));
         }
+    }
+    if !same_device {
+        return symlink(source, destination).map_err(|error| {
+            format!(
+                "Could not link staged file {} to {}: {error}",
+                source.display(),
+                destination.display()
+            )
+        });
     }
     match hard_link(source, destination) {
         Ok(()) => Ok(()),
@@ -4310,10 +5240,8 @@ fn relative_under(root: &Path, path: &Path) -> Option<PathBuf> {
     path.strip_prefix(root).ok().map(Path::to_path_buf)
 }
 
-fn create_overlay_root() -> Result<TempDir, String> {
-    TempDirBuilder::new()
-        .prefix("apple-utils-restore-overlay-")
-        .tempdir()
+fn create_overlay_root() -> Result<crate::scratch::ScratchDir, String> {
+    crate::scratch::ScratchDir::new("apple-utils-restore-overlay-")
         .map_err(|error| format!("Could not create restore staging directory: {error}"))
 }
 
@@ -4455,6 +5383,99 @@ mod tests {
     use tempfile::TempDir;
     use tempfile::tempdir;
 
+    #[test]
+    fn configured_fdr_material_directory_retains_the_operator_path() {
+        let material = tempdir().unwrap();
+        let configured = material.path().as_os_str();
+        assert_eq!(
+            configured_fdr_material_directory(Some(configured)).unwrap(),
+            Some(material.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn selected_fdr_material_directory_keeps_stock_ticket_service_material_separate() {
+        let bundle = tempdir().unwrap();
+        let selected = bundle.path().join("device-material");
+        assert_eq!(
+            selected_fdr_material_directory(None, Some(&selected)).unwrap(),
+            Some(selected.clone())
+        );
+        std::fs::create_dir(&selected).unwrap();
+        assert_eq!(
+            selected_fdr_material_directory(Some(selected.as_os_str()), Some(&selected)).unwrap(),
+            Some(selected)
+        );
+    }
+
+    #[test]
+    fn selected_fdr_material_directory_refuses_conflicting_bridge_material() {
+        let bundle = tempdir().unwrap();
+        let bridged = bundle.path().join("bridged");
+        let selected = bundle.path().join("selected");
+        std::fs::create_dir(&bridged).unwrap();
+        let error = selected_fdr_material_directory(Some(bridged.as_os_str()), Some(&selected))
+            .unwrap_err();
+        assert!(error.contains("fdr-material-path-conflict"), "{error}");
+    }
+
+    #[test]
+    fn configured_fdr_material_directory_preserves_unicode_path_bytes() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let material = tempdir().unwrap();
+        let configured = material.path().join("fdr-é");
+        std::fs::create_dir(&configured).unwrap();
+        let resolved = configured_fdr_material_directory(Some(configured.as_os_str()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resolved.as_os_str().as_bytes(),
+            configured.as_os_str().as_bytes()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn configured_fdr_material_directory_unsupported_path_bytes_are_refused_by_name() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let material = tempdir().unwrap();
+        let configured = material
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"fdr-\xff"));
+        let error = configured_fdr_material_directory(Some(configured.as_os_str())).unwrap_err();
+        assert!(error.contains("fdr-material-path-unreadable"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configured_fdr_material_directory_preserves_non_utf8_path_bytes() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let material = tempdir().unwrap();
+        let configured = material
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"fdr-\xff"));
+        std::fs::create_dir(&configured).unwrap();
+        let resolved = configured_fdr_material_directory(Some(configured.as_os_str()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resolved.as_os_str().as_bytes(),
+            configured.as_os_str().as_bytes()
+        );
+    }
+
+    #[test]
+    fn configured_fdr_material_directory_failures_are_named() {
+        let material = tempdir().unwrap();
+        let missing = material.path().join("requested-material");
+        let error = configured_fdr_material_directory(Some(missing.as_os_str())).unwrap_err();
+        assert!(error.contains("fdr-material-path-unreadable"), "{error}");
+        let file = material.path().join("configured-file");
+        std::fs::write(&file, b"explicit input").unwrap();
+        let error = configured_fdr_material_directory(Some(file.as_os_str())).unwrap_err();
+        assert!(error.contains("fdr-material-path-not-directory"), "{error}");
+    }
+
     #[derive(Default)]
     struct RecordingReporter {
         lines: Vec<String>,
@@ -4502,12 +5523,21 @@ mod tests {
         claims: Mutex<Vec<(String, Arc<FakeClaimedRestore>)>>,
     }
 
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    enum TestBootContextStatus {
+        #[default]
+        Available,
+        Unavailable,
+        Fatal,
+    }
+
     #[derive(Debug, Default, Clone)]
     struct RealBackendTranscript {
         list_requests: u32,
         claim_generations: Vec<u64>,
         claim_device_ids: Vec<String>,
         boot_context_requests: u32,
+        boot_context_status: TestBootContextStatus,
         query_type_requests: u32,
         detach_outcomes: Vec<bridge_protocol::DetachOutcome>,
         handshake_only_closes: u32,
@@ -4782,17 +5812,24 @@ mod tests {
         }
     }
 
+    type ApNonceResponse = Result<Option<[u8; BOOT_NONCE_HASH_BYTES]>, String>;
+
     #[derive(Clone)]
     struct FakeClaimedRestore {
         device_id: String,
         detail: Option<String>,
-        context: ClaimedBootContext,
+        context: Result<ClaimedBootContext, ClaimContextError>,
+        signing_context: Option<RestoreBootContext>,
         device: DeviceType,
         identify_error: Option<String>,
+        queried_ap_nonce: Option<[u8; BOOT_NONCE_HASH_BYTES]>,
+        ap_nonce_responses: Arc<Mutex<VecDeque<ApNonceResponse>>>,
+        ap_nonce_queries: Arc<AtomicU64>,
         outcome: FakeOutcome,
         detach_requests: Arc<Mutex<Vec<HostDetachDisposition>>>,
         aborts: Arc<AtomicU64>,
         captured_plans: Arc<Mutex<Vec<RestorePlan>>>,
+        captured_boot_contexts: Arc<Mutex<Vec<RestoreBootContext>>>,
     }
 
     #[derive(Clone)]
@@ -4833,13 +5870,18 @@ mod tests {
             Arc::new(FakeClaimedRestore {
                 device_id: device_id.to_string(),
                 detail: detail.map(str::to_string),
-                context: sample_context(),
+                context: Ok(sample_context()),
+                signing_context: None,
                 device: device_reporting("J274AP"),
                 identify_error,
+                queried_ap_nonce: None,
+                ap_nonce_responses: Arc::new(Mutex::new(VecDeque::new())),
+                ap_nonce_queries: Arc::new(AtomicU64::new(0)),
                 outcome,
                 detach_requests: Arc::new(Mutex::new(Vec::new())),
                 aborts: Arc::new(AtomicU64::new(0)),
                 captured_plans: Arc::new(Mutex::new(Vec::new())),
+                captured_boot_contexts: Arc::new(Mutex::new(Vec::new())),
             })
         }
 
@@ -4865,8 +5907,27 @@ mod tests {
             self.detail.as_deref()
         }
 
-        fn context(&self) -> ClaimedBootContext {
+        fn context(&self) -> Result<ClaimedBootContext, ClaimContextError> {
             self.context.clone()
+        }
+
+        fn signing_context(&self) -> Result<Option<RestoreBootContext>, String> {
+            Ok(self.signing_context.clone())
+        }
+
+        fn ap_nonce(&self) -> Result<Option<[u8; BOOT_NONCE_HASH_BYTES]>, String> {
+            self.ap_nonce_queries.fetch_add(1, Ordering::Relaxed);
+            if let Some(response) = self.ap_nonce_responses.lock().unwrap().pop_front() {
+                return response;
+            }
+            if let Some(nonce) = self.queried_ap_nonce {
+                return Ok(Some(nonce));
+            }
+            match &self.context {
+                Ok(context) => Ok(context.restore.ap_nonce),
+                Err(ClaimContextError::Unavailable(_)) => Ok(None),
+                Err(error) => Err(error.to_string()),
+            }
         }
 
         fn identify(&self) -> Result<DeviceType, String> {
@@ -4892,12 +5953,13 @@ mod tests {
 
         fn run_restore(
             &self,
-            _boot: RestoreBootContext,
+            boot: RestoreBootContext,
             plan: RestorePlan,
             _image_size: u64,
             stop: Arc<AtomicBool>,
             _reporter: crate::restore::SharedReporter,
         ) -> RestoreOutcome {
+            self.captured_boot_contexts.lock().unwrap().push(boot);
             self.captured_plans.lock().unwrap().push(plan);
             match self.outcome {
                 FakeOutcome::Success => RestoreOutcome::Ended {
@@ -4925,9 +5987,12 @@ mod tests {
         crate::ramrod::RestoreSummary {
             data_requests: 0,
             bulk_transfers: 1,
+            bulk_received: 0,
+            bulk_received_bytes: 0,
             async_data_requests: 0,
             async_waits: 0,
             bulk_declined: 0,
+            bulk_cancelled: 0,
             bulk_empty: 0,
             progress_messages: 1,
             status_messages: 1,
@@ -4980,9 +6045,56 @@ mod tests {
         assert_eq!(guest_failure_note(&summary), "AMRestoreErrorDomain/78");
     }
 
+    #[test]
+    fn the_terminal_guest_error_takes_precedence_over_an_endured_firmware_error() {
+        let mut summary = fake_summary(false);
+        summary.guest_log = Some(
+            "[0]D(_update_generic_firmware: failed to execute queryInfo on AppleTypeCRetimer updater)\nrestore failed with CFError:\n0: AMRestoreErrorDomain/ffffffffffffffff: Creating protected volumes failed.\n"
+                .into(),
+        );
+        summary.checkpoint_error = Some(
+            "[0]D(_update_generic_firmware: failed to execute queryInfo on AppleTypeCRetimer updater)"
+                .into(),
+        );
+        assert_eq!(
+            guest_failure_note(&summary),
+            "Creating protected volumes failed."
+        );
+    }
+
+    #[test]
+    fn the_terminal_checkpoint_failure_takes_precedence_when_the_status_log_ends_early() {
+        let mut summary = fake_summary(false);
+        summary.guest_log = Some(
+            "CHECKPOINT FAILURE: [0x1318] update_usbcretimer [0]D(_update_generic_firmware: failed to execute queryInfo on AppleTypeCRetimer updater)\nCHECKPOINT FAILURE: [0x0674] create_protected_filesystems [0]D(Creating protected volumes failed.)\nCHECKPOINT FAILURE: [0x067B] perform_restore_installing [0]D(Creating protected volumes failed.)\nCHECKPOINT BEGIN: [0x0648] cleanup_send_final_status\n"
+                .into(),
+        );
+        summary.checkpoint_error = Some(
+            "[0]D(_update_generic_firmware: failed to execute queryInfo on AppleTypeCRetimer updater)"
+                .into(),
+        );
+        assert_eq!(
+            guest_failure_note(&summary),
+            "Creating protected volumes failed."
+        );
+    }
+
+    #[test]
+    fn an_open_checkpoint_identifies_the_interrupted_stage_without_claiming_it_failed() {
+        let mut summary = fake_summary(false);
+        summary.status_messages = 0;
+        summary.final_status = None;
+        summary.open_checkpoint = Some("update_savage".into());
+        assert_eq!(
+            guest_failure_note(&summary),
+            "Restore session closed while update_savage was open; no final status received"
+        );
+    }
+
     fn sample_context() -> ClaimedBootContext {
         let bridge = BridgeBootContext {
             staged_boot_manifest_sha384: [2; 48],
+            staged_boot_manifest: None,
             ap_nonce: Some([1; BOOT_NONCE_HASH_BYTES]),
             fdr_element_index: 0,
             fdr_element_count: 0,
@@ -5522,6 +6634,7 @@ mod tests {
     fn sample_bridge_boot_context() -> BootContext {
         BootContext {
             staged_boot_manifest_sha384: [2; 48],
+            staged_boot_manifest: None,
             ap_nonce: Some([1; BOOT_NONCE_HASH_BYTES]),
             fdr_element_index: 0,
             fdr_element_count: 0,
@@ -5658,7 +6771,37 @@ mod tests {
             };
             match frame.header.kind {
                 RecordKind::GetBootContext => {
-                    transcript.lock().unwrap().boot_context_requests += 1;
+                    let status = {
+                        let mut transcript = transcript.lock().unwrap();
+                        transcript.boot_context_requests += 1;
+                        transcript.boot_context_status
+                    };
+                    if status != TestBootContextStatus::Available {
+                        write_json_frame(
+                            &mut stream,
+                            RecordKind::Error,
+                            frame.header.request_id,
+                            91,
+                            9191,
+                            &ErrorRecord {
+                                code: if status == TestBootContextStatus::Fatal {
+                                    "internal".to_string()
+                                } else {
+                                    "bootContextUnavailable".to_string()
+                                },
+                                detail: if status == TestBootContextStatus::Fatal {
+                                    "boot context request failed".to_string()
+                                } else {
+                                    "launch did not retain a frozen boot context".to_string()
+                                },
+                                fatal: status == TestBootContextStatus::Fatal,
+                                retryable: status == TestBootContextStatus::Unavailable,
+                                current_revision: None,
+                                current_generation: Some(91),
+                            },
+                        );
+                        continue;
+                    }
                     write_frame(
                         &mut stream,
                         RecordHeader {
@@ -6179,7 +7322,7 @@ mod tests {
         fs::write(&source, b"firmware payload").unwrap();
         let source = fs::canonicalize(source).unwrap();
 
-        link_exact_file_with(&source, &destination, |_, _| {
+        link_exact_file_with(&source, &destination, true, |_, _| {
             Err(io::Error::from_raw_os_error(libc::EXDEV))
         })
         .unwrap();
@@ -6191,6 +7334,23 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read_link(destination).unwrap(), source);
+    }
+
+    #[test]
+    fn staging_across_devices_links_the_exact_source_without_attempting_a_hard_link() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("payload.im4p");
+        let destination = directory.path().join("staged.im4p");
+        fs::write(&source, b"firmware payload").unwrap();
+        let source = fs::canonicalize(source).unwrap();
+
+        link_exact_file_with(&source, &destination, false, |_, _| {
+            panic!("a hard link cannot cross device boundaries")
+        })
+        .unwrap();
+
+        assert_eq!(fs::read_link(&destination).unwrap(), source);
+        assert_eq!(fs::read(&destination).unwrap(), b"firmware payload");
     }
 
     #[test]
@@ -6579,11 +7739,28 @@ mod tests {
 
     #[test]
     fn real_backend_socket_discovery_claim_identify_and_release_detach() {
+        real_backend_claim_identify_and_release(TestBootContextStatus::Available);
+    }
+
+    #[test]
+    fn real_backend_claim_identifies_with_unavailable_boot_context() {
+        real_backend_claim_identify_and_release(TestBootContextStatus::Unavailable);
+    }
+
+    #[test]
+    fn real_backend_fatal_boot_context_failure_rejects_and_detaches() {
+        real_backend_claim_identify_and_release(TestBootContextStatus::Fatal);
+    }
+
+    fn real_backend_claim_identify_and_release(boot_context_status: TestBootContextStatus) {
         let _env_guard = test_env_lock().lock().unwrap();
         let root = temp_socket_dir();
         let socket_path = broker_socket_path(&root);
         let listener = bind_listener(&socket_path);
-        let transcript = Arc::new(Mutex::new(RealBackendTranscript::default()));
+        let transcript = Arc::new(Mutex::new(RealBackendTranscript {
+            boot_context_status,
+            ..RealBackendTranscript::default()
+        }));
         let server_transcript = Arc::clone(&transcript);
         let server = thread::spawn(move || {
             listener.set_nonblocking(true).unwrap();
@@ -6657,40 +7834,71 @@ mod tests {
             .unwrap();
         let claimed = wait_for_with_timeout(&mut service, Duration::from_secs(10), |events| {
             events.iter().any(|event| {
-                matches!(event, RecoveryEvent::FileRequested(spec) if spec.request_id == MANIFEST_REQUEST_ID)
+                if boot_context_status == TestBootContextStatus::Fatal {
+                    matches!(event, RecoveryEvent::ClaimRejected { device_id, .. } if device_id == &stable_id)
+                } else {
+                    matches!(event, RecoveryEvent::FileRequested(spec) if spec.request_id == MANIFEST_REQUEST_ID)
+                }
             })
         });
         let transcript_snapshot = format!("{:?}", *transcript.lock().unwrap());
-        assert!(
-            claimed.iter().any(|event| matches!(
+        if boot_context_status == TestBootContextStatus::Fatal {
+            assert!(claimed.iter().any(|event| matches!(
                 event,
-                RecoveryEvent::ClaimAccepted { device_id, .. } if device_id == &stable_id
-            )),
-            "events={claimed:?} transcript={transcript_snapshot}"
-        );
-        assert!(
-            claimed.iter().any(|event| matches!(
-                event,
-                RecoveryEvent::FileRequested(spec) if spec.request_id == MANIFEST_REQUEST_ID
-            )),
-            "events={claimed:?} transcript={transcript_snapshot}"
-        );
+                RecoveryEvent::ClaimRejected { device_id, reason }
+                    if device_id == &stable_id && reason == "internal: boot context request failed"
+            )), "events={claimed:?} transcript={transcript_snapshot}");
+        } else {
+            assert!(
+                claimed.iter().any(|event| matches!(
+                    event,
+                    RecoveryEvent::ClaimAccepted { device_id, .. } if device_id == &stable_id
+                )),
+                "events={claimed:?} transcript={transcript_snapshot}"
+            );
+            assert!(
+                claimed.iter().any(|event| matches!(
+                    event,
+                    RecoveryEvent::FileRequested(spec) if spec.request_id == MANIFEST_REQUEST_ID
+                )),
+                "events={claimed:?} transcript={transcript_snapshot}"
+            );
+        }
 
-        service
-            .send(RecoveryCommand::ReleaseDevice {
-                device_id: stable_id.clone(),
-            })
-            .unwrap();
-        let released = wait_for(&mut service, |events| {
-            events.iter().any(|event| {
-                matches!(event, RecoveryEvent::Released { device_id, .. } if device_id == &stable_id)
-            })
-        });
-        assert!(released.iter().any(|event| matches!(
-            event,
-            RecoveryEvent::Released { device_id, note }
-                if device_id == &stable_id && note.as_deref() == Some("Claim released")
-        )));
+        for result in ["version-negotiated", "session-established"] {
+            assert!(
+                claimed.iter().any(|event| matches!(
+                    event,
+                    RecoveryEvent::Log { message, .. } if message.contains(result)
+                )),
+                "events={claimed:?}"
+            );
+        }
+        if boot_context_status == TestBootContextStatus::Unavailable {
+            assert!(claimed.iter().any(|event| matches!(
+                event,
+                RecoveryEvent::Log { message, .. }
+                    if message.contains("Connected to restored; restore metadata unavailable: bootContextUnavailable")
+            )), "events={claimed:?}");
+        }
+
+        if boot_context_status != TestBootContextStatus::Fatal {
+            service
+                .send(RecoveryCommand::ReleaseDevice {
+                    device_id: stable_id.clone(),
+                })
+                .unwrap();
+            let released = wait_for(&mut service, |events| {
+                events.iter().any(|event| {
+                    matches!(event, RecoveryEvent::Released { device_id, .. } if device_id == &stable_id)
+                })
+            });
+            assert!(released.iter().any(|event| matches!(
+                event,
+                RecoveryEvent::Released { device_id, note }
+                    if device_id == &stable_id && note.as_deref() == Some("Claim released")
+            )));
+        }
         drop(service);
         unsafe {
             std::env::remove_var("APPLE_UTILS_RESTORE_BRIDGE_DIR");
@@ -6704,13 +7912,251 @@ mod tests {
         assert_eq!(transcript.query_type_requests, 1);
         assert_eq!(
             transcript.detach_outcomes,
-            vec![bridge_protocol::DetachOutcome::Cancelled]
+            vec![if boot_context_status == TestBootContextStatus::Fatal {
+                bridge_protocol::DetachOutcome::Failed
+            } else {
+                bridge_protocol::DetachOutcome::Cancelled
+            }]
         );
         assert!(transcript.saw_claim_stream_eof);
         assert!(!transcript.accept_loop_timed_out, "{transcript:?}");
         assert_eq!(transcript.claim_read_timeouts, 0, "{transcript:?}");
         assert!(transcript.handler_errors.is_empty(), "{transcript:?}");
         assert!(transcript.credit_to_host_frames >= 4, "{transcript:?}");
+    }
+
+    #[test]
+    fn restore_plan_reports_unavailable_boot_context() {
+        let reason = "bootContextUnavailable: launch did not retain a frozen boot context";
+        let mut claim = FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success);
+        Arc::get_mut(&mut claim).unwrap().context =
+            Err(ClaimContextError::Unavailable(reason.to_string()));
+        let mut session = ClaimedSession::new(
+            claim,
+            Err(ClaimContextError::Unavailable(reason.to_string())),
+            device_reporting("J274AP"),
+        );
+
+        assert_eq!(session.build_restore_plan(false, None).unwrap_err(), reason);
+    }
+
+    #[test]
+    fn terminal_boot_context_retry_detaches_and_releases_the_claim() {
+        let reason = "GetBootContext request timed out";
+        let mut claim = FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success);
+        Arc::get_mut(&mut claim).unwrap().context =
+            Err(ClaimContextError::Failed(reason.to_string()));
+        let backend = Arc::new(FakeBackend::new(
+            BackendDiscovery {
+                devices: vec![broker_device("vm-1")],
+            },
+            Arc::clone(&claim),
+        ));
+        let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_QUEUE_BOUND);
+        let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_BOUND);
+        let mut worker = ServiceWorker::new(backend, command_rx, event_tx);
+        worker.session = Some(ClaimedSession::new(
+            claim.clone(),
+            Err(ClaimContextError::Unavailable(
+                "bootContextUnavailable".to_string(),
+            )),
+            device_reporting("J274AP"),
+        ));
+
+        worker.start_restore("vm-1");
+        let events = drained(&event_rx);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                RecoveryEvent::Released { device_id, .. } if device_id == "vm-1"
+            )),
+            "events={events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                RecoveryEvent::Failed { note } if note == reason
+            )),
+            "events={events:?}"
+        );
+        assert_eq!(claim.detach_requests(), vec![HostDetachDisposition::Failed]);
+        drop(command_tx);
+    }
+
+    fn assert_terminal_ap_nonce_failure_releases_and_allows_a_fresh_claim(
+        metadata_unavailable: bool,
+        successful_queries: u64,
+    ) {
+        let directory = tempdir().unwrap();
+        let image_body = b"install image";
+        let manifest = Value::Dictionary(Dictionary::from_iter([(
+            "BuildIdentities".to_string(),
+            Value::Array(vec![build_identity(
+                "J620AP",
+                "Developer Erase Install (IPSW)",
+                "Erase",
+                "Developer Erase Install (IPSW)",
+                &crate::crypto::sha384(image_body),
+            )]),
+        )]));
+        let manifest_path = directory.path().join(BUILD_MANIFEST_FILE_NAME);
+        write_manifest(&manifest_path, &manifest);
+        fs::write(directory.path().join("058-12345-001.dmg.aea"), image_body).unwrap();
+        let reason = "GetApNonce request timed out";
+        let mut claim = FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success);
+        let mutable = Arc::get_mut(&mut claim).unwrap();
+        mutable.device = device_reporting("J620AP");
+        mutable.context = if metadata_unavailable {
+            Err(ClaimContextError::Unavailable(
+                "bootContextUnavailable: metadata not retained".to_string(),
+            ))
+        } else {
+            let mut context = sample_context();
+            context.restore.ap_nonce = None;
+            context.bridge.ap_nonce = None;
+            Ok(context)
+        };
+        let mut responses = mutable.ap_nonce_responses.lock().unwrap();
+        for _ in 0..successful_queries {
+            responses.push_back(Ok(None));
+        }
+        responses.push_back(Err(reason.to_string()));
+        drop(responses);
+        let mut fresh =
+            FakeClaimedRestore::new("vm-1", Some("Fresh claim accepted"), FakeOutcome::Success);
+        Arc::get_mut(&mut fresh).unwrap().device = device_reporting("J620AP");
+        let backend = Arc::new(FakeBackend::with_claims(
+            BackendDiscovery {
+                devices: vec![broker_device("vm-1")],
+            },
+            vec![claim.clone(), fresh.clone()],
+        ));
+        let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_QUEUE_BOUND);
+        let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_BOUND);
+        let mut worker = ServiceWorker::new(backend, command_rx, event_tx);
+        worker.refresh_discovery();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        worker.prepared = Some(PreparedRestore {
+            accepted: HashMap::from([(
+                MANIFEST_REQUEST_ID.to_string(),
+                AcceptedFile {
+                    source: manifest_path,
+                    overlay_relative: PathBuf::from(BUILD_MANIFEST_FILE_NAME),
+                    expected_hash: None,
+                    source_root: Some(root.clone()),
+                },
+            )]),
+            pending: BTreeMap::new(),
+            manifest_root: Some(root),
+            selected_class: Some("J620AP".to_string()),
+            selected_behavior: Some(RestoreBehavior::Erase),
+        });
+        worker.claim_device("vm-1");
+        assert_eq!(
+            worker
+                .session
+                .as_ref()
+                .unwrap()
+                .derived
+                .as_ref()
+                .unwrap()
+                .behavior,
+            RestoreBehavior::Erase
+        );
+        drained(&event_rx);
+
+        worker.start_restore("vm-1");
+        let events = drained(&event_rx);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                RecoveryEvent::Released { device_id, .. } if device_id == "vm-1"
+            )),
+            "events={events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                RecoveryEvent::Failed { note } if note == reason
+            )),
+            "events={events:?}"
+        );
+        assert_eq!(
+            claim.ap_nonce_queries.load(Ordering::Relaxed),
+            successful_queries + 1
+        );
+        assert_eq!(claim.detach_requests(), vec![HostDetachDisposition::Failed]);
+        worker.claim_device("vm-1");
+        let fresh_claim: Arc<dyn ClaimedRestore> = fresh;
+        assert!(Arc::ptr_eq(
+            &worker.session.as_ref().unwrap().claim,
+            &fresh_claim
+        ));
+        assert_eq!(
+            worker
+                .session
+                .as_ref()
+                .unwrap()
+                .context
+                .as_ref()
+                .map_err(ToString::to_string)
+                .unwrap()
+                .restore
+                .ap_nonce,
+            Some([1; BOOT_NONCE_HASH_BYTES]),
+        );
+        assert!(drained(&event_rx).iter().any(|event| matches!(
+            event,
+            RecoveryEvent::ClaimAccepted { device_id, note }
+                if device_id == "vm-1" && note.as_deref() == Some("Fresh claim accepted")
+        )));
+        assert_eq!(claim.detach_requests(), vec![HostDetachDisposition::Failed]);
+        worker.shutdown();
+        drop(command_tx);
+    }
+
+    #[test]
+    fn terminal_ap_nonce_plan_query_detaches_releases_and_allows_a_fresh_claim() {
+        for metadata_unavailable in [false, true] {
+            assert_terminal_ap_nonce_failure_releases_and_allows_a_fresh_claim(
+                metadata_unavailable,
+                0,
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_ap_nonce_start_query_detaches_releases_and_allows_a_fresh_claim() {
+        for metadata_unavailable in [false, true] {
+            assert_terminal_ap_nonce_failure_releases_and_allows_a_fresh_claim(
+                metadata_unavailable,
+                1,
+            );
+        }
+    }
+
+    #[test]
+    fn restore_plan_retries_boot_context_after_initial_refusal() {
+        let claim = FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success);
+        let mut session = ClaimedSession::new(
+            claim,
+            Err(ClaimContextError::Unavailable(
+                "bootContextUnavailable: launch did not retain a frozen boot context".to_string(),
+            )),
+            device_reporting("J274AP"),
+        );
+
+        assert_eq!(
+            session.build_restore_plan(false, None).unwrap_err(),
+            "BuildManifest.plist has not been accepted yet",
+        );
+        let context = session
+            .context
+            .as_ref()
+            .map_err(ToString::to_string)
+            .unwrap();
+        assert_eq!(context.bridge.staged_boot_manifest_sha384, [2; 48]);
+        assert_eq!(context.restore.ap_nonce, Some([1; BOOT_NONCE_HASH_BYTES]));
     }
 
     #[test]
@@ -6789,6 +8235,394 @@ mod tests {
                 }
             )
         }));
+    }
+
+    #[test]
+    fn prepared_manifest_refusal_reaches_the_ui_instead_of_restarting() {
+        use crate::recovery_model::{RecoveryStep, RequestResolution};
+        use crate::recovery_runtime::{ChannelRecoveryService, RecoveryRuntime};
+
+        let directory = tempdir().unwrap();
+        let manifest_path = directory.path().join(BUILD_MANIFEST_FILE_NAME);
+        let value = Value::Dictionary(Dictionary::from_iter([(
+            "BuildIdentities".to_string(),
+            Value::Array(vec![
+                build_identity(
+                    "J620AP",
+                    "Developer Upgrade Install (IPSW)",
+                    "Update",
+                    "Developer Upgrade Install (IPSW)",
+                    &[],
+                ),
+                build_identity(
+                    "J620AP",
+                    "Recovery Customer Install",
+                    "Erase",
+                    "Recovery Customer Install",
+                    &[],
+                ),
+            ]),
+        )]));
+        write_manifest(&manifest_path, &value);
+        let mut claim = FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success);
+        Arc::get_mut(&mut claim).unwrap().device = device_reporting("J620AP");
+        let backend = Arc::new(FakeBackend::new(
+            BackendDiscovery {
+                devices: vec![broker_device("vm-1")],
+            },
+            claim,
+        ));
+        let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_QUEUE_BOUND);
+        let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_BOUND);
+        let mut worker = ServiceWorker::new(backend, command_rx, event_tx);
+        worker.refresh_discovery();
+        worker.prepared = Some(PreparedRestore {
+            accepted: HashMap::from([(
+                MANIFEST_REQUEST_ID.to_string(),
+                AcceptedFile {
+                    source: manifest_path.clone(),
+                    overlay_relative: PathBuf::from(BUILD_MANIFEST_FILE_NAME),
+                    expected_hash: None,
+                    source_root: Some(directory.path().to_path_buf()),
+                },
+            )]),
+            pending: BTreeMap::new(),
+            manifest_root: Some(directory.path().to_path_buf()),
+            selected_class: Some("J620AP".to_string()),
+            selected_behavior: Some(RestoreBehavior::Erase),
+        });
+        let (service, bridge) = ChannelRecoveryService::pair();
+        let mut runtime = RecoveryRuntime::from_service(service);
+        runtime
+            .model
+            .apply_event(RecoveryEvent::FileRequested(manifest_request_spec()));
+        let file = inspect(manifest_path.to_str().unwrap()).unwrap();
+        runtime
+            .model
+            .note_clipboard_assignment(&file, "Submitted".to_string());
+        runtime.model.apply_event(RecoveryEvent::FileAccepted {
+            request_id: MANIFEST_REQUEST_ID.to_string(),
+            note: None,
+        });
+
+        worker.claim_device("vm-1");
+        for event in drained(&event_rx) {
+            bridge.emit(event).unwrap();
+            runtime.prepare();
+            while let Ok(command) = bridge.recv_command() {
+                worker.handle_command(command);
+            }
+        }
+        for _ in 0..3 {
+            while let Ok(command) = bridge.recv_command() {
+                worker.handle_command(command);
+            }
+            for event in drained(&event_rx) {
+                bridge.emit(event).unwrap();
+            }
+            runtime.prepare();
+        }
+
+        assert_eq!(runtime.model.claimed_device_id.as_deref(), Some("vm-1"));
+        assert_eq!(
+            runtime.model.phase,
+            SessionPhase::Failed,
+            "status={} events={:?}",
+            runtime.model.status_message,
+            runtime.model.logs
+        );
+        assert_eq!(runtime.model.step(), RecoveryStep::Done);
+        assert!(
+            runtime
+                .model
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("no-install-identity")
+        );
+        assert!(matches!(
+            runtime.model.requests[0].resolution,
+            RequestResolution::Missing
+        ));
+        drop(command_tx);
+    }
+
+    #[test]
+    fn recovery_digest_is_checked_when_an_install_filename_is_reused() {
+        let directory = tempdir().unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let install_dir = root.join("Install");
+        let recovery_dir = root.join("Recovery");
+        fs::create_dir(&install_dir).unwrap();
+        fs::create_dir(&recovery_dir).unwrap();
+        let install_file = install_dir.join("image.dmg");
+        let recovery_file = recovery_dir.join("image.dmg");
+        fs::write(&install_file, b"install bytes").unwrap();
+        fs::write(&recovery_file, b"recovery bytes").unwrap();
+        let hash = |bytes: &[u8]| HashExpectation {
+            algorithm: "sha2-384".to_string(),
+            value: hex_digest(&crate::crypto::sha384(bytes)),
+        };
+        let recovery_hash = hash(b"recovery bytes");
+        let claim = FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success);
+        let backend = Arc::new(FakeBackend::new(
+            BackendDiscovery { devices: vec![] },
+            claim.clone(),
+        ));
+        let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_QUEUE_BOUND);
+        let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_BOUND);
+        let mut worker = ServiceWorker::new(backend, command_rx, event_tx);
+        let mut session =
+            ClaimedSession::new(claim, Ok(sample_context()), device_reporting("J620AP"));
+        session.accepted_files.insert(
+            SYSTEM_IMAGE_REQUEST_ID.to_string(),
+            AcceptedFile {
+                source: install_file,
+                overlay_relative: PathBuf::from("Install/image.dmg"),
+                expected_hash: Some(hash(b"install bytes")),
+                source_root: Some(root),
+            },
+        );
+        let request_id = "identity:1:OS".to_string();
+        session.pending_requests.insert(
+            request_id.clone(),
+            PendingRequest {
+                spec: FileRequestSpec {
+                    request_id: request_id.clone(),
+                    role: "Recovery image".to_string(),
+                    preferred_name: Some("image.dmg".to_string()),
+                    accepted_names: vec!["image.dmg".to_string()],
+                    allowed_extensions: vec!["dmg".to_string()],
+                    accept_directory: false,
+                    expected_size: None,
+                    expected_hash: Some(recovery_hash.clone()),
+                    detail: None,
+                    required: true,
+                },
+                overlay_relative: PathBuf::from("Recovery/image.dmg"),
+                expected_hash: Some(recovery_hash.clone()),
+                source_root: None,
+                component: "OS".to_string(),
+                manifest_file_name: "image.dmg".to_string(),
+            },
+        );
+        worker.session = Some(session);
+        worker.scan_session_pending_from(&install_dir);
+        let events = drained(&event_rx);
+        assert!(events.iter().any(|event| matches!(event, RecoveryEvent::Log { level: LogLevel::Warn, message } if message.contains("does not match"))), "{events:?}");
+        worker.scan_session_pending_from(&recovery_dir);
+        let accepted = &worker.session.as_ref().unwrap().accepted_files[&request_id];
+        assert_eq!(accepted.source, recovery_file);
+        assert_eq!(accepted.expected_hash.as_ref(), Some(&recovery_hash));
+        assert_eq!(fs::read(&accepted.source).unwrap(), b"recovery bytes");
+        assert!(drained(&event_rx).iter().any(|event| matches!(event, RecoveryEvent::FileAccepted { request_id: id, .. } if id == &request_id)));
+        drop(command_tx);
+    }
+
+    #[test]
+    fn mobile_start_preserves_recovery_assets_and_the_signing_choices() {
+        let directory = tempdir().unwrap();
+        let install_body = b"install image";
+        let recovery_body = b"recovery image";
+        let mut install = build_identity(
+            "J620AP",
+            "Developer Erase Install (IPSW)",
+            "Erase",
+            "Developer Erase Install (IPSW)",
+            &crate::crypto::sha384(install_body),
+        );
+        install
+            .as_dictionary_mut()
+            .unwrap()
+            .get_mut("Info")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap()
+            .insert(
+                "RecoveryVariant".to_string(),
+                Value::String("Recovery Customer Install".to_string()),
+            );
+        let mut recovery = build_identity(
+            "J620AP",
+            "Recovery Customer Install",
+            "Erase",
+            "Recovery Customer Install",
+            &crate::crypto::sha384(recovery_body),
+        );
+        recovery
+            .as_dictionary_mut()
+            .unwrap()
+            .get_mut("Manifest")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap()
+            .get_mut("OS")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap()
+            .get_mut("Info")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap()
+            .insert(
+                "Path".to_string(),
+                Value::String("recovery.dmg.aea".to_string()),
+            );
+        let manifest = Value::Dictionary(Dictionary::from_iter([(
+            "BuildIdentities".to_string(),
+            Value::Array(vec![install, recovery]),
+        )]));
+        let manifest_path = directory.path().join(BUILD_MANIFEST_FILE_NAME);
+        write_manifest(&manifest_path, &manifest);
+        fs::write(directory.path().join("058-12345-001.dmg.aea"), install_body).unwrap();
+        fs::write(directory.path().join("recovery.dmg.aea"), recovery_body).unwrap();
+        let reason = "bootContextUnavailable: launch did not retain a frozen boot context";
+        let mut claim = FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success);
+        let mutable = Arc::get_mut(&mut claim).unwrap();
+        mutable.device = device_reporting("J620AP");
+        mutable.context = Err(ClaimContextError::Unavailable(reason.to_string()));
+        let backend = Arc::new(FakeBackend::new(
+            BackendDiscovery {
+                devices: vec![broker_device("vm-1")],
+            },
+            claim.clone(),
+        ));
+        let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_QUEUE_BOUND);
+        let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_BOUND);
+        let mut worker = ServiceWorker::new(backend, command_rx, event_tx);
+        worker.refresh_discovery();
+        worker.prepared = Some(PreparedRestore {
+            accepted: HashMap::from([(
+                MANIFEST_REQUEST_ID.to_string(),
+                AcceptedFile {
+                    source: manifest_path,
+                    overlay_relative: PathBuf::from(BUILD_MANIFEST_FILE_NAME),
+                    expected_hash: None,
+                    source_root: Some(fs::canonicalize(directory.path()).unwrap()),
+                },
+            )]),
+            pending: BTreeMap::new(),
+            manifest_root: Some(fs::canonicalize(directory.path()).unwrap()),
+            selected_class: Some("J620AP".to_string()),
+            selected_behavior: Some(RestoreBehavior::Erase),
+        });
+        worker.claim_device("vm-1");
+        worker.handle_command(RecoveryCommand::SetLocalPolicySigning { enabled: true });
+        worker.handle_command(RecoveryCommand::SetVmLocalSigning { enabled: false });
+        worker.handle_command(RecoveryCommand::SetSkipTconFirmware { enabled: true });
+        worker.start_restore("vm-1");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while claim.last_plan().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let plan = claim
+            .last_plan()
+            .unwrap_or_else(|| panic!("mobile start events: {:?}", drained(&event_rx)));
+        assert_eq!(fs::read(&plan.image).unwrap(), install_body);
+        assert_eq!(
+            fs::read(plan.recovery_image.as_ref().unwrap()).unwrap(),
+            recovery_body
+        );
+        assert!(plan.sign_recovery_os_local_policy);
+        let contexts = claim.captured_boot_contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].metadata_unavailable.as_deref(), Some(reason));
+        assert!(!contexts[0].vm_local_signing_enabled);
+        assert!(contexts[0].skip_tcon_firmware);
+        drop(contexts);
+        worker.handle_command(RecoveryCommand::SetVmLocalSigning { enabled: true });
+        worker.handle_command(RecoveryCommand::SetSkipTconFirmware { enabled: false });
+        let events = drained(&event_rx);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RecoveryEvent::SkipTconFirmware { enabled: true }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RecoveryEvent::VmLocalSigning { enabled: false }))
+        );
+        assert!(events.iter().any(|event| matches!(event, RecoveryEvent::Log { message, .. } if message.contains("stays fixed"))));
+        worker.shutdown();
+        drop(command_tx);
+    }
+
+    #[test]
+    fn complete_extracted_files_report_ready_while_waiting_for_a_device() {
+        use crate::recovery_model::{RecoveryModel, RecoveryStep};
+
+        let directory = tempdir().unwrap();
+        let image_body = b"AEA1restore image fixture";
+        let value = Value::Dictionary(Dictionary::from_iter([(
+            "BuildIdentities".to_string(),
+            Value::Array(vec![build_identity(
+                "J620AP",
+                "Developer Erase Install (IPSW)",
+                "Erase",
+                "Developer Erase Install (IPSW)",
+                &crate::crypto::sha384(image_body),
+            )]),
+        )]));
+        let manifest_path = directory.path().join(BUILD_MANIFEST_FILE_NAME);
+        write_manifest(&manifest_path, &value);
+        fs::write(directory.path().join("058-12345-001.dmg.aea"), image_body).unwrap();
+        let backend = Arc::new(FakeBackend::new(
+            BackendDiscovery {
+                devices: Vec::new(),
+            },
+            FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success),
+        ));
+        let mut service = AppleRecoveryService::with_backend(backend);
+        let mut model = RecoveryModel::default();
+        for event in wait_for(&mut service, |events| {
+            events.iter().any(|event| {
+            matches!(event, RecoveryEvent::FileRequested(spec) if spec.request_id == MANIFEST_REQUEST_ID)
+        })
+        }) {
+            model.apply_event(event);
+        }
+        service
+            .send(RecoveryCommand::ProvideFile {
+                device_id: String::new(),
+                request_id: MANIFEST_REQUEST_ID.to_string(),
+                path: manifest_path.display().to_string(),
+            })
+            .unwrap();
+        for event in wait_for(&mut service, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, RecoveryEvent::CompatibleBoards { .. }))
+        }) {
+            model.apply_event(event);
+        }
+        service
+            .send(RecoveryCommand::SelectSystem {
+                device_class: "J620AP".to_string(),
+            })
+            .unwrap();
+        for event in wait_for(&mut service, |events| {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    RecoveryEvent::PhaseChanged {
+                        phase: SessionPhase::Ready,
+                        ..
+                    }
+                )
+            })
+        }) {
+            model.apply_event(event);
+        }
+        assert_eq!(model.phase, SessionPhase::Ready);
+        assert!(model.all_required_files_supplied());
+        assert_eq!(model.selected_system.as_deref(), Some("J620AP"));
+        assert_eq!(model.selected_mode, Some(RestoreMode::Erase));
+        assert_eq!(model.step(), RecoveryStep::WaitDevices);
+        assert_eq!(
+            model.status_message,
+            "Restore files ready; waiting for a recovery device"
+        );
     }
 
     #[test]
@@ -8110,6 +9944,111 @@ mod tests {
     }
 
     #[test]
+    fn active_restore_inventory_omission_preserves_transport_outcomes() {
+        for successful in [true, false] {
+            let claim = FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success);
+            let backend = Arc::new(FakeBackend::new(
+                BackendDiscovery {
+                    devices: vec![broker_device("vm-1")],
+                },
+                Arc::clone(&claim),
+            ));
+            let (_command_tx, command_rx) = mpsc::sync_channel(COMMAND_QUEUE_BOUND);
+            let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_BOUND);
+            let mut worker = ServiceWorker::new(backend.clone(), command_rx, event_tx);
+            worker.refresh_discovery();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_for_run = Arc::clone(&stop);
+            let (finish_tx, finish_rx) = mpsc::channel();
+            let (outcome_tx, outcome_rx) = mpsc::channel();
+            let (completed_tx, completed_rx) = mpsc::channel();
+            let join = thread::spawn(move || {
+                finish_rx.recv().expect("transport completion signal");
+                let outcome = if stop_for_run.load(Ordering::Relaxed) {
+                    RestoreOutcome::Failed {
+                        stage: "run-stopped-teardown".into(),
+                        reason: "discovery cancelled the claimed transport".into(),
+                    }
+                } else if successful {
+                    RestoreOutcome::Ended {
+                        summary: Box::new(fake_summary(true)),
+                        bulk_transfers: 1,
+                    }
+                } else {
+                    RestoreOutcome::Failed {
+                        stage: "restore-transport".into(),
+                        reason: "peer closed the claimed connection".into(),
+                    }
+                };
+                outcome_tx.send(outcome).expect("restore outcome receiver");
+                completed_tx
+                    .send(())
+                    .expect("transport completion receiver");
+            });
+            let mut session = ClaimedSession::new(
+                claim.clone(),
+                Ok(sample_context()),
+                device_reporting("J274AP"),
+            );
+            session.restore_run = Some(ActiveRestore {
+                stop,
+                outcome_rx,
+                join,
+                cancel_requested: false,
+                release_after: false,
+                device_id: "vm-1".into(),
+            });
+            worker.session = Some(session);
+            worker.refresh_discovery();
+            backend.set_devices(vec![broker_device("vm-2")]);
+            for _ in 0..3 {
+                worker.refresh_discovery();
+                assert_eq!(
+                    worker.last_devices["vm-1"].state,
+                    crate::recovery_model::DeviceState::Claimed
+                );
+                assert_eq!(
+                    worker.last_devices["vm-2"].state,
+                    crate::recovery_model::DeviceState::Busy
+                );
+            }
+            backend.set_devices(vec![broker_device("vm-1"), broker_device("vm-2")]);
+            worker.refresh_discovery();
+            finish_tx.send(()).expect("finish restore transport");
+            completed_rx.recv().expect("transport completed");
+            worker.poll_restore_outcome();
+            let events: Vec<_> = event_rx.try_iter().collect();
+            assert_eq!(events.iter().filter(|event| matches!(event,
+                RecoveryEvent::Log { message, .. } if message.contains("Recovery inventory omitted active device vm-1")
+            )).count(), 1);
+            assert!(events.iter().any(|event| matches!(event,
+                RecoveryEvent::Log { message, .. } if message.contains("vm-1 returned to the inventory")
+            )));
+            if successful {
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| matches!(event, RecoveryEvent::Succeeded { .. }))
+                );
+                assert_eq!(
+                    claim.detach_requests(),
+                    vec![HostDetachDisposition::Complete]
+                );
+            } else {
+                assert!(events.iter().any(|event| matches!(event,
+                    RecoveryEvent::Failed { note } if note == "restore-transport: peer closed the claimed connection"
+                )));
+                assert_eq!(claim.detach_requests(), vec![HostDetachDisposition::Failed]);
+            }
+            backend.set_devices(vec![broker_device("vm-2")]);
+            worker.refresh_discovery();
+            assert!(event_rx.try_iter().any(|event| matches!(event,
+                RecoveryEvent::DeviceDisconnected { device_id, .. } if device_id == "vm-1"
+            )));
+        }
+    }
+
+    #[test]
     fn device_loss_is_reported() {
         let claim = FakeClaimedRestore::new("vm-1", None, FakeOutcome::CancelAware);
         let backend = Arc::new(FakeBackend::new(
@@ -8601,7 +10540,8 @@ mod tests {
 
         let (mut worker, events) = handoff_worker();
         let claim = FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success);
-        let mut session = ClaimedSession::new(claim, sample_context(), device_reporting("J274AP"));
+        let mut session =
+            ClaimedSession::new(claim, Ok(sample_context()), device_reporting("J274AP"));
         session.reset_for_manifest_request();
         worker.session = Some(session);
         worker.provide_file(
@@ -8914,5 +10854,297 @@ mod tests {
             lines.is_empty(),
             "the default meter has no sink, so it reports nothing: {lines:?}"
         );
+    }
+    #[test]
+    fn mobile_context_retries_an_unavailable_nonce_and_preserves_metadata() {
+        for metadata_unavailable in [false, true] {
+            let reason = "bootContextUnavailable: metadata not retained";
+            let mut retained = sample_context();
+            retained.restore.ap_nonce = None;
+            retained.bridge.ap_nonce = None;
+            let context = if metadata_unavailable {
+                Err(ClaimContextError::Unavailable(reason.to_string()))
+            } else {
+                Ok(retained.clone())
+            };
+            let claim = FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success);
+            claim
+                .ap_nonce_responses
+                .lock()
+                .unwrap()
+                .extend([Ok(None), Ok(Some([0x71; BOOT_NONCE_HASH_BYTES]))]);
+            let device = device_reporting("J620AP");
+            let mut session = ClaimedSession::new(claim.clone(), context, device.clone());
+            let manifest = Dictionary::from_iter([(
+                "BuildIdentities".to_string(),
+                Value::Array(vec![build_identity(
+                    "J620AP",
+                    "Developer Erase Install (IPSW)",
+                    "Erase",
+                    "Developer Erase Install (IPSW)",
+                    &crate::crypto::sha384(b"install image"),
+                )]),
+            )]);
+            session.derived = Some(
+                crate::restore::derive_restore_options(
+                    &manifest,
+                    &device,
+                    false,
+                    Some(RestoreBehavior::Erase),
+                )
+                .unwrap(),
+            );
+
+            let first = session.restore_boot_context().unwrap();
+            let second = session.restore_boot_context().unwrap();
+            assert_eq!(second.ap_nonce, Some([0x71; BOOT_NONCE_HASH_BYTES]));
+            assert_eq!(claim.ap_nonce_queries.load(Ordering::Relaxed), 2);
+            if metadata_unavailable {
+                assert_eq!(first.metadata_unavailable.as_deref(), Some(reason));
+                assert_eq!(second.metadata_unavailable.as_deref(), Some(reason));
+                assert!(
+                    matches!(session.context, Err(ClaimContextError::Unavailable(ref detail)) if detail == reason)
+                );
+            } else {
+                assert_eq!(
+                    session
+                        .context
+                        .as_ref()
+                        .map_err(ToString::to_string)
+                        .unwrap()
+                        .bridge
+                        .staged_boot_manifest_sha384,
+                    retained.bridge.staged_boot_manifest_sha384
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mobile_restore_uses_claimed_signer_when_boot_manifest_was_not_staged() {
+        let key = crate::crypto::P256PrivateKey::derive(
+            &[0x64; 32],
+            b"restore service signer without boot manifest",
+        );
+        let mut claim = FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success);
+        Arc::get_mut(&mut claim).unwrap().signing_context = Some(RestoreBootContext {
+            sep_public_key: Some(key.public_uncompressed()),
+            remote_digest_signing: true,
+            manifest_signer: Some(Arc::new(crate::restore::LocalFdrManifestSigner::new(
+                key,
+                "test-signer",
+            ))),
+            ..RestoreBootContext::default()
+        });
+        let context = Err(ClaimContextError::Unavailable(
+            "bootContextUnavailable: no staged manifest".to_string(),
+        ));
+        let device = device_reporting("J620AP");
+        let mut session = ClaimedSession::new(claim, context, device.clone());
+        let manifest = Dictionary::from_iter([(
+            "BuildIdentities".to_string(),
+            Value::Array(vec![build_identity(
+                "J620AP",
+                "Developer Erase Install (IPSW)",
+                "Erase",
+                "Developer Erase Install (IPSW)",
+                &crate::crypto::sha384(b"install image"),
+            )]),
+        )]);
+        session.derived = Some(
+            crate::restore::derive_restore_options(
+                &manifest,
+                &device,
+                false,
+                Some(RestoreBehavior::Erase),
+            )
+            .unwrap(),
+        );
+        let boot = session.restore_boot_context().unwrap();
+        assert_eq!(boot.sep_public_key, Some(key.public_uncompressed()));
+        assert!(boot.remote_digest_signing);
+        let signer = boot.manifest_signer.unwrap();
+        assert_eq!(signer.public_key(), key.public_uncompressed());
+        assert_eq!(
+            boot.metadata_unavailable.as_deref(),
+            Some("bootContextUnavailable: no staged manifest")
+        );
+    }
+
+    #[test]
+    fn mobile_context_recovers_published_nonce_and_preserves_frozen_metadata() {
+        let mut claim = FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success);
+        let mutable = Arc::get_mut(&mut claim).unwrap();
+        let mut retained = sample_context();
+        retained.restore.ap_nonce = None;
+        retained.bridge.ap_nonce = None;
+        mutable.context = Ok(retained.clone());
+        mutable.queried_ap_nonce = Some([0x71; BOOT_NONCE_HASH_BYTES]);
+        let device = device_reporting("J620AP");
+        let mut session = ClaimedSession::new(claim, Ok(retained.clone()), device.clone());
+        let manifest = Dictionary::from_iter([(
+            "BuildIdentities".to_string(),
+            Value::Array(vec![build_identity(
+                "J620AP",
+                "Developer Erase Install (IPSW)",
+                "Erase",
+                "Developer Erase Install (IPSW)",
+                &crate::crypto::sha384(b"install image"),
+            )]),
+        )]);
+        session.derived = Some(
+            crate::restore::derive_restore_options(
+                &manifest,
+                &device,
+                false,
+                Some(RestoreBehavior::Erase),
+            )
+            .unwrap(),
+        );
+        let boot = session.restore_boot_context().unwrap();
+        assert_eq!(boot.ap_nonce, Some([0x71; BOOT_NONCE_HASH_BYTES]));
+        assert_eq!(boot.sep_public_key, retained.restore.sep_public_key);
+        assert_eq!(
+            session
+                .context
+                .as_ref()
+                .map_err(ToString::to_string)
+                .unwrap()
+                .bridge
+                .staged_boot_manifest_sha384,
+            retained.bridge.staged_boot_manifest_sha384
+        );
+    }
+
+    /// `APPLE_UTILS_TEST_IPSW=/path/to/macOS.ipsw cargo test --lib an_ipsw_ -- --ignored`
+    #[test]
+    #[ignore = "needs APPLE_UTILS_TEST_IPSW and the ipsw command"]
+    fn an_ipsw_is_unpacked_when_needed_and_removed_afterwards() {
+        let ipsw = std::env::var("APPLE_UTILS_TEST_IPSW").expect("APPLE_UTILS_TEST_IPSW");
+        let board = std::env::var("APPLE_UTILS_TEST_BOARD").unwrap_or_else(|_| "j274ap".into());
+        let (mut worker, events) = handoff_worker();
+        worker.open_manifest_request();
+        drained(&events);
+
+        worker.provide_prepared_file(MANIFEST_REQUEST_ID, &ipsw);
+        let seen = drained(&events);
+        assert!(
+            seen.iter()
+                .any(|event| matches!(event, RecoveryEvent::CompatibleBoards { .. })),
+            "{seen:?}"
+        );
+        let stage = worker.ipsw.clone().expect("the IPSW is held open");
+        let root = stage.root().to_path_buf();
+        assert!(root.join(BUILD_MANIFEST_FILE_NAME).is_file());
+        assert!(root.join("BootabilityBundle").is_dir());
+        assert!(!root.join("094-56453-088.dmg.aea").exists());
+        assert!(
+            !root.join("094-56453-088.dmg").exists(),
+            "no payload before a board is chosen"
+        );
+
+        worker.select_system(&board);
+        let mut seen = drained(&events);
+        if seen
+            .iter()
+            .any(|event| matches!(event, RecoveryEvent::CompatibleModes { .. }))
+        {
+            worker.select_restore_mode(RestoreMode::Erase);
+            seen = drained(&events);
+        }
+        let prepared = worker.prepared.as_ref().expect("prepared");
+        assert!(
+            prepared.pending.is_empty(),
+            "still asking for {:?}; events={seen:?}",
+            prepared.pending.keys().collect::<Vec<_>>()
+        );
+        let os = prepared
+            .accepted
+            .get(SYSTEM_IMAGE_REQUEST_ID)
+            .expect("OS accepted");
+        assert_eq!(
+            os.source,
+            root.join("094-56453-088.dmg"),
+            "decrypted in temp"
+        );
+        assert!(
+            !root.join("094-56453-088.dmg.aea").exists(),
+            "encrypted copy dropped"
+        );
+        let kernels = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("kernelcache.")
+            })
+            .count();
+        assert_eq!(kernels, 1, "only the chosen board's kernelcache is written");
+
+        worker.prepared = None;
+        worker.reap_ipsw();
+        drop(stage);
+        assert!(!root.exists(), "the staging directory must be removed");
+    }
+
+    #[test]
+    #[ignore = "needs APPLE_UTILS_TEST_IPSW and the ipsw command"]
+    fn an_ipsw_handed_to_a_claimed_session_supplies_the_manifest() {
+        let ipsw = std::env::var("APPLE_UTILS_TEST_IPSW").expect("APPLE_UTILS_TEST_IPSW");
+        let (mut worker, events) = handoff_worker();
+        let claim = FakeClaimedRestore::new("vm-1", None, FakeOutcome::Success);
+        let mut session =
+            ClaimedSession::new(claim, Ok(sample_context()), device_reporting("J274AP"));
+        session.reset_for_manifest_request();
+        worker.session = Some(session);
+        worker.provide_file("vm-1", MANIFEST_REQUEST_ID, &ipsw);
+        let seen = drained(&events);
+        let session = worker.session.as_ref().unwrap();
+        assert!(
+            session.accepted_files.contains_key(MANIFEST_REQUEST_ID),
+            "events={seen:?}"
+        );
+        assert!(
+            session.pending_requests.is_empty(),
+            "still asking for {:?}; events={seen:?}",
+            session.pending_requests.keys().collect::<Vec<_>>()
+        );
+        assert!(session.derived.is_some(), "events={seen:?}");
+    }
+
+    #[test]
+    fn the_ipsw_prompt_takes_an_ipsw_and_nothing_else() {
+        let spec = ipsw_request_spec();
+        assert_eq!(spec.request_id, MANIFEST_REQUEST_ID);
+        assert_eq!(spec.title(), "IPSW");
+        let dir = tempdir().unwrap();
+        let ipsw = dir.path().join("macOS.ipsw");
+        fs::write(&ipsw, b"PK").unwrap();
+        let file = inspect(&ipsw.to_string_lossy()).unwrap();
+        assert_eq!(resolve_handoff(&file, &spec).unwrap().path, file.path);
+        let plist = dir.path().join(BUILD_MANIFEST_FILE_NAME);
+        fs::write(&plist, b"x").unwrap();
+        let plist = inspect(&plist.to_string_lossy()).unwrap();
+        assert!(resolve_handoff(&plist, &spec).is_err());
+    }
+
+    #[test]
+    fn the_manifest_prompt_becomes_the_ipsw_prompt_only_with_the_ipsw_command() {
+        let shown = present_request(RecoveryEvent::FileRequested(manifest_request_spec()));
+        let RecoveryEvent::FileRequested(shown) = shown else {
+            panic!("a request stays a request");
+        };
+        let expected = if find_ipsw_cli().is_some() {
+            "IPSW"
+        } else {
+            "BuildManifest"
+        };
+        assert_eq!(shown.role, expected);
+        let other = present_request(RecoveryEvent::FileRequested(
+            pending_request_for_unresolved_component("Ap,DCP2", "x").spec,
+        ));
+        assert!(matches!(other, RecoveryEvent::FileRequested(spec) if spec.role == "Ap,DCP2"));
     }
 }

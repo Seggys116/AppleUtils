@@ -22,6 +22,7 @@ use super::bridge_protocol::{
     WatchRequest,
 };
 use super::link::{BulkTransport, InboundSignal};
+use super::packet_trace::{Context as PacketTraceContext, Disposition, Stage};
 use super::watchdog::{LinkWatchdogStats, WatchdogMetrics};
 use super::{MAX_PACKET, MAX_TRANSFER};
 
@@ -457,11 +458,13 @@ impl SocketBulkTransport {
         }
         let reader_stream = claim.packet_stream.try_clone()?;
         let writer = Arc::new(Mutex::new(claim.packet_stream));
-        let state = Arc::new(TransportState::new(
+        let mut state = TransportState::new(
             claim.host_to_device_credits,
             claim.device_to_host_credits,
             claim.max_transfer_size,
-        ));
+        );
+        state.packet_trace = PacketTraceContext::new(claim.generation, claim.lease_id);
+        let state = Arc::new(state);
         let reader_state = Arc::clone(&state);
         let reader_writer = Arc::clone(&writer);
         let generation = claim.generation;
@@ -545,19 +548,84 @@ impl ClaimedSessionControl {
     }
 
     pub fn get_boot_context(&self) -> io::Result<BootContext> {
+        self.get_boot_context_response()?.map_err(error_to_io)
+    }
+
+    pub fn get_boot_context_response(&self) -> io::Result<Result<BootContext, ErrorRecord>> {
         let record = self.send_request(RecordKind::GetBootContext, &[])?;
         match record.header.kind {
             RecordKind::BootContext => {
                 let context = BootContext::decode(&record.payload)?;
                 validate_boot_context(&context)?;
-                Ok(context)
+                Ok(Ok(context))
             }
             RecordKind::Error => {
                 let error: ErrorRecord = bridge_protocol::decode_json(&record.payload)?;
-                Err(error_to_io(error))
+                Ok(Err(error))
             }
             other => Err(invalid_data(format!(
                 "unexpected GetBootContext response {:?}",
+                other
+            ))),
+        }
+    }
+
+    pub fn get_ap_nonce_response(&self) -> io::Result<Result<[u8; 32], ErrorRecord>> {
+        let record = self.send_request(RecordKind::GetApNonce, &[])?;
+        match record.header.kind {
+            RecordKind::ApNonce => {
+                let nonce = <[u8; 32]>::try_from(record.payload.as_slice())
+                    .map_err(|_| invalid_data("AP_NONCE payload must be exactly 32 bytes"))?;
+                Ok(Ok(nonce))
+            }
+            RecordKind::Error => {
+                let error: ErrorRecord = bridge_protocol::decode_json(&record.payload)?;
+                Ok(Err(error))
+            }
+            other => Err(invalid_data(format!(
+                "unexpected GetApNonce response {:?}",
+                other
+            ))),
+        }
+    }
+
+    pub fn get_sep_nonce_response(&self) -> io::Result<Result<[u8; 20], ErrorRecord>> {
+        let record = self.send_request(RecordKind::GetSepNonce, &[])?;
+        match record.header.kind {
+            RecordKind::SepNonce => {
+                let nonce = <[u8; 20]>::try_from(record.payload.as_slice())
+                    .map_err(|_| invalid_data("SEP_NONCE payload must be exactly 20 bytes"))?;
+                Ok(Ok(nonce))
+            }
+            RecordKind::Error => {
+                let error: ErrorRecord = bridge_protocol::decode_json(&record.payload)?;
+                Ok(Err(error))
+            }
+            other => Err(invalid_data(format!(
+                "unexpected GetSepNonce response {:?}",
+                other
+            ))),
+        }
+    }
+
+    pub fn get_signer_public_key_response(&self) -> io::Result<Result<[u8; 65], ErrorRecord>> {
+        let record = self.send_request(RecordKind::GetSignerPublicKey, &[])?;
+        match record.header.kind {
+            RecordKind::SignerPublicKey => {
+                let key = <[u8; 65]>::try_from(record.payload.as_slice()).map_err(|_| {
+                    invalid_data("signer public key payload must be exactly 65 bytes")
+                })?;
+                if import_public(&key).is_none() {
+                    return Err(invalid_data("signer public key is not a valid P-256 point"));
+                }
+                Ok(Ok(key))
+            }
+            RecordKind::Error => {
+                let error: ErrorRecord = bridge_protocol::decode_json(&record.payload)?;
+                Ok(Err(error))
+            }
+            other => Err(invalid_data(format!(
+                "unexpected GetSignerPublicKey response {:?}",
                 other
             ))),
         }
@@ -568,6 +636,17 @@ impl ClaimedSessionControl {
         signed_body: &[u8],
         boot_context: &BootContext,
     ) -> io::Result<FdrManifestSignature> {
+        let key = boot_context.sep_public_key_uncompressed.ok_or_else(|| {
+            invalid_data("boot context has no SEP public key for signature verification")
+        })?;
+        self.sign_fdr_manifest_with_key(signed_body, &key)
+    }
+
+    pub fn sign_fdr_manifest_with_key(
+        &self,
+        signed_body: &[u8],
+        expected_public_key: &[u8; 65],
+    ) -> io::Result<FdrManifestSignature> {
         let request = SignFdrManifestRequest {
             signed_body: signed_body.to_vec(),
         };
@@ -575,7 +654,7 @@ impl ClaimedSessionControl {
         match record.header.kind {
             RecordKind::FdrManifestSignature => {
                 let signature = FdrManifestSignature::decode(&record.payload)?;
-                validate_manifest_signature(signed_body, boot_context, &signature)?;
+                validate_manifest_signature(signed_body, expected_public_key, &signature)?;
                 Ok(signature)
             }
             RecordKind::Error => {
@@ -675,6 +754,11 @@ impl ClaimedSessionControl {
 }
 
 fn validate_boot_context(context: &BootContext) -> io::Result<()> {
+    if let Some(manifest) = context.staged_boot_manifest.as_deref()
+        && (manifest.is_empty() || sha384(manifest) != context.staged_boot_manifest_sha384)
+    {
+        return Err(invalid_data("boot context staged manifest digest mismatch"));
+    }
     if let Some(ref object) = context.fdr_trust_object {
         let digest = context
             .fdr_trust_digest_sha256
@@ -727,12 +811,9 @@ fn validate_boot_context(context: &BootContext) -> io::Result<()> {
 
 fn validate_manifest_signature(
     signed_body: &[u8],
-    boot_context: &BootContext,
+    expected_public_key: &[u8; 65],
     signature: &FdrManifestSignature,
 ) -> io::Result<()> {
-    let expected_public_key = boot_context.sep_public_key_uncompressed.ok_or_else(|| {
-        invalid_data("boot context has no SEP public key for signature verification")
-    })?;
     let expected_digest = sha384(signed_body);
     if signature.signed_body_length
         != u32::try_from(signed_body.len()).map_err(|_| invalid_input("signed body too large"))?
@@ -746,9 +827,9 @@ fn validate_manifest_signature(
             "signature SHA-384 digest does not match local digest",
         ));
     }
-    if signature.signer_public_key_uncompressed != expected_public_key {
+    if signature.signer_public_key_uncompressed != *expected_public_key {
         return Err(invalid_data(
-            "signature public key does not match BootContext SEP key",
+            "signature public key does not match the claimed signer key",
         ));
     }
     let mut reduced = [0u8; 32];
@@ -759,7 +840,7 @@ fn validate_manifest_signature(
         &signature.signature_rs,
     ) {
         return Err(invalid_data(
-            "signature r||s does not verify against BootContext SEP key",
+            "signature r||s does not verify against the claimed signer key",
         ));
     }
     Ok(())
@@ -814,28 +895,71 @@ impl BulkTransport for SocketBulkTransport {
     }
 
     fn recv(&mut self, timeout: Duration) -> io::Result<Option<Vec<u8>>> {
-        let packet = self.state.recv_packet(timeout)?;
+        let packet = match self.state.recv_packet(timeout) {
+            Ok(packet) => packet,
+            Err(error) => {
+                self.state.packet_trace.packet(
+                    Stage::ReceiveReturn,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    None,
+                    Disposition::IoError(error.kind(), error.raw_os_error()),
+                    0,
+                );
+                return Err(error);
+            }
+        };
         if let Some(ref packet) = packet {
-            let credit = bridge_protocol::encode_credit(CreditRecord {
-                direction: 2,
-                delta: 1,
-            })?;
-            write_frame(
-                &mut self.writer.lock().unwrap(),
-                RecordHeader {
-                    version: bridge_protocol::VERSION,
-                    kind: RecordKind::Credit,
-                    flags: 0,
-                    payload_len: 0,
-                    request_id: 0,
-                    generation: self.generation,
-                    lease_id: self.lease_id,
-                },
-                &credit,
-            )
-            .inspect_err(|error| {
-                self.state.mark_terminal(Some(error.to_string()), false);
-            })?;
+            let started = self.state.packet_trace.credit_started();
+            self.state.packet_trace.packet(
+                Stage::CreditStart,
+                packet,
+                None,
+                None,
+                None,
+                None,
+                Disposition::CreditStarted,
+                0,
+            );
+            let credit_result = (|| {
+                let credit = bridge_protocol::encode_credit(CreditRecord {
+                    direction: 2,
+                    delta: 1,
+                })?;
+                write_frame(
+                    &mut self.writer.lock().unwrap(),
+                    RecordHeader {
+                        version: bridge_protocol::VERSION,
+                        kind: RecordKind::Credit,
+                        flags: 0,
+                        payload_len: 0,
+                        request_id: 0,
+                        generation: self.generation,
+                        lease_id: self.lease_id,
+                    },
+                    &credit,
+                )
+                .inspect_err(|error| {
+                    self.state.mark_terminal(Some(error.to_string()), false);
+                })
+            })();
+            let disposition = match &credit_result {
+                Ok(()) => Disposition::CreditWritten,
+                Err(error) => Disposition::IoError(error.kind(), error.raw_os_error()),
+            };
+            self.state.packet_trace.packet(
+                Stage::ReceiveReturn,
+                packet,
+                None,
+                None,
+                None,
+                None,
+                disposition,
+                self.state.packet_trace.elapsed(started),
+            );
+            credit_result?;
             self.state.packets_in.fetch_add(1, Ordering::Relaxed);
             self.state
                 .queued_from_device
@@ -845,6 +969,10 @@ impl BulkTransport for SocketBulkTransport {
             self.state.idle_reads.fetch_add(1, Ordering::Relaxed);
         }
         Ok(packet)
+    }
+
+    fn packet_trace_identity(&self) -> Option<(u64, u64)> {
+        Some((self.generation, self.lease_id))
     }
 
     fn out_max_packet_size(&self) -> u16 {
@@ -892,6 +1020,7 @@ struct QueueState {
 }
 
 struct TransportState {
+    packet_trace: PacketTraceContext,
     queue: Mutex<QueueState>,
     queue_cv: Condvar,
     waiters: Mutex<HashMap<u64, SyncSender<RawRecord>>>,
@@ -912,6 +1041,7 @@ struct TransportState {
 impl TransportState {
     fn new(host_credits: u32, device_to_host_credits: u32, max_transfer_size: usize) -> Self {
         Self {
+            packet_trace: PacketTraceContext::default(),
             queue: Mutex::new(QueueState {
                 packets: VecDeque::new(),
                 closed: false,
@@ -1043,6 +1173,16 @@ impl TransportState {
         }
         guard.inbound_generation = guard.inbound_generation.wrapping_add(1);
         guard.packets.push_back(packet);
+        self.packet_trace.packet(
+            Stage::Enqueue,
+            guard.packets.back().unwrap(),
+            None,
+            None,
+            None,
+            None,
+            Disposition::Packet,
+            0,
+        );
         self.queued_from_device
             .store(guard.packets.len() as u32, Ordering::Relaxed);
         self.queue_cv.notify_all();
@@ -1059,6 +1199,16 @@ impl TransportState {
             }
         }
         if let Some(packet) = guard.packets.pop_front() {
+            self.packet_trace.packet(
+                Stage::Dequeue,
+                &packet,
+                None,
+                None,
+                None,
+                None,
+                Disposition::Packet,
+                0,
+            );
             self.queued_from_device
                 .store(guard.packets.len() as u32, Ordering::Relaxed);
             return Ok(Some(packet));
@@ -1217,7 +1367,12 @@ fn handle_packet_frame(
                 &bridge_protocol::encode_ping_nonce(nonce),
             )
         }
-        RecordKind::Pong | RecordKind::BootContext | RecordKind::FdrManifestSignature => {
+        RecordKind::Pong
+        | RecordKind::BootContext
+        | RecordKind::ApNonce
+        | RecordKind::SepNonce
+        | RecordKind::SignerPublicKey
+        | RecordKind::FdrManifestSignature => {
             if frame.header.request_id == 0 {
                 return Err(invalid_data("control reply requestId must be nonzero"));
             }
@@ -1548,7 +1703,9 @@ fn error_to_io(error: ErrorRecord) -> io::Error {
         "staleGeneration" | "deviceUnavailable" | "deviceBusy" | "deviceGone" => {
             io::ErrorKind::WouldBlock
         }
-        "bootContextUnavailable" | "signerUnavailable" => io::ErrorKind::NotFound,
+        "bootContextUnavailable" | "apNonceUnavailable" | "signerUnavailable" => {
+            io::ErrorKind::NotFound
+        }
         "invalidFdrManifest" | "creditViolation" | "internal" => io::ErrorKind::InvalidData,
         _ => io::ErrorKind::Other,
     };
@@ -1577,6 +1734,213 @@ mod tests {
     use std::time::Instant;
 
     use tempfile::TempDir;
+
+    fn traced_socket_transport(
+        context: PacketTraceContext,
+    ) -> (SocketBulkTransport, Arc<TransportState>, UnixStream) {
+        let (socket, peer) = UnixStream::pair().unwrap();
+        let mut state = TransportState::new(8, 8, MAX_TRANSFER);
+        state.packet_trace = context;
+        let state = Arc::new(state);
+        (
+            SocketBulkTransport {
+                writer: Arc::new(Mutex::new(socket)),
+                state: Arc::clone(&state),
+                reader: None,
+                out_max_packet_size: 512,
+                max_packet_size: MAX_PACKET,
+                generation: 91,
+                lease_id: 12,
+            },
+            state,
+            peer,
+        )
+    }
+
+    #[test]
+    fn packet_trace_follows_ack_through_delayed_credit_to_session_advance() {
+        use super::super::frame::{MuxVersion, VersionRequest};
+        use super::super::link::tests::{device_packet, device_version_reply, encode_segment};
+        use super::super::link::{LinkEvent, MuxLink};
+        use super::super::session::SessionEvent;
+        use super::super::tcp::{TcpHeader, flags};
+
+        let (context, recorder) = PacketTraceContext::recording(91, 12);
+        let (transport, state, mut peer) = traced_socket_transport(context.clone());
+        let writer = Arc::clone(&transport.writer);
+        let mut link = MuxLink::new(transport);
+        link.set_packet_trace(context);
+        state.push_packet(device_version_reply(2)).unwrap();
+        assert_eq!(
+            link.negotiate(VersionRequest::resync(), Duration::from_secs(1))
+                .unwrap(),
+            MuxVersion::V2
+        );
+        let port = link.begin_open(62078).unwrap();
+        let initial = link.send_state(port).unwrap().snd_nxt.wrapping_add(1);
+        state
+            .push_packet(device_packet(
+                0,
+                0,
+                &encode_segment(
+                    TcpHeader {
+                        source_port: 62078,
+                        destination_port: port,
+                        sequence: 0,
+                        acknowledgement: initial,
+                        flags: flags::SYN_ACK,
+                        window: 65536,
+                    },
+                    &[],
+                ),
+            ))
+            .unwrap();
+        assert_eq!(
+            link.pump(Duration::from_secs(1)).unwrap(),
+            LinkEvent::Session {
+                local_port: port,
+                event: SessionEvent::Established
+            }
+        );
+        link.finish_open(port, 62078).unwrap();
+        let payload = b"restore image payload";
+        assert_eq!(link.queue_write(port, payload).unwrap(), 0);
+        let sent = link.send_state(port).unwrap();
+        assert_eq!(sent.snd_una, initial);
+        assert_eq!(sent.snd_nxt, initial.wrapping_add(payload.len() as u32));
+        recorder.drain();
+        let credit_starts = recorder.seen(Stage::CreditStart);
+        let packet = device_packet(
+            1,
+            0,
+            &encode_segment(
+                TcpHeader {
+                    source_port: 62078,
+                    destination_port: port,
+                    sequence: 1,
+                    acknowledgement: sent.snd_nxt,
+                    flags: flags::ACK,
+                    window: 65536,
+                },
+                &[],
+            ),
+        );
+        let held_writer = writer.lock().unwrap();
+        state.push_packet(packet.clone()).unwrap();
+        let pumping = thread::spawn(move || {
+            assert_eq!(
+                link.pump(Duration::from_secs(1)).unwrap(),
+                LinkEvent::Session {
+                    local_port: port,
+                    event: SessionEvent::Acknowledged
+                }
+            );
+            link
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while recorder.seen(Stage::CreditStart) == credit_starts {
+            assert!(
+                Instant::now() < deadline,
+                "the ACK reached the synchronous Credit write"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let held_at = Instant::now();
+        thread::sleep(Duration::from_millis(20));
+        let held_for = held_at.elapsed();
+        drop(held_writer);
+        let link = pumping.join().unwrap();
+        let delivered = link.send_state(port).unwrap();
+        assert_eq!(delivered.snd_una, sent.snd_nxt);
+        assert_eq!(delivered.snd_nxt, sent.snd_nxt);
+        let records = recorder.drain();
+        let stages = [
+            Stage::Enqueue,
+            Stage::Dequeue,
+            Stage::CreditStart,
+            Stage::ReceiveReturn,
+            Stage::PumpReceipt,
+            Stage::Apply,
+        ];
+        assert_eq!(records.len(), stages.len());
+        for (record, stage) in records.iter().zip(stages) {
+            assert_eq!(record.stage, stage);
+            assert_eq!(&record.prefix[..36], &packet[..]);
+            assert_eq!((record.generation, record.lease), (91, 12));
+        }
+        for pair in records.windows(2) {
+            assert!(pair[1].monotonic_ns >= pair[0].monotonic_ns);
+        }
+        let returned = records
+            .iter()
+            .find(|record| record.stage == Stage::ReceiveReturn)
+            .unwrap();
+        assert_eq!(returned.disposition, Disposition::CreditWritten);
+        assert!(returned.elapsed_ns >= held_for.as_nanos() as u64);
+        let applied = records
+            .iter()
+            .find(|record| record.stage == Stage::Apply)
+            .unwrap();
+        assert_eq!(applied.local_port, Some(port));
+        assert_eq!(applied.before.unwrap().snd_una, initial);
+        assert_eq!(applied.after.unwrap().snd_una, sent.snd_nxt);
+        assert_eq!(
+            applied.disposition,
+            Disposition::Session(Ok(SessionEvent::Acknowledged))
+        );
+        let mut reader = RecordReader::default();
+        let mut credits = 0;
+        while credits < 3 {
+            let frame = read_one(&mut peer, &mut reader);
+            if frame.header.kind == RecordKind::Credit {
+                assert_eq!(
+                    bridge_protocol::decode_credit(&frame.payload).unwrap(),
+                    CreditRecord {
+                        direction: 2,
+                        delta: 1
+                    }
+                );
+                credits += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn packet_trace_attributes_credit_write_failure_to_the_dequeued_packet() {
+        use super::super::link::tests::{device_packet, encode_segment};
+        use super::super::tcp::{TcpHeader, flags};
+        let (context, recorder) = PacketTraceContext::recording(91, 12);
+        let (mut transport, state, peer) = traced_socket_transport(context);
+        let packet = device_packet(
+            17,
+            23,
+            &encode_segment(
+                TcpHeader {
+                    source_port: 62078,
+                    destination_port: 49152,
+                    sequence: 123,
+                    acknowledgement: 456,
+                    flags: flags::ACK,
+                    window: 65536,
+                },
+                &[],
+            ),
+        );
+        state.push_packet(packet.clone()).unwrap();
+        drop(peer);
+        let error = transport.recv(Duration::from_secs(1)).unwrap_err();
+        let records = recorder.drain();
+        let returned = records
+            .iter()
+            .find(|record| record.stage == Stage::ReceiveReturn)
+            .unwrap();
+        assert_eq!(&returned.prefix[..36], &packet[..]);
+        assert_eq!(
+            returned.disposition,
+            Disposition::IoError(error.kind(), error.raw_os_error())
+        );
+        assert_eq!(recorder.seen(Stage::ReceiveReturn), 1);
+    }
 
     fn temp_socket_dir() -> TempDir {
         let root = tempfile::Builder::new()
@@ -1723,6 +2087,7 @@ mod tests {
     fn valid_boot_context(signing_key: &P256PrivateKey) -> BootContext {
         BootContext {
             staged_boot_manifest_sha384: [0x10; 48],
+            staged_boot_manifest: None,
             ap_nonce: Some([0x20; 32]),
             fdr_element_index: 0,
             fdr_element_count: 1,
@@ -1883,6 +2248,90 @@ mod tests {
     }
 
     #[test]
+    fn claimed_control_returns_the_nonce_and_preserves_named_operation_errors() {
+        let root = temp_socket_dir();
+        let socket_path = broker_path(&root);
+        let listener = bind_listener(&socket_path);
+        let nonce: [u8; 32] = std::array::from_fn(|index| index as u8);
+        let server = thread::spawn(move || {
+            let hello = server_hello();
+            let (_discovery, _) = accept_server_connection(&listener, &hello);
+            let (mut stream, mut parser) = accept_server_connection(&listener, &hello);
+            let claim = read_one(&mut stream, &mut parser);
+            write_json_frame(
+                &mut stream,
+                RecordKind::Claimed,
+                claim.header.request_id,
+                91,
+                1234,
+                &Claimed {
+                    device_id: "opaque-1".to_string(),
+                    transport_kind: bridge_protocol::TransportKind::Dwc3,
+                    out_max_packet_size: 512,
+                    max_packet_size: MAX_PACKET as u32,
+                    max_transfer_size: MAX_TRANSFER as u32,
+                    host_to_device_credits: 1,
+                    device_to_host_credits: 1,
+                },
+            );
+            for error_code in [None, Some("apNonceUnavailable"), Some("invalidRequest")] {
+                let request = read_one(&mut stream, &mut parser);
+                assert_eq!(request.header.kind, RecordKind::GetApNonce);
+                assert_eq!(request.payload.len(), 0);
+                assert!(request.header.request_id > 0);
+                assert_eq!(request.header.generation, 91);
+                assert_eq!(request.header.lease_id, 1234);
+                if let Some(code) = error_code {
+                    write_json_frame(
+                        &mut stream,
+                        RecordKind::Error,
+                        request.header.request_id,
+                        91,
+                        1234,
+                        &ErrorRecord {
+                            code: code.to_string(),
+                            detail: format!("GetApNonce: {code}"),
+                            fatal: false,
+                            retryable: true,
+                            current_revision: Some(7),
+                            current_generation: Some(91),
+                        },
+                    );
+                } else {
+                    write_frame(
+                        &mut stream,
+                        RecordHeader {
+                            version: bridge_protocol::VERSION,
+                            kind: RecordKind::ApNonce,
+                            flags: 0,
+                            payload_len: 32,
+                            request_id: request.header.request_id,
+                            generation: 91,
+                            lease_id: 1234,
+                        },
+                        &nonce,
+                    )
+                    .unwrap();
+                }
+            }
+            let _ = parser.read(&mut stream).unwrap();
+        });
+        let client = BridgeClient::connect_path(&socket_path).unwrap();
+        let claim = client.claim_device("opaque-1", 91).unwrap();
+        let transport = claim.into_transport().unwrap();
+        let control = transport.control_handle();
+        assert_eq!(control.get_ap_nonce_response().unwrap().unwrap(), nonce);
+        for code in ["apNonceUnavailable", "invalidRequest"] {
+            let error = control.get_ap_nonce_response().unwrap().unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(error.current_generation, Some(91));
+            assert!(!error.fatal);
+        }
+        control.close().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn list_claim_boot_context_sign_and_packet_flow_work_end_to_end() {
         let root = temp_socket_dir();
         let socket_path = broker_path(&root);
@@ -1999,6 +2448,23 @@ mod tests {
             )
             .unwrap();
 
+            let signer_query = read_one(&mut claim_stream, &mut claim_parser);
+            assert_eq!(signer_query.header.kind, RecordKind::GetSignerPublicKey);
+            write_frame(
+                &mut claim_stream,
+                RecordHeader {
+                    version: bridge_protocol::VERSION,
+                    kind: RecordKind::SignerPublicKey,
+                    flags: 0,
+                    payload_len: 0,
+                    request_id: signer_query.header.request_id,
+                    generation: signer_query.header.generation,
+                    lease_id: signer_query.header.lease_id,
+                },
+                &signing_key.public_uncompressed(),
+            )
+            .unwrap();
+
             let sign_record = read_one(&mut claim_stream, &mut claim_parser);
             assert_eq!(sign_record.header.kind, RecordKind::SignFdrManifest);
             let request_id = sign_record.header.request_id;
@@ -2104,6 +2570,10 @@ mod tests {
         let control = transport.control_handle();
         let context = control.get_boot_context().unwrap();
         assert_eq!(context, expected_boot_context);
+        assert_eq!(
+            control.get_signer_public_key_response().unwrap().unwrap(),
+            signing_key.public_uncompressed(),
+        );
         let body = valid_manb_body();
         let signature = control.sign_fdr_manifest(&body, &context).unwrap();
         assert_eq!(signature.digest_sha384, sha384(&body));

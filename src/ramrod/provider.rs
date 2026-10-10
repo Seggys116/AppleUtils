@@ -64,6 +64,10 @@ impl StreamedObject {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BulkOutcome {
+    Received {
+        bytes: u64,
+        path: PathBuf,
+    },
     Served {
         bytes: u64,
         blocks: u64,
@@ -77,8 +81,19 @@ pub enum BulkOutcome {
     },
 }
 
+pub type BulkTransferTask =
+    Box<dyn FnOnce() -> Result<BulkOutcome, ProviderError> + Send + 'static>;
+
 pub trait BulkTransferService {
-    fn serve(&mut self, port: u16, request: &DataRequest) -> Result<BulkOutcome, ProviderError>;
+    fn prepare(
+        &mut self,
+        port: u16,
+        request: &DataRequest,
+    ) -> Result<BulkTransferTask, ProviderError>;
+
+    fn serve(&mut self, port: u16, request: &DataRequest) -> Result<BulkOutcome, ProviderError> {
+        self.prepare(port, request)?()
+    }
 }
 
 pub trait SessionObserver {
@@ -98,6 +113,15 @@ pub trait SessionObserver {
     }
     fn on_message(&mut self, _msg_type: &str, _body: &Dictionary) {}
     fn on_data_request(&mut self, _request: &DataRequest) {}
+    fn on_bulk_receiving(&mut self, _request: &DataRequest, _port: u16) {}
+    fn on_bulk_received(
+        &mut self,
+        _request: &DataRequest,
+        _port: u16,
+        _bytes: u64,
+        _path: &std::path::Path,
+    ) {
+    }
     fn on_bulk_serving(&mut self, _request: &DataRequest, _port: u16) {}
     fn on_data_answered(&mut self, _request: &DataRequest, _keys: &[&str], _bytes: usize) {}
     fn on_data_streamed(
@@ -112,6 +136,7 @@ pub trait SessionObserver {
     fn on_bulk_served_empty(&mut self, _request: &DataRequest, _port: u16, _outcome: &BulkOutcome) {
     }
     fn on_bulk_declined(&mut self, _request: &DataRequest, _port: u16, _reason: &str) {}
+    fn on_bulk_cancelled(&mut self, _request: &DataRequest, _port: u16, _reason: &str) {}
     fn on_async_wait(&mut self, _uuid: Option<&str>, _body: &Dictionary) {}
     fn on_data_unanswered(&mut self, _request: &DataRequest, _error: &ProviderError) {}
     fn on_control_send_failed(&mut self, _request: &DataRequest, _error: &str) {}
@@ -196,7 +221,11 @@ impl RestoreDataProvider for PreparedAnswers {
 pub struct NoBulkTransfers;
 
 impl BulkTransferService for NoBulkTransfers {
-    fn serve(&mut self, port: u16, request: &DataRequest) -> Result<BulkOutcome, ProviderError> {
+    fn prepare(
+        &mut self,
+        port: u16,
+        request: &DataRequest,
+    ) -> Result<BulkTransferTask, ProviderError> {
         Err(ProviderError::BulkTransferNotConfigured {
             port,
             data_type: request.data_type.wire_name().to_string(),

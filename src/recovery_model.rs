@@ -75,6 +75,8 @@ pub struct RecoveryHitMap {
     pub events_pane: Rect,
     pub handoff: Rect,
     pub local_policy_signing: Rect,
+    pub vm_local_signing: Rect,
+    pub skip_tcon_firmware: Rect,
 }
 
 impl RecoveryHitMap {
@@ -87,6 +89,8 @@ impl RecoveryHitMap {
         self.events_pane = Rect::default();
         self.handoff = Rect::default();
         self.local_policy_signing = Rect::default();
+        self.vm_local_signing = Rect::default();
+        self.skip_tcon_firmware = Rect::default();
     }
 
     pub fn device_at(&self, col: u16, row: u16) -> Option<usize> {
@@ -110,6 +114,14 @@ impl RecoveryHitMap {
 
     pub fn local_policy_signing_at(&self, col: u16, row: u16) -> bool {
         contains(&self.local_policy_signing, col, row)
+    }
+
+    pub fn vm_local_signing_at(&self, col: u16, row: u16) -> bool {
+        contains(&self.vm_local_signing, col, row)
+    }
+
+    pub fn skip_tcon_firmware_at(&self, col: u16, row: u16) -> bool {
+        contains(&self.skip_tcon_firmware, col, row)
     }
 
     pub fn pane_at(&self, col: u16, row: u16) -> Option<RecoveryFocus> {
@@ -448,6 +460,8 @@ pub struct RecoveryModel {
     pub request_page_rows: usize,
     pub event_page_rows: usize,
     pub sign_recovery_os_local_policy: bool,
+    pub vm_local_signing_enabled: bool,
+    pub skip_tcon_firmware: bool,
     pub hits: RecoveryHitMap,
 }
 
@@ -480,6 +494,8 @@ impl Default for RecoveryModel {
             request_page_rows: 0,
             event_page_rows: 0,
             sign_recovery_os_local_policy: false,
+            vm_local_signing_enabled: true,
+            skip_tcon_firmware: false,
             hits: RecoveryHitMap::default(),
         };
         model.push_log(LogLevel::Info, "Recovery monitor online");
@@ -490,9 +506,9 @@ impl Default for RecoveryModel {
 #[must_use]
 pub fn local_policy_signing_title(enabled: bool) -> &'static str {
     if enabled {
-        "LocalPolicy signing armed"
+        "Apple restore signing armed"
     } else {
-        "LocalPolicy signing off"
+        "Apple restore signing off"
     }
 }
 
@@ -500,20 +516,20 @@ pub fn local_policy_signing_title(enabled: bool) -> &'static str {
 pub fn local_policy_signing_detail(enabled: bool) -> String {
     if enabled {
         format!(
-            "sends this Mac's ECID, chip and board to {}",
+            "device identity and requests to {}",
             crate::restore::SIGNING_SERVER_DEFAULT_BASE_URL
         )
     } else {
-        "Apple is not contacted; the recoveryOS policy stays unbound".to_string()
+        "Apple is not contacted; LocalPolicy and Cryptex stay unsigned".to_string()
     }
 }
 
 #[must_use]
 pub fn local_policy_signing_short(enabled: bool) -> &'static str {
     if enabled {
-        "signing armed, ECID to Apple"
+        "Apple signing armed"
     } else {
-        "signing off"
+        "Apple signing off"
     }
 }
 
@@ -523,6 +539,50 @@ pub fn local_policy_signing_status(enabled: bool) -> String {
         "{}: {}",
         local_policy_signing_title(enabled),
         local_policy_signing_detail(enabled)
+    )
+}
+
+#[must_use]
+pub fn vm_local_signing_title(enabled: bool) -> &'static str {
+    if enabled {
+        "VM local signing on"
+    } else {
+        "VM local signing off"
+    }
+}
+
+#[must_use]
+pub fn vm_local_signing_detail(enabled: bool) -> &'static str {
+    if enabled {
+        "uses the VM-supplied signing service"
+    } else {
+        "VM-supplied signing service disabled"
+    }
+}
+
+#[must_use]
+pub fn vm_local_signing_status(enabled: bool) -> String {
+    format!(
+        "{}: {}",
+        vm_local_signing_title(enabled),
+        vm_local_signing_detail(enabled)
+    )
+}
+
+#[must_use]
+pub fn skip_tcon_firmware_title(enabled: bool) -> &'static str {
+    if enabled {
+        "Skip TCON firmware on"
+    } else {
+        "Skip TCON firmware off"
+    }
+}
+
+#[must_use]
+pub fn skip_tcon_firmware_status(enabled: bool) -> String {
+    format!(
+        "{}: mobile restores only; requires separately patched recovery media",
+        skip_tcon_firmware_title(enabled)
     )
 }
 
@@ -1047,7 +1107,8 @@ impl RecoveryModel {
     ) -> Result<(usize, FileInfo, String), String> {
         let spec = &self.requests[index].spec;
         let resolved = resolve_handoff(file, spec)?;
-        if let Some(size) = spec.expected_size {
+        // An IPSW stands for the whole restore set, so a single file's size range cannot apply.
+        if let Some(size) = spec.expected_size.filter(|_| !is_ipsw_name(&resolved.name)) {
             let bytes = resolved
                 .size
                 .ok_or_else(|| format!("{} size could not be read", resolved.name))?;
@@ -1155,13 +1216,18 @@ impl RecoveryModel {
             RecoveryEvent::DeviceDisconnected { device_id, note } => {
                 self.mark_device_connected(&device_id, false, DeviceState::Disconnected);
                 if self.claimed_device_id.as_deref() == Some(device_id.as_str()) {
-                    self.phase = SessionPhase::Waiting;
                     self.claimed_device_id = None;
-                    self.progress = None;
-                    self.verifying = None;
-                    self.status_message = note
-                        .clone()
-                        .unwrap_or_else(|| "Claimed device disconnected".into());
+                    if !matches!(
+                        self.phase,
+                        SessionPhase::Succeeded | SessionPhase::Failed | SessionPhase::Cancelled
+                    ) {
+                        self.phase = SessionPhase::Waiting;
+                        self.progress = None;
+                        self.verifying = None;
+                        self.status_message = note
+                            .clone()
+                            .unwrap_or_else(|| "Claimed device disconnected".into());
+                    }
                     self.push_log(
                         LogLevel::Warn,
                         note.unwrap_or_else(|| "Claimed device disconnected".into()),
@@ -1205,17 +1271,23 @@ impl RecoveryModel {
                 self.push_log(LogLevel::Error, reason);
             }
             RecoveryEvent::Released { device_id, note } => {
+                let finished = matches!(
+                    self.phase,
+                    SessionPhase::Succeeded | SessionPhase::Failed | SessionPhase::Cancelled
+                );
                 if self.claimed_device_id.as_deref() == Some(device_id.as_str()) {
                     self.claimed_device_id = None;
-                    self.progress = None;
-                    self.verifying = None;
-                    self.phase = if self.next_open_request().is_some() {
-                        SessionPhase::Collecting
-                    } else if self.all_required_files_supplied() && !self.requests.is_empty() {
-                        SessionPhase::Ready
-                    } else {
-                        SessionPhase::Waiting
-                    };
+                    if !finished {
+                        self.progress = None;
+                        self.verifying = None;
+                        self.phase = if self.next_open_request().is_some() {
+                            SessionPhase::Collecting
+                        } else if self.all_required_files_supplied() && !self.requests.is_empty() {
+                            SessionPhase::Ready
+                        } else {
+                            SessionPhase::Waiting
+                        };
+                    }
                 }
                 for device in &mut self.devices {
                     if device.id == device_id {
@@ -1228,7 +1300,9 @@ impl RecoveryModel {
                         device.state = DeviceState::Available;
                     }
                 }
-                self.status_message = note.clone().unwrap_or_else(|| "Claim released".into());
+                if !finished {
+                    self.status_message = note.clone().unwrap_or_else(|| "Claim released".into());
+                }
                 self.push_log(
                     LogLevel::Info,
                     note.unwrap_or_else(|| "Claim released".into()),
@@ -1355,7 +1429,10 @@ impl RecoveryModel {
                 let checking = progress.stage.eq_ignore_ascii_case("checking")
                     || progress.stage.eq_ignore_ascii_case("hashing")
                     || progress.stage.eq_ignore_ascii_case("scanning")
-                    || progress.stage.eq_ignore_ascii_case("reading");
+                    || progress.stage.eq_ignore_ascii_case("reading")
+                    || progress.stage.eq_ignore_ascii_case("indexing")
+                    || progress.stage.eq_ignore_ascii_case("extracting")
+                    || progress.stage.eq_ignore_ascii_case("decrypting");
                 if checking {
                     self.verifying = Some(progress.clone());
                     self.status_message = if progress.detail.is_empty() {
@@ -1443,6 +1520,12 @@ impl RecoveryModel {
             }
             RecoveryEvent::LocalPolicySigning { enabled } => {
                 self.sign_recovery_os_local_policy = enabled;
+            }
+            RecoveryEvent::VmLocalSigning { enabled } => {
+                self.vm_local_signing_enabled = enabled;
+            }
+            RecoveryEvent::SkipTconFirmware { enabled } => {
+                self.skip_tcon_firmware = enabled;
             }
             RecoveryEvent::Cancelled { note } => {
                 self.phase = SessionPhase::Cancelled;
@@ -1598,13 +1681,31 @@ pub fn resolve_handoff_candidates(
     file: &FileInfo,
     spec: &FileRequestSpec,
 ) -> Result<Vec<FileInfo>, String> {
+    resolve_handoff_candidates_with(file, spec, crate::ipsw_tree::find_ipsw_cli().is_some())
+}
+
+/// `ipsw_cli` says whether the `ipsw` command is installed; with it an IPSW is handed over whole,
+/// since the restore unpacks only the files it needs.
+fn resolve_handoff_candidates_with(
+    file: &FileInfo,
+    spec: &FileRequestSpec,
+    ipsw_cli: bool,
+) -> Result<Vec<FileInfo>, String> {
     let file = follow_if_link(file);
     if is_archive_name(&file.name)
         && !spec.matches_name(&file.name)
         && !spec.matches_extension(&file)
     {
+        if ipsw_cli && is_ipsw_name(&file.name) && effective_kind(&file) == FileKind::File {
+            return Ok(vec![file]);
+        }
+        let ipsw_hint = if is_ipsw_name(&file.name) {
+            " Or install the ipsw command and hand over the IPSW itself."
+        } else {
+            ""
+        };
         return Err(format!(
-            "{} needs {}. {} is an archive — extract it first, then copy {} from the extracted folder.",
+            "{} needs {}. {} is an archive — extract it first, then copy {} from the extracted folder.{ipsw_hint}",
             spec.role,
             spec.expectation_label(),
             file.name,
@@ -2012,6 +2113,10 @@ fn effective_kind(file: &FileInfo) -> FileKind {
     file.kind
 }
 
+fn is_ipsw_name(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".ipsw")
+}
+
 fn is_archive_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.ends_with(".ipsw") || lower.ends_with(".zip")
@@ -2112,6 +2217,12 @@ pub enum RecoveryEvent {
     LocalPolicySigning {
         enabled: bool,
     },
+    VmLocalSigning {
+        enabled: bool,
+    },
+    SkipTconFirmware {
+        enabled: bool,
+    },
     Cancelled {
         note: Option<String>,
     },
@@ -2130,6 +2241,50 @@ pub enum RecoveryEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signing_service_events_preserve_independent_choices() {
+        let mut model = RecoveryModel::default();
+        assert_eq!(
+            (
+                model.sign_recovery_os_local_policy,
+                model.vm_local_signing_enabled,
+            ),
+            (false, true)
+        );
+        model.apply_event(RecoveryEvent::LocalPolicySigning { enabled: true });
+        assert_eq!(
+            (
+                model.sign_recovery_os_local_policy,
+                model.vm_local_signing_enabled,
+            ),
+            (true, true)
+        );
+        model.apply_event(RecoveryEvent::VmLocalSigning { enabled: false });
+        assert_eq!(
+            (
+                model.sign_recovery_os_local_policy,
+                model.vm_local_signing_enabled,
+            ),
+            (true, false)
+        );
+        model.apply_event(RecoveryEvent::LocalPolicySigning { enabled: false });
+        assert_eq!(
+            (
+                model.sign_recovery_os_local_policy,
+                model.vm_local_signing_enabled,
+            ),
+            (false, false)
+        );
+        model.apply_event(RecoveryEvent::VmLocalSigning { enabled: true });
+        assert_eq!(
+            (
+                model.sign_recovery_os_local_policy,
+                model.vm_local_signing_enabled,
+            ),
+            (false, true)
+        );
+    }
 
     #[test]
     fn required_files_gate_start() {
@@ -2189,8 +2344,8 @@ mod tests {
         model.focus = RecoveryFocus::Requests;
 
         let file = FileInfo {
-            path: "/tmp/restore.ipsw".into(),
-            name: "restore.ipsw".into(),
+            path: "/tmp/restore.zip".into(),
+            name: "restore.zip".into(),
             kind: FileKind::File,
             size: Some(180),
             modified: None,
@@ -2481,9 +2636,37 @@ mod tests {
             size: Some(2048),
             modified: None,
         };
-        let error = resolve_handoff(&file, &spec).unwrap_err();
+        let error = resolve_handoff_candidates_with(&file, &spec, false).unwrap_err();
         assert!(error.contains("archive"), "{error}");
         assert!(error.contains("BuildManifest.plist"), "{error}");
+        assert!(error.contains("ipsw command"), "{error}");
+    }
+
+    #[test]
+    fn an_ipsw_is_handed_over_whole_when_the_ipsw_command_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let ipsw = dir.path().join("iPhone.ipsw");
+        std::fs::write(&ipsw, b"PK").unwrap();
+        let spec = FileRequestSpec {
+            request_id: "manifest".into(),
+            role: "BuildManifest".into(),
+            preferred_name: Some("BuildManifest.plist".into()),
+            accepted_names: vec!["BuildManifest.plist".into()],
+            allowed_extensions: vec!["plist".into()],
+            accept_directory: false,
+            expected_size: None,
+            expected_hash: None,
+            detail: None,
+            required: true,
+        };
+        let file = inspect(&ipsw.to_string_lossy()).expect("ipsw");
+        let handed = resolve_handoff_candidates_with(&file, &spec, true).expect("ipsw accepted");
+        assert_eq!(handed.len(), 1);
+        assert_eq!(handed[0].path, file.path);
+        let zip = dir.path().join("restore.zip");
+        std::fs::write(&zip, b"PK").unwrap();
+        let zip = inspect(&zip.to_string_lossy()).expect("zip");
+        assert!(resolve_handoff_candidates_with(&zip, &spec, true).is_err());
     }
 
     #[test]
@@ -2615,6 +2798,52 @@ mod tests {
         assert_eq!(model.phase, SessionPhase::Waiting);
         assert!(model.claimed_device_id.is_none());
         assert_eq!(model.devices[0].state, DeviceState::Disconnected);
+    }
+
+    #[test]
+    fn completed_restore_failure_stays_visible_after_transport_release() {
+        for release_first in [true, false] {
+            let mut model = RecoveryModel::default();
+            model.apply_event(RecoveryEvent::DeviceDiscovered(RecoveryDevice {
+                id: "dev-1".into(),
+                title: "Recovery Device".into(),
+                detail: "iPad".into(),
+                connection: "127.0.0.1:9123".into(),
+                state: DeviceState::Available,
+                connected: true,
+            }));
+            model.apply_event(RecoveryEvent::ClaimAccepted {
+                device_id: "dev-1".into(),
+                note: None,
+            });
+            model.apply_event(RecoveryEvent::Failed {
+                note: "failed to request root ticket".into(),
+            });
+            let released = RecoveryEvent::Released {
+                device_id: "dev-1".into(),
+                note: Some("Claim released".into()),
+            };
+            let disconnected = RecoveryEvent::DeviceDisconnected {
+                device_id: "dev-1".into(),
+                note: Some("Device disconnected".into()),
+            };
+            if release_first {
+                model.apply_event(released);
+                model.apply_event(disconnected);
+            } else {
+                model.apply_event(disconnected);
+                model.apply_event(released);
+            }
+            assert_eq!(model.step(), RecoveryStep::Done);
+            assert_eq!(model.phase, SessionPhase::Failed);
+            assert_eq!(model.status_message, "failed to request root ticket");
+            assert_eq!(
+                model.last_error.as_deref(),
+                Some("failed to request root ticket")
+            );
+            assert!(model.claimed_device_id.is_none());
+            assert_eq!(model.devices[0].state, DeviceState::Disconnected);
+        }
     }
 
     #[test]
@@ -3016,5 +3245,20 @@ mod tests {
 
         let resolved = resolve_handoff(&folder, &spec).unwrap();
         assert_eq!(resolved.path, payload.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn unpacking_an_ipsw_is_file_checking_not_a_running_restore() {
+        let mut model = RecoveryModel::default();
+        for stage in ["indexing", "extracting", "decrypting"] {
+            model.apply_event(RecoveryEvent::Progress(RestoreProgress {
+                stage: stage.into(),
+                detail: "macOS.ipsw".into(),
+                fraction: None,
+            }));
+            assert!(model.verifying.is_some(), "{stage}");
+            assert_ne!(model.phase, SessionPhase::Running, "{stage}");
+            assert!(model.progress.is_none(), "{stage}");
+        }
     }
 }

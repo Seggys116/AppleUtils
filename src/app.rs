@@ -1035,6 +1035,14 @@ impl App {
                     self.recovery.toggle_local_policy_signing();
                     false
                 }
+                KeyCode::Char('l') => {
+                    self.recovery.toggle_vm_local_signing();
+                    false
+                }
+                KeyCode::Char('t') => {
+                    self.recovery.toggle_skip_tcon_firmware();
+                    false
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.recovery.model.move_system_cursor(-1);
                     false
@@ -1083,6 +1091,14 @@ impl App {
                     self.recovery.toggle_local_policy_signing();
                     false
                 }
+                KeyCode::Char('l') => {
+                    self.recovery.toggle_vm_local_signing();
+                    false
+                }
+                KeyCode::Char('t') => {
+                    self.recovery.toggle_skip_tcon_firmware();
+                    false
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.recovery.model.move_mode_cursor(-1);
                     false
@@ -1114,6 +1130,14 @@ impl App {
                 }
                 KeyCode::Char('p') => {
                     self.recovery.toggle_local_policy_signing();
+                    false
+                }
+                KeyCode::Char('l') => {
+                    self.recovery.toggle_vm_local_signing();
+                    false
+                }
+                KeyCode::Char('t') => {
+                    self.recovery.toggle_skip_tcon_firmware();
                     false
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -2780,12 +2804,11 @@ impl App {
         self.asahi_job_rx = Some(rx);
         std::thread::spawn(move || {
             let fetched = (|| {
-                let work = std::env::temp_dir().join(format!(
-                    "apple-utils-asahi-catalogue-{}",
-                    std::process::id()
-                ));
-                std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
-                let dest = work.join("installer_data.json");
+                let work = tempfile::Builder::new()
+                    .prefix("apple-utils-asahi-catalogue-")
+                    .tempdir()
+                    .map_err(|e| e.to_string())?;
+                let dest = work.path().join("installer_data.json");
                 asahi_ops::fetch_url_to_file_with_progress(&url, &dest, |fraction| {
                     let _ = tx.send(AsahiJobEvent::Progress {
                         status: "fetching catalogue".into(),
@@ -3090,6 +3113,14 @@ impl App {
     }
 
     fn recovery_click(&mut self, col: u16, row: u16) {
+        if self.recovery.model.hits.skip_tcon_firmware_at(col, row) {
+            self.recovery.toggle_skip_tcon_firmware();
+            return;
+        }
+        if self.recovery.model.hits.vm_local_signing_at(col, row) {
+            self.recovery.toggle_vm_local_signing();
+            return;
+        }
         if self.recovery.model.hits.local_policy_signing_at(col, row) {
             self.recovery.toggle_local_policy_signing();
             return;
@@ -3142,6 +3173,8 @@ fn execute_asahi_work(
     progress("preparing", Some(0.0));
     let mut next_object = "m1n1/boot.bin".to_string();
 
+    // Holds the package and extracted images until the whole job has finished.
+    let mut scratch: Option<crate::scratch::ScratchDir> = None;
     let mut preflight_archives = None;
     let mut artifacts = if let Some(arts) = plan.injected_artifacts.clone() {
         arts
@@ -3156,12 +3189,11 @@ fn execute_asahi_work(
             doc
         } else {
             progress("fetching catalogue", Some(0.0));
-            let meta_dir = std::env::temp_dir().join(format!(
-                "apple-utils-asahi-catalogue-{}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&meta_dir).map_err(|e| e.to_string())?;
-            let meta_path = meta_dir.join("installer_data.json");
+            let meta_dir = tempfile::Builder::new()
+                .prefix("apple-utils-asahi-catalogue-")
+                .tempdir()
+                .map_err(|e| e.to_string())?;
+            let meta_path = meta_dir.path().join("installer_data.json");
             asahi_ops::fetch_url_to_file_with_progress(
                 asahi_ops::DEFAULT_INSTALLER_DATA_URL,
                 &meta_path,
@@ -3191,7 +3223,8 @@ fn execute_asahi_work(
                 Some((&target.board, target.chip_id)),
             )?;
             let requirements = asahi_ops::FirmwareRequirements::from(&resolved);
-            let work = tempfile::tempdir().map_err(|e| e.to_string())?;
+            let work = crate::scratch::ScratchDir::new("apple-utils-asahi-firmware-")
+                .map_err(|e| e.to_string())?;
             let archives = crate::asahi_firmware_download::resolve_firmware_archives(
                 &crate::asahi_firmware_download::FirmwareArchiveInputs {
                     board: &target.board,
@@ -3209,12 +3242,12 @@ fn execute_asahi_work(
             preflight_archives = Some((archives, work));
         }
         next_object = resolved.next_object.clone();
-        let work = std::env::temp_dir().join(format!(
-            "apple-utils-asahi-{}-{}",
-            std::process::id(),
-            resolved.os_name.replace(' ', "-")
-        ));
-        std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+        let work = scratch
+            .insert(
+                crate::scratch::ScratchDir::new("apple-utils-asahi-").map_err(|e| e.to_string())?,
+            )
+            .path()
+            .to_path_buf();
         let package = work.join("package.zip");
         progress("downloading package", Some(0.0));
         asahi_ops::fetch_url_to_file_with_progress(&resolved.package_url, &package, |fraction| {
@@ -3657,6 +3690,162 @@ mod tests {
         assert_eq!(app.asahi_step, AsahiStep::Menu);
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.screen, Screen::Picker);
+    }
+
+    #[test]
+    fn recovery_tcon_key_and_click_send_choices_on_each_setup_screen() {
+        use crate::recovery_model::{CompatibleSystem, RestoreMode};
+        use crate::recovery_runtime::{ChannelRecoveryService, RecoveryCommand, RecoveryRuntime};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (service, bridge) = ChannelRecoveryService::pair();
+        let mut app = App::new();
+        app.screen = Screen::Recovery;
+        app.recovery = RecoveryRuntime::from_service(service);
+        app.recovery.model.requests.clear();
+        app.recovery
+            .model
+            .apply_event(RecoveryEvent::DeviceDiscovered(RecoveryDevice {
+                id: "dev-1".into(),
+                title: "Restore device".into(),
+                detail: "j620ap".into(),
+                connection: "usb".into(),
+                state: DeviceState::Available,
+                connected: true,
+            }));
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        for step in [
+            RecoveryStep::PickDevice,
+            RecoveryStep::PickSystem,
+            RecoveryStep::PickMode,
+        ] {
+            match step {
+                RecoveryStep::PickSystem => {
+                    app.recovery
+                        .model
+                        .apply_event(RecoveryEvent::CompatibleBoards {
+                            systems: vec![CompatibleSystem {
+                                class: "j620ap".into(),
+                                title: "Restore device".into(),
+                                detail: "j620ap".into(),
+                            }],
+                            product_version: None,
+                            product_build: None,
+                        })
+                }
+                RecoveryStep::PickMode => {
+                    app.recovery
+                        .model
+                        .apply_event(RecoveryEvent::SystemSelected {
+                            class: "j620ap".into(),
+                        });
+                    app.recovery
+                        .model
+                        .apply_event(RecoveryEvent::CompatibleModes {
+                            modes: vec![RestoreMode::Erase],
+                        });
+                }
+                _ => {}
+            }
+            assert_eq!(app.recovery.model.step(), step);
+            press(&mut app, KeyCode::Char('t'));
+            assert_eq!(
+                bridge.recv_command().unwrap(),
+                RecoveryCommand::SetSkipTconFirmware { enabled: true }
+            );
+            assert!(app.recovery.model.skip_tcon_firmware);
+            terminal
+                .draw(|frame| crate::ui::render(frame, &mut app))
+                .unwrap();
+            let row = app.recovery.model.hits.skip_tcon_firmware;
+            assert!(row.width > 0);
+            assert_eq!(row.height, 1);
+            app.handle_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: row.x + row.width / 2,
+                row: row.y,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert_eq!(
+                bridge.recv_command().unwrap(),
+                RecoveryCommand::SetSkipTconFirmware { enabled: false }
+            );
+            assert!(!app.recovery.model.skip_tcon_firmware);
+            assert!(app.recovery.model.vm_local_signing_enabled);
+        }
+    }
+
+    #[test]
+    fn recovery_signing_rows_send_independent_commands_when_clicked() {
+        use crate::recovery_runtime::{ChannelRecoveryService, RecoveryCommand, RecoveryRuntime};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (service, bridge) = ChannelRecoveryService::pair();
+        let mut app = App::new();
+        app.screen = Screen::Recovery;
+        app.recovery = RecoveryRuntime::from_service(service);
+        app.recovery
+            .model
+            .apply_event(RecoveryEvent::DeviceDiscovered(RecoveryDevice {
+                id: "dev-1".into(),
+                title: "Mac mini".into(),
+                detail: "j274ap".into(),
+                connection: "usb".into(),
+                state: DeviceState::Available,
+                connected: true,
+            }));
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).expect("terminal");
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .expect("draw signing controls");
+        let apple = app.recovery.model.hits.local_policy_signing;
+        let vm = app.recovery.model.hits.vm_local_signing;
+        assert!(apple.width > 0 && vm.width > 0);
+        assert_eq!((apple.height, vm.height), (1, 1));
+        assert_eq!(apple.bottom(), vm.y);
+
+        for (rect, expected, choices) in [
+            (
+                vm,
+                RecoveryCommand::SetVmLocalSigning { enabled: false },
+                (false, false),
+            ),
+            (
+                apple,
+                RecoveryCommand::SetLocalPolicySigning { enabled: true },
+                (true, false),
+            ),
+            (
+                vm,
+                RecoveryCommand::SetVmLocalSigning { enabled: true },
+                (true, true),
+            ),
+            (
+                apple,
+                RecoveryCommand::SetLocalPolicySigning { enabled: false },
+                (false, true),
+            ),
+        ] {
+            app.handle_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x + rect.width / 2,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert_eq!(
+                bridge.recv_command().expect("clicked signing command"),
+                expected
+            );
+            assert_eq!(
+                (
+                    app.recovery.model.sign_recovery_os_local_policy,
+                    app.recovery.model.vm_local_signing_enabled,
+                ),
+                choices
+            );
+        }
     }
 
     #[test]

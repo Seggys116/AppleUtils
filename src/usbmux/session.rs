@@ -16,8 +16,7 @@ pub enum SessionEvent {
     Data { bytes: usize },
     Acknowledged,
     Reset,
-    // Dropped exactly as the device drops it: no reassembly and no retransmission either side,
-    // so a gap is terminal.
+    // The device drops out-of-order data. The sender retains unacknowledged bytes for recovery.
     OutOfOrder { expected: u32, received: u32 },
     ClosedByFlags { flags: u8 },
 }
@@ -82,10 +81,15 @@ pub struct MuxSession {
     snd_nxt: u32,
     snd_una: u32,
     snd_wnd_edge: u32,
+    send_epoch: u64,
     rcv_nxt: u32,
     outbound: VecDeque<u8>,
+    unacknowledged: VecDeque<u8>,
     inbound: VecDeque<u8>,
     owe_ack: bool,
+    peer_fin: Option<u32>,
+    write_shutdown: bool,
+    sent_fin: Option<u32>,
     peer_window: u32,
     max_peer_window: u32,
     segments_in: u64,
@@ -101,10 +105,15 @@ impl MuxSession {
             snd_nxt: config.initial_sequence,
             snd_una: config.initial_sequence,
             snd_wnd_edge: config.initial_sequence,
+            send_epoch: 0,
             rcv_nxt: 0,
             outbound: VecDeque::new(),
+            unacknowledged: VecDeque::new(),
             inbound: VecDeque::new(),
             owe_ack: false,
+            peer_fin: None,
+            write_shutdown: false,
+            sent_fin: None,
             peer_window: 0,
             max_peer_window: 0,
             segments_in: 0,
@@ -226,30 +235,38 @@ impl MuxSession {
         header: &TcpHeader,
         payload: &[u8],
     ) -> Result<SessionEvent, SessionError> {
-        if !header.is_bare_ack() {
+        if !header.is_bare_ack() && !header.is_fin() {
             self.state = SessionState::Closed;
             return Ok(SessionEvent::ClosedByFlags {
                 flags: header.flags,
             });
         }
-        if seq_gt(header.acknowledgement, self.snd_una) {
+        if header.flags & flags::ACK != 0 && seq_gt(header.acknowledgement, self.snd_una) {
             if seq_gt(header.acknowledgement, self.snd_nxt) {
                 return Err(SessionError::BadAcknowledgement {
                     sent: self.snd_nxt,
                     acknowledged: header.acknowledgement,
                 });
             }
+            let acknowledged = header.acknowledgement.wrapping_sub(self.snd_una) as usize;
+            // FIN occupies sequence space but is not a byte in the retransmission queue.
+            self.unacknowledged
+                .drain(..acknowledged.min(self.unacknowledged.len()));
             self.snd_una = header.acknowledgement;
+            self.send_epoch = self.send_epoch.wrapping_add(1);
         }
         // The last segment's edge, never the widest seen: the device advertises free space rounded
         // down to 256, so its edge retracts by up to 255 and an older edge over-sends with no retransmit.
-        self.snd_wnd_edge = header.window_edge();
-        self.peer_window = header.window;
-        self.max_peer_window = self.max_peer_window.max(header.window);
-        if payload.is_empty() {
+        if header.flags & flags::ACK != 0 {
+            self.snd_wnd_edge = header.window_edge();
+            self.peer_window = header.window;
+            self.max_peer_window = self.max_peer_window.max(header.window);
+        }
+        if payload.is_empty() && !header.is_fin() {
             return Ok(SessionEvent::Acknowledged);
         }
-        if header.sequence != self.rcv_nxt {
+        if header.sequence != self.rcv_nxt || self.peer_fin.is_some() {
+            self.owe_ack = true;
             return Ok(SessionEvent::OutOfOrder {
                 expected: self.rcv_nxt,
                 received: header.sequence,
@@ -258,6 +275,10 @@ impl MuxSession {
         self.inbound.reserve(payload.len());
         self.inbound.extend(payload);
         self.rcv_nxt = self.rcv_nxt.wrapping_add(payload.len() as u32);
+        if header.is_fin() {
+            self.peer_fin = Some(self.rcv_nxt);
+            self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
+        }
         self.owe_ack = true;
         Ok(SessionEvent::Data {
             bytes: payload.len(),
@@ -282,12 +303,30 @@ impl MuxSession {
         if usable > 0 && !self.outbound.is_empty() {
             let take = self.outbound.len().min(self.config.mss).min(usable);
             if self.may_send_now(take) {
+                let starts_flight = self.unacknowledged.is_empty();
                 let payload = self.take_outbound(take);
+                self.unacknowledged.extend(&payload);
+                if starts_flight {
+                    self.send_epoch = self.send_epoch.wrapping_add(1);
+                }
                 let header = self.ack_header(self.snd_nxt);
                 self.snd_nxt = self.snd_nxt.wrapping_add(take as u32);
                 self.owe_ack = false;
                 return Some(Segment { header, payload });
             }
+        }
+        if usable > 0 && self.outbound.is_empty() && self.write_shutdown && self.sent_fin.is_none()
+        {
+            let mut header = self.ack_header(self.snd_nxt);
+            header.flags |= flags::FIN;
+            self.sent_fin = Some(self.snd_nxt);
+            self.snd_nxt = self.snd_nxt.wrapping_add(1);
+            self.send_epoch = self.send_epoch.wrapping_add(1);
+            self.owe_ack = false;
+            return Some(Segment {
+                header,
+                payload: Vec::new(),
+            });
         }
         if self.owe_ack {
             self.owe_ack = false;
@@ -297,6 +336,44 @@ impl MuxSession {
             });
         }
         None
+    }
+
+    pub fn retransmit_unacknowledged(&self) -> Option<Segment> {
+        if self.state != SessionState::Established {
+            return None;
+        }
+        if self.unacknowledged.is_empty() {
+            let sequence = self.sent_fin?;
+            if self.snd_una != sequence {
+                return None;
+            }
+            let mut header = self.ack_header(sequence);
+            header.flags |= flags::FIN;
+            return Some(Segment {
+                header,
+                payload: Vec::new(),
+            });
+        }
+        let room = self.snd_wnd_edge.wrapping_sub(self.snd_una);
+        if (room as i32) <= 0 {
+            return None;
+        }
+        let take = self
+            .unacknowledged
+            .len()
+            .min(self.config.mss)
+            .min(room as usize);
+        let (front, back) = self.unacknowledged.as_slices();
+        let from_front = front.len().min(take);
+        let mut payload = Vec::with_capacity(take);
+        payload.extend_from_slice(&front[..from_front]);
+        if from_front < take {
+            payload.extend_from_slice(&back[..take - from_front]);
+        }
+        Some(Segment {
+            header: self.ack_header(self.snd_una),
+            payload,
+        })
     }
 
     pub fn request_ack(&mut self) {
@@ -318,7 +395,38 @@ impl MuxSession {
         true
     }
 
-    // A reset is the only teardown the device cleans up without answering; a FIN draws a reset back.
+    pub fn shutdown_write(&mut self) -> Result<(), SessionError> {
+        if self.state != SessionState::Established {
+            return Err(SessionError::Closed);
+        }
+        self.write_shutdown = true;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn can_write(&self) -> bool {
+        self.state == SessionState::Established && !self.write_shutdown
+    }
+
+    #[must_use]
+    pub fn received_eof(&self) -> bool {
+        self.peer_fin.is_some() && self.inbound.is_empty()
+    }
+
+    #[must_use]
+    pub fn orderly_closed(&self) -> bool {
+        self.state == SessionState::Established
+            && self.received_eof()
+            && self.sent_fin.is_some()
+            && self.snd_una == self.snd_nxt
+    }
+
+    #[must_use]
+    pub fn pending_sequences(&self) -> usize {
+        self.outbound.len() + usize::from(self.write_shutdown && self.sent_fin.is_none())
+    }
+
+    // Abortive close discards the session immediately. Orderly close is handled by its FIN exchange.
     pub fn close(&mut self) -> Segment {
         self.state = SessionState::Closed;
         let header = TcpHeader {
@@ -359,6 +467,11 @@ impl MuxSession {
     #[must_use]
     pub fn snd_wnd_edge(&self) -> u32 {
         self.snd_wnd_edge
+    }
+
+    #[must_use]
+    pub fn send_epoch(&self) -> u64 {
+        self.send_epoch
     }
 
     #[must_use]
@@ -431,6 +544,146 @@ mod tests {
             SessionEvent::Established
         );
         session
+    }
+
+    fn peer_fin(session: &MuxSession, sequence: u32) -> TcpHeader {
+        TcpHeader {
+            source_port: RESTORED_PORT,
+            destination_port: HOST_PORT,
+            sequence,
+            acknowledgement: session.snd_nxt,
+            flags: flags::ACK | flags::FIN,
+            window: 65536,
+        }
+    }
+
+    #[test]
+    fn payload_and_fin_preserve_bytes_and_consume_the_final_sequence() {
+        let mut session = established();
+        let header = peer_fin(&session, 1);
+        assert_eq!(
+            session.on_segment(&header, b"log").unwrap(),
+            SessionEvent::Data { bytes: 3 }
+        );
+        assert_eq!(session.received_len(), 3);
+        assert_eq!(session.next_segment().unwrap().header.acknowledgement, 5);
+        let mut bytes = [0u8; 2];
+        assert_eq!(session.take_received(&mut bytes), 2);
+        assert_eq!(&bytes, b"lo");
+        assert_eq!(session.take_received(&mut bytes), 1);
+        assert_eq!(bytes[0], b'g');
+        assert!(session.received_eof());
+    }
+
+    #[test]
+    fn fin_after_buffered_payload_exposes_eof_after_the_payload_is_read() {
+        let mut session = established();
+        let mut header = peer_fin(&session, 1);
+        header.flags = flags::ACK;
+        session.on_segment(&header, b"bytes").unwrap();
+        header.sequence = 6;
+        header.flags |= flags::FIN;
+        session.on_segment(&header, &[]).unwrap();
+        let mut bytes = [0u8; 5];
+        assert_eq!(session.take_received(&mut bytes), 5);
+        assert_eq!(&bytes, b"bytes");
+        assert!(session.received_eof());
+        assert_eq!(session.next_segment().unwrap().header.acknowledgement, 7);
+    }
+
+    #[test]
+    fn duplicate_fin_repeats_its_acknowledgement_without_replaying_payload() {
+        let mut session = established();
+        let header = peer_fin(&session, 1);
+        session.on_segment(&header, b"end").unwrap();
+        assert_eq!(session.next_segment().unwrap().header.acknowledgement, 5);
+        assert_eq!(
+            session.on_segment(&header, b"end").unwrap(),
+            SessionEvent::OutOfOrder {
+                expected: 5,
+                received: 1
+            }
+        );
+        assert_eq!(session.next_segment().unwrap().header.acknowledgement, 5);
+        let mut bytes = [0u8; 6];
+        assert_eq!(session.take_received(&mut bytes), 3);
+        assert_eq!(&bytes[..3], b"end");
+        assert!(session.received_eof());
+    }
+
+    #[test]
+    fn a_fin_ahead_of_payload_is_acknowledged_at_the_contiguous_sequence() {
+        let mut session = established();
+        let mut header = peer_fin(&session, 4);
+        assert_eq!(
+            session.on_segment(&header, &[]).unwrap(),
+            SessionEvent::OutOfOrder {
+                expected: 1,
+                received: 4
+            }
+        );
+        assert_eq!(session.next_segment().unwrap().header.acknowledgement, 1);
+        header.sequence = 1;
+        header.flags = flags::ACK;
+        session.on_segment(&header, b"end").unwrap();
+        header.sequence = 4;
+        header.flags = flags::FIN;
+        session.on_segment(&header, &[]).unwrap();
+        assert_eq!(session.next_segment().unwrap().header.acknowledgement, 5);
+        session.on_segment(&header, &[]).unwrap();
+        assert_eq!(session.next_segment().unwrap().header.acknowledgement, 5);
+        let mut bytes = [0u8; 3];
+        assert_eq!(session.take_received(&mut bytes), 3);
+        assert_eq!(&bytes, b"end");
+        assert!(session.received_eof());
+    }
+
+    #[test]
+    fn fin_sequences_and_acknowledgements_wrap_with_payload() {
+        let mut session = established();
+        session.rcv_nxt = u32::MAX - 1;
+        let header = peer_fin(&session, u32::MAX - 1);
+        session.on_segment(&header, b"xy").unwrap();
+        assert_eq!(session.next_segment().unwrap().header.acknowledgement, 1);
+        let mut bytes = [0u8; 2];
+        assert_eq!(session.take_received(&mut bytes), 2);
+        assert_eq!(&bytes, b"xy");
+        assert!(session.received_eof());
+        session.snd_nxt = u32::MAX;
+        session.snd_una = u32::MAX;
+        session.snd_wnd_edge = 1023;
+        session.shutdown_write().unwrap();
+        let fin = session.next_segment().unwrap();
+        assert_eq!(fin.header.sequence, u32::MAX);
+        assert_eq!(fin.header.flags, flags::ACK | flags::FIN);
+        assert_eq!(session.snd_nxt, 0);
+        let mut ack = peer_fin(&session, 1);
+        ack.flags = flags::ACK;
+        session.on_segment(&ack, &[]).unwrap();
+        assert!(session.orderly_closed());
+    }
+
+    #[test]
+    fn host_fin_is_retransmitted_and_acknowledged_separately_from_bytes() {
+        let mut session = established();
+        session.queue(b"reply");
+        let data = session.next_segment().unwrap();
+        session.shutdown_write().unwrap();
+        let fin = session.next_segment().unwrap();
+        assert_eq!(fin.header.flags, flags::FIN | flags::ACK);
+        assert_eq!(fin.header.sequence, data.header.sequence.wrapping_add(5));
+        let mut ack = peer_fin(&session, 1);
+        ack.flags = flags::ACK;
+        ack.acknowledgement = fin.header.sequence;
+        session.on_segment(&ack, &[]).unwrap();
+        assert_eq!(session.retransmit_unacknowledged().unwrap(), fin);
+        assert_eq!(session.in_flight(), 1);
+        ack.acknowledgement = fin.header.sequence.wrapping_add(1);
+        session.on_segment(&ack, &[]).unwrap();
+        assert_eq!(session.snd_una(), session.snd_nxt());
+        ack.flags |= flags::FIN;
+        session.on_segment(&ack, &[]).unwrap();
+        assert!(session.orderly_closed());
     }
 
     #[test]
@@ -660,6 +913,27 @@ mod tests {
     }
 
     #[test]
+    fn retransmission_fits_the_device_current_window_and_continues_after_acknowledgement() {
+        let (mut session, base) = retracting_device();
+        let payload: Vec<u8> = (0..(1 << 20)).map(|byte| byte as u8).collect();
+        session.queue(&payload);
+        let first = session.next_segment().expect("the initial window is open");
+        assert_eq!(first.payload, payload[..16640]);
+
+        let retracted = device_ack(&session, base.wrapping_add(248), 256);
+        session.on_segment(&retracted, &[]).unwrap();
+        let retry = session.retransmit_unacknowledged().expect("256 bytes fit");
+        assert_eq!(retry.header.sequence, base.wrapping_add(248));
+        assert_eq!(retry.payload, payload[248..504]);
+
+        let delivered = device_ack(&session, base.wrapping_add(16640), 16384);
+        session.on_segment(&delivered, &[]).unwrap();
+        let next = session.next_segment().expect("the next window is open");
+        assert_eq!(next.header.sequence, base.wrapping_add(16640));
+        assert_eq!(next.payload, payload[16640..33024]);
+    }
+
+    #[test]
     fn a_window_probe_consumes_no_sequence_space() {
         let (mut session, base) = retracting_device();
         session.queue(&vec![0xCC; 1 << 20]);
@@ -849,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn anything_but_a_bare_ack_on_an_established_session_ends_it() {
+    fn unsupported_push_flags_close_the_session_by_name() {
         let mut session = established();
         let header = TcpHeader {
             source_port: RESTORED_PORT,

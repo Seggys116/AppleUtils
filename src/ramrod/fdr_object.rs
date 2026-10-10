@@ -4,6 +4,11 @@ use std::path::{Path, PathBuf};
 use crate::crypto::{P256PrivateKey, Sha256};
 
 use super::der;
+use super::fdr_material_format::{
+    FDR_MATERIAL_CREATION_FILE_NAME, FDR_MATERIAL_FILE_NAME, FdrAuthorityDescriptor,
+    FdrMaterialCreationInputs, FdrMaterialCreationRecord, FdrMaterialDescriptor,
+    FdrMaterialFormatError,
+};
 use super::fdr_pki::{
     CertificateIdentity, DEFAULT_LEAF_COMMON_NAME, DEFAULT_ORGANIZATION,
     DEFAULT_ROOT_CA_COMMON_NAME, DEFAULT_TLS_ROOT_COMMON_NAME, DistinguishedName,
@@ -36,6 +41,14 @@ pub const SEALING_LEAF_SERIAL_FILE_NAME: &str = "sealing-leaf.serial";
 
 #[derive(Debug)]
 pub enum FdrObjectError {
+    MaterialFormat(FdrMaterialFormatError),
+    UnrecordedMaterial {
+        path: PathBuf,
+    },
+    PortableRefusal {
+        name: &'static str,
+        detail: String,
+    },
     EmptyCertificate {
         which: &'static str,
     },
@@ -65,6 +78,13 @@ pub enum FdrObjectError {
 impl std::fmt::Display for FdrObjectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MaterialFormat(error) => write!(f, "{error}"),
+            Self::UnrecordedMaterial { path } => write!(
+                f,
+                "fdr-material-unrecorded-existing: {} requires explicit owner-profile adoption",
+                path.display()
+            ),
+            Self::PortableRefusal { name, detail } => write!(f, "fdr-material-{name}: {detail}"),
             Self::EmptyCertificate { which } => {
                 write!(f, "the {which} element was given no certificate")
             }
@@ -99,6 +119,220 @@ impl From<PkiError> for FdrObjectError {
     fn from(error: PkiError) -> Self {
         Self::Pki(error)
     }
+}
+
+impl From<FdrMaterialFormatError> for FdrObjectError {
+    fn from(error: FdrMaterialFormatError) -> Self {
+        Self::MaterialFormat(error)
+    }
+}
+
+fn portable_refusal(name: &'static str, detail: impl std::fmt::Display) -> FdrObjectError {
+    FdrObjectError::PortableRefusal {
+        name,
+        detail: detail.to_string(),
+    }
+}
+
+pub(crate) fn sdk_material_descriptor(not_before: i64, not_after: i64) -> FdrMaterialDescriptor {
+    FdrMaterialDescriptor::new(
+        FdrAuthorityDescriptor::new(
+            FDR_ROOT_CA_KEY_DOMAIN,
+            &DistinguishedName::new()
+                .common_name(DEFAULT_ROOT_CA_COMMON_NAME)
+                .organization(DEFAULT_ORGANIZATION),
+            not_before,
+            not_after,
+        ),
+        FdrAuthorityDescriptor::new(
+            FDR_TLS_ROOT_KEY_DOMAIN,
+            &DistinguishedName::new()
+                .common_name(DEFAULT_TLS_ROOT_COMMON_NAME)
+                .organization(DEFAULT_ORGANIZATION),
+            not_before,
+            not_after,
+        ),
+    )
+}
+
+fn read_portable_serial(directory: &Path, filename: &str) -> Result<Vec<u8>, FdrObjectError> {
+    let path = directory.join(filename);
+    let serial = fs::read(&path).map_err(|error| {
+        portable_refusal("serial-unreadable", format!("{}: {error}", path.display()))
+    })?;
+    if serial.is_empty() || serial.len() > MAXIMUM_SERIAL_BYTES {
+        return Err(portable_refusal(
+            "serial-invalid",
+            format!("{} holds {} bytes", path.display(), serial.len()),
+        ));
+    }
+    Ok(serial)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CreationPublication {
+    Record,
+    RootCaSeed,
+    TlsRootSeed,
+    RootCaSerial,
+    TlsRootSerial,
+    Descriptor,
+}
+
+impl CreationPublication {
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::Record => FDR_MATERIAL_CREATION_FILE_NAME,
+            Self::RootCaSeed => ROOT_CA_SEED_FILE_NAME,
+            Self::TlsRootSeed => TLS_ROOT_SEED_FILE_NAME,
+            Self::RootCaSerial => ROOT_CA_SERIAL_FILE_NAME,
+            Self::TlsRootSerial => TLS_ROOT_SERIAL_FILE_NAME,
+            Self::Descriptor => FDR_MATERIAL_FILE_NAME,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationBoundary {
+    Before,
+    After,
+}
+
+struct ValidatedCreation {
+    inputs: FdrMaterialCreationInputs,
+    material: FdrTrustMaterial,
+}
+
+fn validate_creation(
+    record: &FdrMaterialCreationRecord,
+) -> Result<ValidatedCreation, FdrObjectError> {
+    let inputs = record.inputs()?;
+    let root_domain = inputs.descriptor.root_ca.key_derivation_domain("rootCa")?;
+    let tls_domain = inputs
+        .descriptor
+        .tls_root
+        .key_derivation_domain("tlsRoot")?;
+    let root_identity = CertificateIdentity {
+        subject: inputs.descriptor.root_ca.subject_name("rootCa")?,
+        serial: inputs.root_ca_serial.clone(),
+        not_before: inputs.descriptor.root_ca.not_before,
+        not_after: inputs.descriptor.root_ca.not_after,
+    };
+    let tls_identity = CertificateIdentity {
+        subject: inputs.descriptor.tls_root.subject_name("tlsRoot")?,
+        serial: inputs.tls_root_serial.clone(),
+        not_before: inputs.descriptor.tls_root.not_before,
+        not_after: inputs.descriptor.tls_root.not_after,
+    };
+    let material = FdrTrustMaterial::issue(
+        FdrKeyPair::from_seed(inputs.root_ca_seed, &root_domain),
+        FdrKeyPair::from_seed(inputs.tls_root_seed, &tls_domain),
+        &root_identity,
+        &tls_identity,
+    )
+    .map_err(|_| {
+        portable_refusal(
+            "creation-invalid",
+            "recorded authority identity cannot be issued",
+        )
+    })?;
+    Ok(ValidatedCreation { inputs, material })
+}
+
+fn creation_file_matches(path: &Path, expected: &[u8]) -> Result<bool, FdrObjectError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(portable_refusal(
+                "creation-unreadable",
+                format!("{}: {error}", path.display()),
+            ));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Err(portable_refusal(
+            "creation-conflict",
+            format!("{} must be a regular authority member", path.display()),
+        ));
+    }
+    let actual = fs::read(path).map_err(|error| {
+        portable_refusal(
+            "creation-unreadable",
+            format!("{}: {error}", path.display()),
+        )
+    })?;
+    if actual != expected {
+        return Err(portable_refusal(
+            "creation-conflict",
+            format!(
+                "{} differs from the selected creation record",
+                path.display()
+            ),
+        ));
+    }
+    Ok(true)
+}
+
+fn publish_creation_file(
+    directory: &Path,
+    stage: CreationPublication,
+    bytes: &[u8],
+    publisher: &mut impl FnMut(PublicationBoundary, CreationPublication) -> Result<(), FdrObjectError>,
+) -> Result<(), FdrObjectError> {
+    use std::io::Write as _;
+    publisher(PublicationBoundary::Before, stage)?;
+    let path = directory.join(stage.file_name());
+    if !creation_file_matches(&path, bytes)? {
+        let mut temporary = tempfile::NamedTempFile::new_in(directory).map_err(|error| {
+            portable_refusal(
+                "creation-unreadable",
+                format!("{}: {error}", path.display()),
+            )
+        })?;
+        temporary
+            .write_all(bytes)
+            .and_then(|_| temporary.as_file().sync_all())
+            .map_err(|error| {
+                portable_refusal(
+                    "creation-unreadable",
+                    format!("{}: {error}", path.display()),
+                )
+            })?;
+        match temporary.persist_noclobber(&path) {
+            Ok(_) => {}
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(portable_refusal(
+                    "creation-unreadable",
+                    format!("{}: {}", path.display(), error.error),
+                ));
+            }
+        }
+        if !creation_file_matches(&path, bytes)? {
+            return Err(portable_refusal(
+                "creation-unreadable",
+                format!("{} could not be read after publication", path.display()),
+            ));
+        }
+    }
+    publisher(PublicationBoundary::After, stage)
+}
+
+fn refuse_pending_creation(directory: &Path) -> Result<(), FdrObjectError> {
+    let path = directory.join(FDR_MATERIAL_FILE_NAME);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(FdrMaterialFormatError::Read { path, error }.into()),
+    }
+    if FdrMaterialCreationRecord::load(directory)?.is_some() {
+        return Err(portable_refusal(
+            "creation-conflict",
+            "explicit legacy adoption cannot replace a pending creation transaction",
+        ));
+    }
+    Ok(())
 }
 
 fn tagged_element(tag: &str, body: &[u8]) -> Vec<u8> {
@@ -179,6 +413,221 @@ impl SealingLeaf {
 }
 
 impl FdrTrustMaterial {
+    pub fn load_from_directory(directory: &Path) -> Result<Self, FdrObjectError> {
+        let descriptor = FdrMaterialDescriptor::load(directory)?;
+        Self::load_with_descriptor(directory, &descriptor)
+    }
+
+    pub(crate) fn load_with_descriptor(
+        directory: &Path,
+        descriptor: &FdrMaterialDescriptor,
+    ) -> Result<Self, FdrObjectError> {
+        descriptor.validate()?;
+        let root_domain = descriptor.root_ca.key_derivation_domain("rootCa")?;
+        let tls_domain = descriptor.tls_root.key_derivation_domain("tlsRoot")?;
+        let root_key = FdrKeyPair::load(&directory.join(ROOT_CA_SEED_FILE_NAME), &root_domain)
+            .map_err(|error| portable_refusal("root-key-unreadable", error))?;
+        let tls_key = FdrKeyPair::load(&directory.join(TLS_ROOT_SEED_FILE_NAME), &tls_domain)
+            .map_err(|error| portable_refusal("tls-key-unreadable", error))?;
+        let root_identity = CertificateIdentity {
+            subject: descriptor.root_ca.subject_name("rootCa")?,
+            serial: read_portable_serial(directory, ROOT_CA_SERIAL_FILE_NAME)?,
+            not_before: descriptor.root_ca.not_before,
+            not_after: descriptor.root_ca.not_after,
+        };
+        let tls_identity = CertificateIdentity {
+            subject: descriptor.tls_root.subject_name("tlsRoot")?,
+            serial: read_portable_serial(directory, TLS_ROOT_SERIAL_FILE_NAME)?,
+            not_before: descriptor.tls_root.not_before,
+            not_after: descriptor.tls_root.not_after,
+        };
+        Self::issue(root_key, tls_key, &root_identity, &tls_identity)
+            .map_err(|error| portable_refusal("identity-invalid", error))
+    }
+
+    pub fn adopt_legacy_material(
+        directory: &Path,
+        descriptor: &FdrMaterialDescriptor,
+        expected_trust_object: &[u8],
+    ) -> Result<Self, FdrObjectError> {
+        refuse_pending_creation(directory)?;
+        let material = Self::load_with_descriptor(directory, descriptor)?;
+        if material.trust_object() != expected_trust_object {
+            return Err(portable_refusal(
+                "legacy-object-mismatch",
+                "the explicit owner profile does not reproduce the expected trust object",
+            ));
+        }
+        refuse_pending_creation(directory)?;
+        descriptor.write_new(directory)?;
+        Ok(material)
+    }
+
+    pub fn load_or_generate_portable(
+        directory: &Path,
+        not_before: i64,
+        not_after: i64,
+    ) -> Result<Self, FdrObjectError> {
+        Self::load_or_generate_portable_with_publisher(
+            directory,
+            not_before,
+            not_after,
+            &mut |_, _| Ok(()),
+        )
+    }
+
+    fn load_committed_portable(
+        directory: &Path,
+        not_before: i64,
+        not_after: i64,
+    ) -> Result<Option<Self>, FdrObjectError> {
+        let path = directory.join(FDR_MATERIAL_FILE_NAME);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let descriptor = FdrMaterialDescriptor::load(directory)?;
+                descriptor.require_window(not_before, not_after)?;
+                Self::load_with_descriptor(directory, &descriptor).map(Some)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(FdrMaterialFormatError::Read { path, error }.into()),
+        }
+    }
+
+    fn resume_creation(
+        directory: &Path,
+        record: &FdrMaterialCreationRecord,
+        not_before: i64,
+        not_after: i64,
+        publisher: &mut impl FnMut(
+            PublicationBoundary,
+            CreationPublication,
+        ) -> Result<(), FdrObjectError>,
+    ) -> Result<Self, FdrObjectError> {
+        let selected = validate_creation(record)?;
+        selected
+            .inputs
+            .descriptor
+            .require_window(not_before, not_after)?;
+        let files: [(CreationPublication, &[u8]); 5] = [
+            (
+                CreationPublication::RootCaSeed,
+                &selected.inputs.root_ca_seed,
+            ),
+            (
+                CreationPublication::TlsRootSeed,
+                &selected.inputs.tls_root_seed,
+            ),
+            (
+                CreationPublication::RootCaSerial,
+                &selected.inputs.root_ca_serial,
+            ),
+            (
+                CreationPublication::TlsRootSerial,
+                &selected.inputs.tls_root_serial,
+            ),
+            (
+                CreationPublication::Descriptor,
+                record.descriptor_json.as_bytes(),
+            ),
+        ];
+        for (stage, bytes) in &files {
+            creation_file_matches(&directory.join(stage.file_name()), bytes)?;
+        }
+        for (stage, bytes) in files {
+            publish_creation_file(directory, stage, bytes, publisher)?;
+        }
+        let loaded = Self::load_from_directory(directory)?;
+        if loaded.trust_object() != selected.material.trust_object() {
+            return Err(portable_refusal(
+                "creation-conflict",
+                "published authority does not reproduce the selected trust object",
+            ));
+        }
+        Ok(loaded)
+    }
+
+    fn load_or_generate_portable_with_publisher(
+        directory: &Path,
+        not_before: i64,
+        not_after: i64,
+        publisher: &mut impl FnMut(
+            PublicationBoundary,
+            CreationPublication,
+        ) -> Result<(), FdrObjectError>,
+    ) -> Result<Self, FdrObjectError> {
+        if let Some(committed) = Self::load_committed_portable(directory, not_before, not_after)? {
+            return Ok(committed);
+        }
+        if let Some(record) = FdrMaterialCreationRecord::load(directory)? {
+            return Self::resume_creation(directory, &record, not_before, not_after, publisher);
+        }
+        for filename in [
+            ROOT_CA_SEED_FILE_NAME,
+            TLS_ROOT_SEED_FILE_NAME,
+            ROOT_CA_SERIAL_FILE_NAME,
+            TLS_ROOT_SERIAL_FILE_NAME,
+        ] {
+            let path = directory.join(filename);
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    if let Some(committed) =
+                        Self::load_committed_portable(directory, not_before, not_after)?
+                    {
+                        return Ok(committed);
+                    }
+                    if let Some(record) = FdrMaterialCreationRecord::load(directory)? {
+                        return Self::resume_creation(
+                            directory, &record, not_before, not_after, publisher,
+                        );
+                    }
+                    return Err(FdrObjectError::UnrecordedMaterial { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(portable_refusal(
+                        "creation-unreadable",
+                        format!("{}: {error}", path.display()),
+                    ));
+                }
+            }
+        }
+        let descriptor = sdk_material_descriptor(not_before, not_after);
+        descriptor.validate()?;
+        let root_key = FdrKeyPair::generate(FDR_ROOT_CA_KEY_DOMAIN)?;
+        let tls_key = FdrKeyPair::generate(FDR_TLS_ROOT_KEY_DOMAIN)?;
+        let candidate = FdrMaterialCreationRecord::new(
+            &descriptor,
+            root_key.seed(),
+            tls_key.seed(),
+            &random_serial()?,
+            &random_serial()?,
+        )?;
+        validate_creation(&candidate)?;
+        fs::create_dir_all(directory).map_err(|error| {
+            portable_refusal(
+                "creation-unreadable",
+                format!("{}: {error}", directory.display()),
+            )
+        })?;
+        if let Some(committed) = Self::load_committed_portable(directory, not_before, not_after)? {
+            return Ok(committed);
+        }
+        publisher(PublicationBoundary::Before, CreationPublication::Record)?;
+        let record = if candidate.publish_new(directory)? {
+            candidate
+        } else {
+            FdrMaterialCreationRecord::load(directory)?.ok_or_else(|| {
+                portable_refusal(
+                    "creation-unreadable",
+                    "the competing creator's record could not be read",
+                )
+            })?
+        };
+        validate_creation(&record)?;
+        publisher(PublicationBoundary::After, CreationPublication::Record)?;
+        Self::resume_creation(directory, &record, not_before, not_after, publisher)
+    }
+
     pub fn issue(
         root_ca_key: FdrKeyPair,
         tls_root_key: FdrKeyPair,
@@ -415,6 +864,691 @@ mod tests {
             &tls_root_identity,
         )
         .expect("the trust material must issue")
+    }
+
+    fn portable_snapshot(directory: &Path) -> Vec<Vec<u8>> {
+        [
+            ROOT_CA_SEED_FILE_NAME,
+            TLS_ROOT_SEED_FILE_NAME,
+            ROOT_CA_SERIAL_FILE_NAME,
+            TLS_ROOT_SERIAL_FILE_NAME,
+            FDR_MATERIAL_FILE_NAME,
+        ]
+        .iter()
+        .map(|name| fs::read(directory.join(name)).unwrap())
+        .collect()
+    }
+
+    fn legacy_snapshot(directory: &Path) -> Vec<Vec<u8>> {
+        [
+            ROOT_CA_SEED_FILE_NAME,
+            TLS_ROOT_SEED_FILE_NAME,
+            ROOT_CA_SERIAL_FILE_NAME,
+            TLS_ROOT_SERIAL_FILE_NAME,
+        ]
+        .iter()
+        .map(|name| fs::read(directory.join(name)).unwrap())
+        .collect()
+    }
+
+    #[test]
+    fn portable_sdk_material_retains_identity_and_readonly_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected =
+            FdrTrustMaterial::load_or_generate_portable(directory.path(), NOT_BEFORE, NOT_AFTER)
+                .unwrap();
+        let before = portable_snapshot(directory.path());
+        let loaded = FdrTrustMaterial::load_from_directory(directory.path()).unwrap();
+        assert_eq!(
+            loaded.root_ca_key().public_uncompressed(),
+            expected.root_ca_key().public_uncompressed()
+        );
+        assert_eq!(loaded.root_ca_certificate(), expected.root_ca_certificate());
+        assert_eq!(
+            loaded.tls_root_certificate(),
+            expected.tls_root_certificate()
+        );
+        assert_eq!(loaded.trust_object(), expected.trust_object());
+        assert_eq!(loaded.digest(), expected.digest());
+        assert_eq!(portable_snapshot(directory.path()), before);
+        let sdk =
+            FdrTrustMaterial::load_or_generate(directory.path(), NOT_BEFORE, NOT_AFTER).unwrap();
+        assert_eq!(loaded.trust_object(), sdk.trust_object());
+        assert_eq!(
+            FdrMaterialDescriptor::load(directory.path()).unwrap(),
+            sdk_material_descriptor(NOT_BEFORE, NOT_AFTER)
+        );
+    }
+
+    #[test]
+    fn readonly_material_preserves_the_recorded_authority_profile() {
+        use super::super::fdr_pki::NameAttribute;
+        let directory = tempfile::tempdir().unwrap();
+        let root_domain = b"fixture owner root derivation\0";
+        let tls_domain = b"fixture owner TLS derivation\xff";
+        let root_subject = DistinguishedName::new()
+            .organization("fixture owner")
+            .common_name("fixture sealing root")
+            .with(NameAttribute::StateOrProvinceName, "fixture state");
+        let tls_subject = DistinguishedName::new()
+            .common_name("fixture TLS root")
+            .organization("fixture owner");
+        let descriptor = FdrMaterialDescriptor::new(
+            FdrAuthorityDescriptor::new(root_domain, &root_subject, NOT_BEFORE, NOT_AFTER),
+            FdrAuthorityDescriptor::new(tls_domain, &tls_subject, NOT_BEFORE + 1, NOT_AFTER + 2),
+        );
+        let root_seed = [0x26; FDR_KEY_SEED_BYTES];
+        let tls_seed = [0x72; FDR_KEY_SEED_BYTES];
+        let root_serial = vec![0x13, 0x27];
+        let tls_serial = vec![0x21, 0x42];
+        fs::write(directory.path().join(ROOT_CA_SEED_FILE_NAME), root_seed).unwrap();
+        fs::write(directory.path().join(TLS_ROOT_SEED_FILE_NAME), tls_seed).unwrap();
+        fs::write(
+            directory.path().join(ROOT_CA_SERIAL_FILE_NAME),
+            &root_serial,
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(TLS_ROOT_SERIAL_FILE_NAME),
+            &tls_serial,
+        )
+        .unwrap();
+        descriptor.write_new(directory.path()).unwrap();
+        let expected = FdrTrustMaterial::issue(
+            FdrKeyPair::from_seed(root_seed, root_domain),
+            FdrKeyPair::from_seed(tls_seed, tls_domain),
+            &CertificateIdentity {
+                subject: root_subject.clone(),
+                serial: root_serial,
+                not_before: NOT_BEFORE,
+                not_after: NOT_AFTER,
+            },
+            &CertificateIdentity {
+                subject: tls_subject,
+                serial: tls_serial,
+                not_before: NOT_BEFORE + 1,
+                not_after: NOT_AFTER + 2,
+            },
+        )
+        .unwrap();
+        let before = portable_snapshot(directory.path());
+        let loaded = FdrTrustMaterial::load_from_directory(directory.path()).unwrap();
+        assert_eq!(
+            loaded.root_ca_subject().attributes(),
+            root_subject.attributes()
+        );
+        assert_eq!(
+            loaded.root_ca_key().public_uncompressed(),
+            expected.root_ca_key().public_uncompressed()
+        );
+        assert_eq!(
+            loaded.tls_root_key().public_uncompressed(),
+            expected.tls_root_key().public_uncompressed()
+        );
+        assert_eq!(loaded.root_ca_certificate(), expected.root_ca_certificate());
+        assert_eq!(
+            loaded.tls_root_certificate(),
+            expected.tls_root_certificate()
+        );
+        assert_eq!(loaded.trust_object(), expected.trust_object());
+        assert_eq!(loaded.digest(), expected.digest());
+        assert_eq!(portable_snapshot(directory.path()), before);
+    }
+
+    #[test]
+    fn portable_reload_preserves_recorded_profile_and_refuses_window_contradictions() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected =
+            FdrTrustMaterial::load_or_generate_portable(directory.path(), NOT_BEFORE, NOT_AFTER)
+                .unwrap();
+        let before = portable_snapshot(directory.path());
+        let loaded =
+            FdrTrustMaterial::load_or_generate_portable(directory.path(), NOT_BEFORE, NOT_AFTER)
+                .unwrap();
+        assert_eq!(loaded.trust_object(), expected.trust_object());
+        let error = FdrTrustMaterial::load_or_generate_portable(
+            directory.path(),
+            NOT_BEFORE + 1,
+            NOT_AFTER,
+        )
+        .err()
+        .expect("an explicit window contradicting the descriptor must be refused");
+        assert!(
+            error.to_string().contains("fdr-material-window-mismatch"),
+            "{error}"
+        );
+        assert_eq!(portable_snapshot(directory.path()), before);
+    }
+
+    #[test]
+    fn explicit_legacy_adoption_preserves_existing_material_files_and_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected =
+            FdrTrustMaterial::load_or_generate(directory.path(), NOT_BEFORE, NOT_AFTER).unwrap();
+        let before = legacy_snapshot(directory.path());
+        let descriptor = sdk_material_descriptor(NOT_BEFORE, NOT_AFTER);
+        let adopted = FdrTrustMaterial::adopt_legacy_material(
+            directory.path(),
+            &descriptor,
+            expected.trust_object(),
+        )
+        .unwrap();
+        assert_eq!(adopted.trust_object(), expected.trust_object());
+        assert_eq!(legacy_snapshot(directory.path()), before);
+        assert_eq!(
+            FdrMaterialDescriptor::load(directory.path()).unwrap(),
+            descriptor
+        );
+        let loaded = FdrTrustMaterial::load_from_directory(directory.path()).unwrap();
+        assert_eq!(loaded.trust_object(), expected.trust_object());
+        assert_eq!(loaded.digest(), expected.digest());
+    }
+
+    #[test]
+    fn legacy_adoption_requires_the_expected_exact_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected =
+            FdrTrustMaterial::load_or_generate(directory.path(), NOT_BEFORE, NOT_AFTER).unwrap();
+        let before = legacy_snapshot(directory.path());
+        let mut mismatched = expected.trust_object().to_vec();
+        mismatched[0] ^= 1;
+        let error = FdrTrustMaterial::adopt_legacy_material(
+            directory.path(),
+            &sdk_material_descriptor(NOT_BEFORE, NOT_AFTER),
+            &mismatched,
+        )
+        .err()
+        .expect("adoption must prove the caller's exact trust object");
+        assert!(
+            error
+                .to_string()
+                .contains("fdr-material-legacy-object-mismatch"),
+            "{error}"
+        );
+        assert_eq!(legacy_snapshot(directory.path()), before);
+    }
+
+    #[test]
+    fn incomplete_or_unrecorded_portable_material_is_refused_by_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = FdrTrustMaterial::load_from_directory(directory.path())
+            .err()
+            .expect("consumption requires a declared authority profile");
+        assert!(
+            error
+                .to_string()
+                .contains("fdr-material-metadata-unreadable"),
+            "{error}"
+        );
+        let seed = [0x31; FDR_KEY_SEED_BYTES];
+        fs::write(directory.path().join(ROOT_CA_SEED_FILE_NAME), seed).unwrap();
+        let error =
+            FdrTrustMaterial::load_or_generate_portable(directory.path(), NOT_BEFORE, NOT_AFTER)
+                .err()
+                .expect("existing material requires an explicit owner profile");
+        assert!(
+            error
+                .to_string()
+                .contains("fdr-material-unrecorded-existing"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(directory.path().join(ROOT_CA_SEED_FILE_NAME)).unwrap(),
+            seed
+        );
+        let descriptor = sdk_material_descriptor(NOT_BEFORE, NOT_AFTER);
+        descriptor.write_new(directory.path()).unwrap();
+        let error = FdrTrustMaterial::load_from_directory(directory.path())
+            .err()
+            .expect("read-only consumption requires both existing keys");
+        assert!(
+            error
+                .to_string()
+                .contains("fdr-material-tls-key-unreadable"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(directory.path().join(ROOT_CA_SEED_FILE_NAME)).unwrap(),
+            seed
+        );
+    }
+
+    fn selected_creation_record() -> FdrMaterialCreationRecord {
+        let root_subject = DistinguishedName::new()
+            .organization("fixture owner")
+            .common_name("fixture authority root");
+        let tls_subject = DistinguishedName::new()
+            .common_name("fixture authority TLS root")
+            .organization("fixture owner");
+        let descriptor = FdrMaterialDescriptor::new(
+            FdrAuthorityDescriptor::new(
+                b"fixture root domain\0",
+                &root_subject,
+                NOT_BEFORE,
+                NOT_AFTER,
+            ),
+            FdrAuthorityDescriptor::new(
+                b"fixture TLS domain\xff",
+                &tls_subject,
+                NOT_BEFORE,
+                NOT_AFTER,
+            ),
+        );
+        let mut record = FdrMaterialCreationRecord::new(
+            &descriptor,
+            &[0x46; FDR_KEY_SEED_BYTES],
+            &[0x54; FDR_KEY_SEED_BYTES],
+            &[0x01, 0x23],
+            &[0x04, 0x56],
+        )
+        .unwrap();
+        record.descriptor_json = format!("\n{}\n", record.descriptor_json);
+        validate_creation(&record).unwrap();
+        record
+    }
+
+    fn assert_selected_authority(actual: &FdrTrustMaterial, expected: &FdrTrustMaterial) {
+        assert_eq!(
+            actual.root_ca_key().public_uncompressed(),
+            expected.root_ca_key().public_uncompressed()
+        );
+        assert_eq!(
+            actual.tls_root_key().public_uncompressed(),
+            expected.tls_root_key().public_uncompressed()
+        );
+        assert_eq!(actual.root_ca_certificate(), expected.root_ca_certificate());
+        assert_eq!(
+            actual.tls_root_certificate(),
+            expected.tls_root_certificate()
+        );
+        assert_eq!(actual.trust_object(), expected.trust_object());
+        assert_eq!(actual.digest(), expected.digest());
+    }
+
+    #[test]
+    fn portable_creation_retries_each_reached_publication_boundary_with_exact_authority() {
+        for stage in [
+            CreationPublication::Record,
+            CreationPublication::RootCaSeed,
+            CreationPublication::TlsRootSeed,
+            CreationPublication::RootCaSerial,
+            CreationPublication::TlsRootSerial,
+            CreationPublication::Descriptor,
+        ] {
+            for boundary in [PublicationBoundary::Before, PublicationBoundary::After] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut reached = Vec::new();
+                let error = FdrTrustMaterial::load_or_generate_portable_with_publisher(
+                    directory.path(),
+                    NOT_BEFORE,
+                    NOT_AFTER,
+                    &mut |current_boundary, current_stage| {
+                        reached.push((current_boundary, current_stage));
+                        if (current_boundary, current_stage) == (boundary, stage) {
+                            return Err(portable_refusal(
+                                "creation-unreadable",
+                                "injected process interruption at a reached publication boundary",
+                            ));
+                        }
+                        Ok(())
+                    },
+                )
+                .err()
+                .expect("the reached publication boundary must inject its failure");
+                assert!(
+                    reached.contains(&(boundary, stage)),
+                    "the requested boundary must have executed"
+                );
+                assert!(
+                    error
+                        .to_string()
+                        .contains("fdr-material-creation-unreadable"),
+                    "{error}"
+                );
+                let selected_before_retry = FdrMaterialCreationRecord::load(directory.path())
+                    .unwrap()
+                    .map(|record| validate_creation(&record).unwrap().material);
+                let recovered = FdrTrustMaterial::load_or_generate_portable(
+                    directory.path(),
+                    NOT_BEFORE,
+                    NOT_AFTER,
+                )
+                .unwrap();
+                if let Some(expected) = selected_before_retry {
+                    assert_selected_authority(&recovered, &expected);
+                }
+                let record = FdrMaterialCreationRecord::load(directory.path())
+                    .unwrap()
+                    .expect("successful creation retains its authority record");
+                let expected = validate_creation(&record).unwrap().material;
+                assert_selected_authority(&recovered, &expected);
+                let record_bytes =
+                    fs::read(directory.path().join(FDR_MATERIAL_CREATION_FILE_NAME)).unwrap();
+                let stable = FdrTrustMaterial::load_from_directory(directory.path()).unwrap();
+                assert_selected_authority(&stable, &expected);
+                assert!(
+                    fs::read(directory.path().join(FDR_MATERIAL_CREATION_FILE_NAME)).unwrap()
+                        == record_bytes,
+                    "read-only consumption must retain the exact selected record"
+                );
+                assert_eq!(
+                    fs::read(directory.path().join(FDR_MATERIAL_FILE_NAME)).unwrap(),
+                    record.descriptor_json.as_bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_portable_creators_elect_one_exact_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let election = std::sync::Barrier::new(2);
+        let (first, second) = std::thread::scope(|scope| {
+            let create = || {
+                let mut record_reached = false;
+                let material = FdrTrustMaterial::load_or_generate_portable_with_publisher(
+                    directory.path(),
+                    NOT_BEFORE,
+                    NOT_AFTER,
+                    &mut |boundary, stage| {
+                        if (boundary, stage)
+                            == (PublicationBoundary::Before, CreationPublication::Record)
+                        {
+                            record_reached = true;
+                            election.wait();
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert!(
+                    record_reached,
+                    "each competing creator must reach authority election"
+                );
+                material
+            };
+            let first = scope.spawn(create);
+            let second = scope.spawn(create);
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_selected_authority(&first, &second);
+        let record = FdrMaterialCreationRecord::load(directory.path())
+            .unwrap()
+            .expect("a creator must publish the election record");
+        let expected = validate_creation(&record).unwrap().material;
+        assert_selected_authority(&first, &expected);
+        assert_selected_authority(
+            &FdrTrustMaterial::load_from_directory(directory.path()).unwrap(),
+            &expected,
+        );
+    }
+
+    #[test]
+    fn concurrent_window_requests_preserve_the_elected_authority_and_name_the_contradiction() {
+        let directory = tempfile::tempdir().unwrap();
+        let election = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let create = |not_before| {
+                let mut record_reached = false;
+                let result = FdrTrustMaterial::load_or_generate_portable_with_publisher(
+                    directory.path(),
+                    not_before,
+                    NOT_AFTER,
+                    &mut |boundary, stage| {
+                        if (boundary, stage)
+                            == (PublicationBoundary::Before, CreationPublication::Record)
+                        {
+                            record_reached = true;
+                            election.wait();
+                        }
+                        Ok(())
+                    },
+                );
+                assert!(record_reached, "both window requests must reach election");
+                result
+            };
+            let first = scope.spawn(move || create(NOT_BEFORE));
+            let second = scope.spawn(move || create(NOT_BEFORE + 1));
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        let mut accepted = Vec::new();
+        let mut refusals = Vec::new();
+        for result in results {
+            match result {
+                Ok(material) => accepted.push(material),
+                Err(error) => refusals.push(error),
+            }
+        }
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(refusals.len(), 1);
+        assert!(
+            refusals[0]
+                .to_string()
+                .contains("fdr-material-window-mismatch")
+        );
+        let record = FdrMaterialCreationRecord::load(directory.path())
+            .unwrap()
+            .expect("the elected authority is retained");
+        assert_selected_authority(&accepted[0], &validate_creation(&record).unwrap().material);
+    }
+
+    #[test]
+    fn pending_foreign_profile_recovery_preserves_exact_descriptor_text_and_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = selected_creation_record();
+        let expected = validate_creation(&record).unwrap().material;
+        assert!(record.publish_new(directory.path()).unwrap());
+        let recovered =
+            FdrTrustMaterial::load_or_generate_portable(directory.path(), NOT_BEFORE, NOT_AFTER)
+                .unwrap();
+        assert_selected_authority(&recovered, &expected);
+        assert_eq!(
+            fs::read(directory.path().join(FDR_MATERIAL_FILE_NAME)).unwrap(),
+            record.descriptor_json.as_bytes()
+        );
+        assert_selected_authority(
+            &FdrTrustMaterial::load_from_directory(directory.path()).unwrap(),
+            &expected,
+        );
+    }
+
+    #[test]
+    fn creation_replay_conflicts_and_unreadable_records_are_named() {
+        for directory_conflict in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let record = selected_creation_record();
+            assert!(record.publish_new(directory.path()).unwrap());
+            let member = directory.path().join(ROOT_CA_SEED_FILE_NAME);
+            if directory_conflict {
+                fs::create_dir(&member).unwrap();
+            } else {
+                fs::write(&member, [0x71; FDR_KEY_SEED_BYTES]).unwrap();
+            }
+            let error = FdrTrustMaterial::load_or_generate_portable(
+                directory.path(),
+                NOT_BEFORE,
+                NOT_AFTER,
+            )
+            .err()
+            .expect("a conflicting authority member must be named");
+            assert!(
+                error.to_string().contains("fdr-material-creation-conflict"),
+                "{error}"
+            );
+            assert!(
+                error.to_string().contains(ROOT_CA_SEED_FILE_NAME),
+                "{error}"
+            );
+        }
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join(FDR_MATERIAL_CREATION_FILE_NAME)).unwrap();
+        let error =
+            FdrTrustMaterial::load_or_generate_portable(directory.path(), NOT_BEFORE, NOT_AFTER)
+                .err()
+                .expect("a nonregular creation record must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("fdr-material-creation-unreadable"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn concurrent_descriptor_publication_requires_the_selected_exact_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = selected_creation_record();
+        assert!(record.publish_new(directory.path()).unwrap());
+        let mut other = sdk_material_descriptor(NOT_BEFORE, NOT_AFTER);
+        other.root_ca.subject[0].value = "another declared owner".to_string();
+        let other_bytes = serde_json::to_vec_pretty(&other).unwrap();
+        let mut publication_reached = false;
+        let error = FdrTrustMaterial::load_or_generate_portable_with_publisher(
+            directory.path(),
+            NOT_BEFORE,
+            NOT_AFTER,
+            &mut |boundary, stage| {
+                if (boundary, stage)
+                    == (PublicationBoundary::Before, CreationPublication::Descriptor)
+                {
+                    publication_reached = true;
+                    fs::write(directory.path().join(FDR_MATERIAL_FILE_NAME), &other_bytes).unwrap();
+                }
+                Ok(())
+            },
+        )
+        .err()
+        .expect("concurrent descriptor bytes must agree with the selected authority");
+        assert!(
+            publication_reached,
+            "descriptor publication must be reached"
+        );
+        assert!(
+            error.to_string().contains("fdr-material-creation-conflict"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(directory.path().join(FDR_MATERIAL_FILE_NAME)).unwrap(),
+            other_bytes
+        );
+    }
+
+    #[test]
+    fn damaged_committed_authority_returns_its_named_read_refusal() {
+        let directory = tempfile::tempdir().unwrap();
+        FdrTrustMaterial::load_or_generate_portable(directory.path(), NOT_BEFORE, NOT_AFTER)
+            .unwrap();
+        let record_bytes =
+            fs::read(directory.path().join(FDR_MATERIAL_CREATION_FILE_NAME)).unwrap();
+        let members = legacy_snapshot(directory.path());
+        fs::write(directory.path().join(FDR_MATERIAL_FILE_NAME), b"{").unwrap();
+        let error =
+            FdrTrustMaterial::load_or_generate_portable(directory.path(), NOT_BEFORE, NOT_AFTER)
+                .err()
+                .expect("the committed descriptor remains the authority");
+        assert!(
+            error.to_string().contains("fdr-material-metadata-invalid"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(directory.path().join(FDR_MATERIAL_FILE_NAME)).unwrap(),
+            b"{"
+        );
+        assert!(
+            legacy_snapshot(directory.path()) == members,
+            "existing authority members retain their exact bytes"
+        );
+        assert!(
+            fs::read(directory.path().join(FDR_MATERIAL_CREATION_FILE_NAME)).unwrap()
+                == record_bytes,
+            "the selected private record retains its exact bytes"
+        );
+    }
+
+    #[test]
+    fn pending_creation_refuses_explicit_legacy_adoption() {
+        let directory = tempfile::tempdir().unwrap();
+        let legacy =
+            FdrTrustMaterial::load_or_generate(directory.path(), NOT_BEFORE, NOT_AFTER).unwrap();
+        let before = legacy_snapshot(directory.path());
+        let record = selected_creation_record();
+        assert!(record.publish_new(directory.path()).unwrap());
+        let error = FdrTrustMaterial::adopt_legacy_material(
+            directory.path(),
+            &sdk_material_descriptor(NOT_BEFORE, NOT_AFTER),
+            legacy.trust_object(),
+        )
+        .err()
+        .expect("pending authority election must be handled by its producer");
+        assert!(
+            error.to_string().contains("fdr-material-creation-conflict"),
+            "{error}"
+        );
+        assert!(
+            legacy_snapshot(directory.path()) == before,
+            "legacy authority bytes are preserved"
+        );
+        let retained = FdrMaterialCreationRecord::load(directory.path())
+            .unwrap()
+            .expect("the selected record is retained");
+        assert_eq!(retained.descriptor_json, record.descriptor_json);
+    }
+
+    #[test]
+    fn malformed_and_unissuable_creation_records_are_refused_by_name() {
+        let record = selected_creation_record();
+        let original = serde_json::to_value(&record).unwrap();
+        for (field, value) in [
+            ("creationVersion", serde_json::json!(2)),
+            ("rootCaSeedHex", serde_json::json!("41".repeat(31))),
+            ("tlsRootSeedHex", serde_json::json!("+f".repeat(32))),
+            (
+                "rootCaSerialHex",
+                serde_json::json!("01".repeat(MAXIMUM_SERIAL_BYTES + 1)),
+            ),
+            ("tlsRootSerialHex", serde_json::json!("00")),
+            ("descriptorJson", serde_json::json!("{}")),
+            ("undeclared", serde_json::json!(true)),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut malformed = original.clone();
+            malformed[field] = value;
+            fs::write(
+                directory.path().join(FDR_MATERIAL_CREATION_FILE_NAME),
+                serde_json::to_vec(&malformed).unwrap(),
+            )
+            .unwrap();
+            let error = FdrTrustMaterial::load_or_generate_portable(
+                directory.path(),
+                NOT_BEFORE,
+                NOT_AFTER,
+            )
+            .err()
+            .expect("creation metadata must be validated before replay");
+            assert!(
+                error.to_string().contains("fdr-material-creation-invalid"),
+                "{error}"
+            );
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut malformed = original;
+        let mut descriptor = sdk_material_descriptor(NOT_BEFORE, NOT_AFTER);
+        descriptor.root_ca.subject[0].value = "Apple".to_string();
+        malformed["descriptorJson"] =
+            serde_json::json!(serde_json::to_string(&descriptor).unwrap());
+        fs::write(
+            directory.path().join(FDR_MATERIAL_CREATION_FILE_NAME),
+            serde_json::to_vec(&malformed).unwrap(),
+        )
+        .unwrap();
+        let error =
+            FdrTrustMaterial::load_or_generate_portable(directory.path(), NOT_BEFORE, NOT_AFTER)
+                .err()
+                .expect("recorded certificate identities must be issuable before replay");
+        assert!(
+            error.to_string().contains("fdr-material-creation-invalid"),
+            "{error}"
+        );
     }
 
     fn take(bytes: &[u8]) -> (u8, &[u8], &[u8]) {

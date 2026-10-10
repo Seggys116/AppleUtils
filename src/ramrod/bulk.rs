@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::asr_server::payload::PayloadObserver;
@@ -10,7 +11,7 @@ use crate::asr_server::source::FileImageSource;
 use super::dial::{Clock, DialPlan, GuestDialer, SystemClock, dial_until};
 use super::images::bulk_image_entry;
 use super::message::{DataRequest, DataType};
-use super::provider::{BulkOutcome, BulkTransferService, ProviderError};
+use super::provider::{BulkOutcome, BulkTransferService, BulkTransferTask, ProviderError};
 
 pub const DEFAULT_DATA_PORT_WINDOW: Duration = Duration::from_secs(30);
 
@@ -119,16 +120,45 @@ impl ImageSources {
     }
 }
 
+#[derive(Debug)]
+struct StoppedImageTransfer {
+    port: u16,
+    data_type: String,
+    bytes: u64,
+    size: u64,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for StoppedImageTransfer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the {} transfer on port {} stopped after {} of {} image bytes: {}",
+            self.data_type, self.port, self.bytes, self.size, self.source
+        )
+    }
+}
+
+impl std::error::Error for StoppedImageTransfer {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self.source.get_ref() {
+            Some(source) => Some(source as &(dyn std::error::Error + 'static)),
+            None => Some(&self.source),
+        }
+    }
+}
+
 pub struct AsrBulkTransfer<D, O, C = SystemClock> {
     dialer: D,
     images: ImageSources,
     config: AsrServerConfig,
     observer: O,
+    transfer_started: Option<fn(&mut O)>,
     clock: C,
     attempt_timeout: Duration,
     retry_interval: Duration,
     window: Duration,
-    transfers: Vec<SessionSummary>,
+    transfers: Arc<Mutex<Vec<SessionSummary>>>,
 }
 
 impl<D, O> AsrBulkTransfer<D, O, SystemClock>
@@ -142,11 +172,12 @@ where
             images,
             config,
             observer,
+            transfer_started: None,
             clock: SystemClock,
             attempt_timeout: DEFAULT_DATA_PORT_ATTEMPT_TIMEOUT,
             retry_interval: DEFAULT_DATA_PORT_RETRY_INTERVAL,
             window: DEFAULT_DATA_PORT_WINDOW,
-            transfers: Vec::new(),
+            transfers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -169,11 +200,12 @@ where
             images,
             config,
             observer,
+            transfer_started: None,
             clock,
             attempt_timeout: DEFAULT_DATA_PORT_ATTEMPT_TIMEOUT,
             retry_interval: DEFAULT_DATA_PORT_RETRY_INTERVAL,
             window: DEFAULT_DATA_PORT_WINDOW,
-            transfers: Vec::new(),
+            transfers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -188,8 +220,17 @@ where
         self
     }
 
-    pub fn transfers(&self) -> &[SessionSummary] {
-        &self.transfers
+    pub fn transfers(&self) -> Vec<SessionSummary> {
+        self.transfers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[must_use]
+    pub fn with_transfer_started(mut self, started: fn(&mut O)) -> Self {
+        self.transfer_started = Some(started);
+        self
     }
 
     pub fn observer(&self) -> &O {
@@ -208,11 +249,51 @@ where
 
 impl<D, O, C> BulkTransferService for AsrBulkTransfer<D, O, C>
 where
+    D: GuestDialer + Clone + Send + 'static,
+    O: PayloadObserver + Clone + Send + 'static,
+    C: Clock + Clone + Send + 'static,
+{
+    fn prepare(
+        &mut self,
+        port: u16,
+        request: &DataRequest,
+    ) -> Result<BulkTransferTask, ProviderError> {
+        if super::updater_output::is_updater_output(&request.data_type) {
+            return Ok(Box::new(move || {
+                Ok(BulkOutcome::Declined {
+                    reason: format!(
+                        "{port}: BasebandUpdaterOutputData is guest-produced output and requires an output receiver"
+                    ),
+                })
+            }));
+        }
+        let mut transfer = Self {
+            dialer: self.dialer.clone(),
+            images: self.images.clone(),
+            config: self.config.clone(),
+            observer: self.observer.clone(),
+            transfer_started: self.transfer_started,
+            clock: self.clock.clone(),
+            attempt_timeout: self.attempt_timeout,
+            retry_interval: self.retry_interval,
+            window: self.window,
+            transfers: Arc::clone(&self.transfers),
+        };
+        let request = request.clone();
+        Ok(Box::new(move || transfer.execute(port, &request)))
+    }
+}
+
+impl<D, O, C> AsrBulkTransfer<D, O, C>
+where
     D: GuestDialer,
     O: PayloadObserver,
     C: Clock,
 {
-    fn serve(&mut self, port: u16, request: &DataRequest) -> Result<BulkOutcome, ProviderError> {
+    fn execute(&mut self, port: u16, request: &DataRequest) -> Result<BulkOutcome, ProviderError> {
+        if let Some(started) = self.transfer_started {
+            started(&mut self.observer);
+        }
         let Some(matched) = self.images.resolve_match(&request.data_type) else {
             return Ok(BulkOutcome::Declined {
                 reason: format!(
@@ -267,6 +348,20 @@ where
             )));
         };
 
+        if payload.stopped_early {
+            let source = self.observer.stop_error();
+            return Err(ProviderError::Io(std::io::Error::new(
+                source.kind(),
+                StoppedImageTransfer {
+                    port,
+                    data_type: request.data_type.wire_name().to_string(),
+                    bytes: payload.data_bytes,
+                    size: session.payload_size(),
+                    source,
+                },
+            )));
+        }
+
         let outcome = BulkOutcome::Served {
             bytes: payload.data_bytes,
             blocks: payload.blocks,
@@ -275,7 +370,10 @@ where
             oob_requests: summary.oob_ranges_requests + summary.oob_single_requests,
             oob_bytes: summary.oob_bytes,
         };
-        self.transfers.push(summary);
+        self.transfers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(summary);
         Ok(outcome)
     }
 }
@@ -319,19 +417,23 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct FlakyDialer {
         refusals: u32,
-        attempts: u32,
-        ports: Vec<u16>,
+        attempts: Arc<std::sync::atomic::AtomicU32>,
+        ports: Arc<Mutex<Vec<u16>>>,
     }
 
     impl GuestDialer for FlakyDialer {
         type Stream = ScriptedStream;
 
         fn dial(&mut self, port: u16, _timeout: Duration) -> io::Result<Self::Stream> {
-            self.attempts += 1;
-            self.ports.push(port);
-            if self.attempts <= self.refusals {
+            let attempts = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            self.ports.lock().unwrap().push(port);
+            if attempts <= self.refusals {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     "not listening yet",
@@ -349,6 +451,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct DeadDialer;
 
     impl GuestDialer for DeadDialer {
@@ -362,6 +465,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct TestClock {
         now: Instant,
     }
@@ -393,6 +497,35 @@ mod tests {
     }
 
     #[test]
+    fn updater_output_is_refused_as_guest_output_even_with_a_default_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = write_image(dir.path(), 4096);
+        let mut service = AsrBulkTransfer::with_clock(
+            FlakyDialer {
+                refusals: 0,
+                attempts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                ports: Arc::new(Mutex::new(Vec::new())),
+            },
+            ImageSources::with_default(&image),
+            AsrServerConfig::default(),
+            (),
+            TestClock {
+                now: Instant::now(),
+            },
+        );
+        let mut request = image_request(9420);
+        request.data_type = DataType::Other("BasebandUpdaterOutputData".to_string());
+        match service.serve(9420, &request).unwrap() {
+            BulkOutcome::Declined { reason } => {
+                assert!(reason.contains("BasebandUpdaterOutputData"));
+                assert!(reason.contains("guest-produced output"));
+                assert!(reason.contains("9420"));
+            }
+            other => panic!("expected a named output-port refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_data_port_request_is_answered_by_streaming_the_image_over_that_port() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_image(dir.path(), 4096);
@@ -400,8 +533,8 @@ mod tests {
         let mut service = AsrBulkTransfer::with_clock(
             FlakyDialer {
                 refusals: 0,
-                attempts: 0,
-                ports: Vec::new(),
+                attempts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                ports: Arc::new(Mutex::new(Vec::new())),
             },
             ImageSources::with_default(&path),
             AsrServerConfig {
@@ -430,8 +563,8 @@ mod tests {
         let mut service = AsrBulkTransfer::with_clock(
             FlakyDialer {
                 refusals: 3,
-                attempts: 0,
-                ports: Vec::new(),
+                attempts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                ports: Arc::new(Mutex::new(Vec::new())),
             },
             ImageSources::with_default(&path),
             AsrServerConfig::default(),
@@ -442,8 +575,22 @@ mod tests {
         );
 
         service.serve(0x4d2, &image_request(0x4d2)).unwrap();
-        assert_eq!(service.dialer.attempts, 4);
-        assert!(service.dialer.ports.iter().all(|port| *port == 0x4d2));
+        assert_eq!(
+            service
+                .dialer
+                .attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            4
+        );
+        assert!(
+            service
+                .dialer
+                .ports
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|port| *port == 0x4d2)
+        );
     }
 
     #[test]
@@ -454,8 +601,8 @@ mod tests {
         let mut service = AsrBulkTransfer::with_clock(
             FlakyDialer {
                 refusals: 0,
-                attempts: 0,
-                ports: Vec::new(),
+                attempts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                ports: Arc::new(Mutex::new(Vec::new())),
             },
             ImageSources::with_default(&path),
             AsrServerConfig {
@@ -472,7 +619,10 @@ mod tests {
             service.serve(port, &image_request(port)).unwrap();
         }
 
-        assert_eq!(service.dialer.ports, vec![12346, 12347, 12348]);
+        assert_eq!(
+            *service.dialer.ports.lock().unwrap(),
+            vec![12346, 12347, 12348]
+        );
         assert_eq!(service.transfers().len(), 3);
     }
 
@@ -505,8 +655,8 @@ mod tests {
         let mut service = AsrBulkTransfer::with_clock(
             FlakyDialer {
                 refusals: 0,
-                attempts: 0,
-                ports: Vec::new(),
+                attempts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                ports: Arc::new(Mutex::new(Vec::new())),
             },
             ImageSources::with_default(&missing),
             AsrServerConfig::default(),
@@ -518,7 +668,11 @@ mod tests {
 
         assert!(service.serve(6000, &image_request(6000)).is_err());
         assert_eq!(
-            service.dialer.attempts, 0,
+            service
+                .dialer
+                .attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
             "the guest must not be dialled for an image that cannot be opened"
         );
     }
@@ -531,8 +685,8 @@ mod tests {
         let mut service = AsrBulkTransfer::with_clock(
             FlakyDialer {
                 refusals: 0,
-                attempts: 0,
-                ports: Vec::new(),
+                attempts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                ports: Arc::new(Mutex::new(Vec::new())),
             },
             ImageSources::with_default(&path),
             AsrServerConfig {
@@ -557,10 +711,10 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct RecordingObserver {
-        matches: Vec<(String, u16, PathBuf)>,
-        origins: Vec<(String, String)>,
+        matches: Arc<Mutex<Vec<(String, u16, PathBuf)>>>,
+        origins: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     impl PayloadObserver for RecordingObserver {
@@ -575,8 +729,12 @@ mod tests {
             _payload_size: u64,
         ) {
             self.matches
+                .lock()
+                .unwrap()
                 .push((data_type.to_string(), port, image.to_path_buf()));
             self.origins
+                .lock()
+                .unwrap()
                 .push((data_type.to_string(), origin.to_string()));
         }
     }
@@ -591,8 +749,8 @@ mod tests {
         let mut service = AsrBulkTransfer::with_clock(
             FlakyDialer {
                 refusals: 0,
-                attempts: 0,
-                ports: Vec::new(),
+                attempts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                ports: Arc::new(Mutex::new(Vec::new())),
             },
             ImageSources::with_default(&recovery).and_type(&DataType::SystemImageData, &system),
             AsrServerConfig {
@@ -612,7 +770,7 @@ mod tests {
         second.data_type = DataType::SystemImageData;
         service.serve(9501, &second).unwrap();
 
-        let matches = &service.observer().matches;
+        let matches = service.observer().matches.lock().unwrap();
         assert_eq!(matches.len(), 2);
         assert_eq!(
             matches[0],
@@ -633,8 +791,8 @@ mod tests {
         let mut service = AsrBulkTransfer::with_clock(
             FlakyDialer {
                 refusals: 0,
-                attempts: 0,
-                ports: Vec::new(),
+                attempts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                ports: Arc::new(Mutex::new(Vec::new())),
             },
             ImageSources::with_default(&recovery),
             AsrServerConfig {
@@ -660,9 +818,15 @@ mod tests {
             }
             other => panic!("expected a decline, got {other:?}"),
         }
-        assert_eq!(service.dialer.attempts, 0);
+        assert_eq!(
+            service
+                .dialer
+                .attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         assert!(service.transfers().is_empty());
-        assert!(service.observer().matches.is_empty());
+        assert!(service.observer().matches.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -679,5 +843,513 @@ mod tests {
             assert_eq!(sources.resolve(&data_type), Some(recovery.as_path()));
         }
         assert_eq!(sources.resolve(&DataType::SystemImageData), None);
+    }
+    #[test]
+    fn asr_waiting_for_its_key_allows_a_second_async_port_and_a_control_answer() {
+        use crate::ramrod::codec::{self as control_codec, PlistFormat};
+        use crate::ramrod::{
+            HttpAssetRouter, HttpAssetTransfer, PreparedAnswers, RamrodClient, RestoreOptions,
+            SessionObserver,
+        };
+        use plist::Value;
+        use std::io::Cursor;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        const IMAGE_PORT: u16 = 9510;
+        const KEY_PORT: u16 = 9511;
+        const KEY_BYTES: &[u8] = b"guest-decryption-key";
+        const WRAPPED_KEY: &[u8] = b"wrapped guest key";
+
+        struct Control {
+            incoming: Cursor<Vec<u8>>,
+            written: Vec<u8>,
+            terminal_at: u64,
+            completed: Option<mpsc::Receiver<u16>>,
+        }
+        impl Read for Control {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                if self.incoming.position() == self.terminal_at
+                    && let Some(completed) = self.completed.take()
+                {
+                    let mut ports = vec![
+                        completed.recv_timeout(Duration::from_secs(5)).unwrap(),
+                        completed.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    ];
+                    ports.sort();
+                    assert_eq!(ports, vec![IMAGE_PORT, KEY_PORT]);
+                }
+                self.incoming.read(bytes)
+            }
+        }
+        impl Write for Control {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.written.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct GuestStream {
+            incoming: Cursor<Vec<u8>>,
+            key_gate: Option<mpsc::Receiver<Vec<u8>>>,
+            key_sink: Option<mpsc::Sender<Vec<u8>>>,
+            image_waiting: mpsc::Sender<()>,
+            key_received: Arc<AtomicBool>,
+            port: u16,
+            written: Vec<u8>,
+            captured: Arc<Mutex<BTreeMap<u16, Vec<u8>>>>,
+            completed: mpsc::Sender<u16>,
+        }
+        impl Drop for GuestStream {
+            fn drop(&mut self) {
+                let _ = self.completed.send(self.port);
+            }
+        }
+        impl Read for GuestStream {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                if let Some(gate) = self.key_gate.take() {
+                    self.image_waiting.send(()).unwrap();
+                    let reply = gate.recv_timeout(Duration::from_secs(5)).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("guest image waiting for its key: {error}"),
+                        )
+                    })?;
+                    let decoded = control_codec::read_message(&mut Cursor::new(reply))
+                        .map_err(|error| {
+                            io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                        })?
+                        .unwrap();
+                    let body = decoded.as_dictionary().unwrap();
+                    assert_eq!(
+                        body.get("ResponseBody").and_then(Value::as_data),
+                        Some(KEY_BYTES)
+                    );
+                    assert_eq!(
+                        body.get("ResponseBodyDone").and_then(Value::as_boolean),
+                        Some(true)
+                    );
+                    assert_eq!(
+                        body.get("ResponseStatus")
+                            .and_then(Value::as_signed_integer),
+                        Some(200)
+                    );
+                    self.key_received.store(true, Ordering::Release);
+                }
+                self.incoming.read(bytes)
+            }
+        }
+        impl Write for GuestStream {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.written.extend_from_slice(bytes);
+                self.captured
+                    .lock()
+                    .unwrap()
+                    .entry(self.port)
+                    .or_default()
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if let Some(sink) = self.key_sink.take() {
+                    sink.send(std::mem::take(&mut self.written))
+                        .map_err(|error| {
+                            io::Error::new(io::ErrorKind::BrokenPipe, error.to_string())
+                        })?;
+                }
+                Ok(())
+            }
+        }
+        #[derive(Clone)]
+        struct Dialer {
+            key_gate: Arc<Mutex<Option<mpsc::Receiver<Vec<u8>>>>>,
+            key_sink: mpsc::Sender<Vec<u8>>,
+            image_waiting: mpsc::Sender<()>,
+            key_received: Arc<AtomicBool>,
+            captured: Arc<Mutex<BTreeMap<u16, Vec<u8>>>>,
+            completed: mpsc::Sender<u16>,
+        }
+        impl GuestDialer for Dialer {
+            type Stream = GuestStream;
+            fn dial(&mut self, port: u16, _timeout: Duration) -> io::Result<Self::Stream> {
+                let (incoming, key_gate, key_sink) = match port {
+                    IMAGE_PORT => {
+                        let mut incoming =
+                            encode_plist(&Request::new(Command::Initiate).to_value()).unwrap();
+                        incoming.extend_from_slice(
+                            &encode_plist(&Request::new(Command::Payload).to_value()).unwrap(),
+                        );
+                        (incoming, self.key_gate.lock().unwrap().take(), None)
+                    }
+                    KEY_PORT => (Vec::new(), None, Some(self.key_sink.clone())),
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            format!("guest did not name port {other}"),
+                        ));
+                    }
+                };
+                Ok(GuestStream {
+                    incoming: Cursor::new(incoming),
+                    key_gate,
+                    key_sink,
+                    image_waiting: self.image_waiting.clone(),
+                    key_received: Arc::clone(&self.key_received),
+                    port,
+                    written: Vec::new(),
+                    captured: Arc::clone(&self.captured),
+                    completed: self.completed.clone(),
+                })
+            }
+        }
+        struct Observer {
+            control_answered: mpsc::Sender<()>,
+            completions: Vec<(u16, String)>,
+        }
+        impl SessionObserver for Observer {
+            fn on_data_answered(&mut self, _request: &DataRequest, _keys: &[&str], _bytes: usize) {
+                self.control_answered.send(()).unwrap();
+            }
+            fn on_bulk_served(&mut self, request: &DataRequest, port: u16, _outcome: &BulkOutcome) {
+                self.completions
+                    .push((port, request.data_type.wire_name().to_string()));
+            }
+        }
+        fn request(
+            data_type: &str,
+            port: Option<u16>,
+            asynchronous: bool,
+            arguments: Dictionary,
+        ) -> Value {
+            let mut body = Dictionary::new();
+            body.insert(
+                "MsgType".into(),
+                Value::String(
+                    if asynchronous {
+                        "AsyncDataRequestMsg"
+                    } else {
+                        "DataRequestMsg"
+                    }
+                    .into(),
+                ),
+            );
+            body.insert("DataType".into(), Value::String(data_type.into()));
+            if let Some(port) = port {
+                body.insert("DataPort".into(), Value::Integer(u64::from(port).into()));
+            }
+            body.insert("Arguments".into(), Value::Dictionary(arguments));
+            Value::Dictionary(body)
+        }
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/key", listener.local_addr().unwrap());
+        let (image_waiting_tx, image_waiting_rx) = mpsc::channel();
+        let (control_answered_tx, control_answered_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let began = Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            && began.elapsed() < Duration::from_secs(5) =>
+                    {
+                        std::thread::sleep(Duration::from_millis(1))
+                    }
+                    Err(error) => panic!("key HTTP request did not arrive: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut incoming = Vec::new();
+            let end = loop {
+                if let Some(at) = incoming.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break at + 4;
+                }
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).unwrap();
+                incoming.push(byte[0]);
+            };
+            let headers = std::str::from_utf8(&incoming[..end]).unwrap();
+            assert!(headers.starts_with("POST /key HTTP/1.1\r\n"));
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            let mut body = vec![0u8; length];
+            stream.read_exact(&mut body).unwrap();
+            assert_eq!(body, WRAPPED_KEY);
+            image_waiting_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            control_answered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nX-Key-Origin: guest-request\r\nConnection: close\r\n\r\n", KEY_BYTES.len()).unwrap();
+            stream.write_all(KEY_BYTES).unwrap();
+            stream.flush().unwrap();
+            body.len()
+        });
+        let (key_sink, key_gate) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let captured = Arc::new(Mutex::new(BTreeMap::new()));
+        let key_received = Arc::new(AtomicBool::new(false));
+        let dialer = Dialer {
+            key_gate: Arc::new(Mutex::new(Some(key_gate))),
+            key_sink,
+            image_waiting: image_waiting_tx,
+            key_received: Arc::clone(&key_received),
+            captured: Arc::clone(&captured),
+            completed: completed_tx,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let image = write_image(directory.path(), 4096);
+        let expected_image = std::fs::read(&image).unwrap();
+        let asr = AsrBulkTransfer::new(
+            dialer.clone(),
+            ImageSources::with_default(&image),
+            AsrServerConfig {
+                checksum_chunk_size: 0,
+                ..AsrServerConfig::default()
+            },
+            (),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let http = HttpAssetTransfer::new(dialer, stop, Arc::clone(&cancel));
+        let mut bulk = HttpAssetRouter::new(http, asr);
+        let mut arguments = Dictionary::new();
+        arguments.insert("RequestMethod".into(), Value::String("POST".into()));
+        arguments.insert("RequestURL".into(), Value::String(url));
+        arguments.insert("RequestBody".into(), Value::Data(WRAPPED_KEY.to_vec()));
+        arguments.insert(
+            "RequestAdditionalHeaders".into(),
+            Value::Dictionary(Dictionary::new()),
+        );
+        let mut final_status = Dictionary::new();
+        final_status.insert(
+            "MsgType".into(),
+            Value::String("ReceivedFinalStatusMsg".into()),
+        );
+        let mut incoming = Vec::new();
+        for message in [
+            request(
+                "RecoveryOSASRImage",
+                Some(IMAGE_PORT),
+                true,
+                Dictionary::new(),
+            ),
+            request(
+                "StreamedImageDecryptionKey",
+                Some(KEY_PORT),
+                true,
+                arguments,
+            ),
+            request("RecoveryOSRootTicketData", None, false, Dictionary::new()),
+        ] {
+            incoming.extend_from_slice(
+                &control_codec::encode_message(&message, PlistFormat::Binary).unwrap(),
+            );
+        }
+        let terminal_at = incoming.len() as u64;
+        incoming.extend_from_slice(
+            &control_codec::encode_message(&Value::Dictionary(final_status), PlistFormat::Binary)
+                .unwrap(),
+        );
+        let mut client = RamrodClient::new(Control {
+            incoming: Cursor::new(incoming),
+            written: Vec::new(),
+            terminal_at,
+            completed: Some(completed_rx),
+        });
+        client.start_restore(RestoreOptions::new()).unwrap();
+        let mut provider =
+            PreparedAnswers::new().with_ticket(DataType::RecoveryOSRootTicketData, vec![9, 8, 7]);
+        let mut observer = Observer {
+            control_answered: control_answered_tx,
+            completions: Vec::new(),
+        };
+        let result =
+            client.run_restore_with_cancellation(&mut provider, &mut bulk, &mut observer, cancel);
+        assert_eq!(server.join().unwrap(), WRAPPED_KEY.len());
+        let summary = result.unwrap();
+        assert_eq!(summary.async_data_requests, 2);
+        assert_eq!(summary.bulk_transfers, 2);
+        assert_eq!(summary.data_requests, 1);
+        let control = client.into_inner();
+        let mut control_replies = Cursor::new(control.written);
+        control_codec::read_message(&mut control_replies)
+            .unwrap()
+            .unwrap();
+        let reply = control_codec::read_message(&mut control_replies)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reply
+                .as_dictionary()
+                .unwrap()
+                .get("RootTicketData")
+                .and_then(Value::as_data),
+            Some(&[9, 8, 7][..])
+        );
+        observer.completions.sort();
+        assert_eq!(
+            observer.completions,
+            vec![
+                (IMAGE_PORT, "RecoveryOSASRImage".into()),
+                (KEY_PORT, "StreamedImageDecryptionKey".into())
+            ]
+        );
+        assert!(key_received.load(Ordering::Acquire));
+        let transfers = bulk.fallback().transfers();
+        assert_eq!(transfers.len(), 1);
+        assert_eq!(transfers[0].payload.as_ref().unwrap().data_bytes, 4096);
+        let captured = captured.lock().unwrap();
+        assert!(
+            captured[&IMAGE_PORT]
+                .windows(expected_image.len())
+                .any(|bytes| bytes == expected_image.as_slice())
+        );
+        assert!(captured[&KEY_PORT].len() > KEY_BYTES.len());
+    }
+
+    fn partial_image_stop(reason: super::super::dial::DialCancellation, port: u16) {
+        use super::super::dial::DialCancellation;
+        use crate::asr_server::payload::DEFAULT_BLOCK_LEN;
+        use crate::restore::{PayloadProgress, RestoreEvent, RestoreReporter, SharedReporter};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ProgressReporter {
+            blocks: Vec<(u64, u64, u64)>,
+            events: Vec<String>,
+            stop: Arc<AtomicBool>,
+            cancel: Arc<AtomicBool>,
+            reason: DialCancellation,
+        }
+        impl RestoreReporter for ProgressReporter {
+            fn event(&mut self, event: RestoreEvent<'_>) {
+                self.events.push(event.result.into());
+            }
+            fn payload_block(&mut self, sent: u64, total: u64, blocks: u64, _elapsed: Duration) {
+                self.blocks.push((sent, total, blocks));
+                self.cancel.store(true, Ordering::Release);
+                if self.reason == DialCancellation::OperatorStopped {
+                    self.stop.store(true, Ordering::Release);
+                }
+            }
+        }
+        struct CaptureStream {
+            incoming: std::io::Cursor<Vec<u8>>,
+            captured: Arc<Mutex<Vec<u8>>>,
+        }
+        impl Read for CaptureStream {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                self.incoming.read(bytes)
+            }
+        }
+        impl Write for CaptureStream {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.captured.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        #[derive(Clone)]
+        struct CaptureDialer {
+            captured: Arc<Mutex<Vec<u8>>>,
+        }
+        impl GuestDialer for CaptureDialer {
+            type Stream = CaptureStream;
+            fn dial(&mut self, _port: u16, _timeout: Duration) -> io::Result<Self::Stream> {
+                let mut incoming =
+                    encode_plist(&Request::new(Command::Initiate).to_value()).unwrap();
+                incoming.extend_from_slice(
+                    &encode_plist(&Request::new(Command::Payload).to_value()).unwrap(),
+                );
+                Ok(CaptureStream {
+                    incoming: std::io::Cursor::new(incoming),
+                    captured: Arc::clone(&self.captured),
+                })
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let image = write_image(directory.path(), 2 * DEFAULT_BLOCK_LEN);
+        let expected = std::fs::read(&image).unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let recorded = Arc::new(Mutex::new(ProgressReporter {
+            blocks: Vec::new(),
+            events: Vec::new(),
+            stop: Arc::clone(&stop),
+            cancel: Arc::clone(&cancel),
+            reason,
+        }));
+        let reporter: SharedReporter = recorded.clone();
+        let observer = PayloadProgress::new(expected.len() as u64, stop, reporter)
+            .with_transfer_cancel(cancel);
+        let mut service = AsrBulkTransfer::new(
+            CaptureDialer {
+                captured: Arc::clone(&captured),
+            },
+            ImageSources::with_default(&image),
+            AsrServerConfig {
+                checksum_chunk_size: 0,
+                ..AsrServerConfig::default()
+            },
+            observer,
+        );
+        let error = service.serve(port, &image_request(port)).unwrap_err();
+        let ProviderError::Io(error) = error else {
+            panic!("expected a typed partial-image stop, got {error}");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(DialCancellation::from_io_error(&error), Some(reason));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("RecoveryOSASRImage transfer on port {port}"))
+        );
+        assert!(error.to_string().contains(&format!(
+            "stopped after {} of {} image bytes",
+            DEFAULT_BLOCK_LEN,
+            2 * DEFAULT_BLOCK_LEN
+        )));
+        assert_eq!(
+            recorded.lock().unwrap().blocks,
+            vec![(DEFAULT_BLOCK_LEN as u64, (2 * DEFAULT_BLOCK_LEN) as u64, 1)]
+        );
+        let captured = captured.lock().unwrap();
+        assert!(
+            captured
+                .windows(DEFAULT_BLOCK_LEN)
+                .any(|bytes| bytes == &expected[..DEFAULT_BLOCK_LEN])
+        );
+    }
+
+    #[test]
+    fn a_partially_written_image_returns_typed_terminal_cleanup_cancellation() {
+        partial_image_stop(super::super::dial::DialCancellation::TransferFailed, 9630);
+    }
+
+    #[test]
+    fn a_partially_written_image_returns_typed_operator_stop() {
+        partial_image_stop(super::super::dial::DialCancellation::OperatorStopped, 9631);
     }
 }

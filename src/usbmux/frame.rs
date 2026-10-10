@@ -55,6 +55,7 @@ impl MuxVersion {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Protocol {
     Version,
+    Control,
     HostLogLevel,
     Tcp,
     Unknown(u32),
@@ -65,6 +66,7 @@ impl Protocol {
     pub const fn wire_value(self) -> u32 {
         match self {
             Self::Version => 0,
+            Self::Control => 1,
             Self::HostLogLevel => 2,
             Self::Tcp => 6,
             Self::Unknown(value) => value,
@@ -75,6 +77,7 @@ impl Protocol {
     pub const fn from_wire(value: u32) -> Self {
         match value {
             0 => Self::Version,
+            1 => Self::Control,
             2 => Self::HostLogLevel,
             6 => Self::Tcp,
             other => Self::Unknown(other),
@@ -91,6 +94,7 @@ impl fmt::Display for Protocol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Version => f.write_str("version"),
+            Self::Control => f.write_str("control"),
             Self::HostLogLevel => f.write_str("host log level"),
             Self::Tcp => f.write_str("tcp"),
             Self::Unknown(value) => write!(f, "unknown({value})"),
@@ -454,8 +458,8 @@ mod tests {
         assert_eq!(Protocol::from_wire(0), Protocol::Version);
         assert_eq!(Protocol::from_wire(2), Protocol::HostLogLevel);
         assert_eq!(Protocol::from_wire(6), Protocol::Tcp);
-        assert_eq!(Protocol::from_wire(1), Protocol::Unknown(1));
-        assert!(!Protocol::Unknown(1).is_dispatched());
+        assert_eq!(Protocol::from_wire(1), Protocol::Control);
+        assert!(!Protocol::Control.is_dispatched());
         for protocol in [Protocol::Version, Protocol::HostLogLevel, Protocol::Tcp] {
             assert!(protocol.is_dispatched());
             assert_eq!(Protocol::from_wire(protocol.wire_value()), protocol);

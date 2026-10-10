@@ -3,7 +3,10 @@ use std::time::Duration;
 
 use super::frame::MuxVersion;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Enables bounded packet-header diagnostics on stderr, reported outside transport threads.
+pub const PACKET_HEADER_TRACE_ENV: &str = "APPLE_UTILS_MUX_PACKET_TRACE";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MuxTraceEvent {
     VersionSent {
         version: u32,
@@ -11,6 +14,10 @@ pub enum MuxTraceEvent {
     },
     VersionTimedOut {
         waited: Duration,
+    },
+    VersionWaitDiscarded {
+        protocol: u32,
+        bytes: usize,
     },
     VersionNegotiated {
         version: MuxVersion,
@@ -39,6 +46,12 @@ pub enum MuxTraceEvent {
         local_port: u16,
         bytes: usize,
     },
+    Retransmitted {
+        local_port: u16,
+        sequence: u32,
+        bytes: usize,
+        outer_sequence: Option<u16>,
+    },
     Received {
         local_port: u16,
         bytes: usize,
@@ -60,6 +73,10 @@ pub enum MuxTraceEvent {
     },
     OtherProtocol {
         protocol: u32,
+    },
+    ControlMessage {
+        payload: Vec<u8>,
+        acknowledged_host_packet: Option<u16>,
     },
     PacketRejected {
         protocol: u32,
@@ -122,18 +139,21 @@ impl MuxTraceEvent {
         match self {
             Self::VersionSent { .. } => "version-sent",
             Self::VersionTimedOut { .. } => "version-no-reply",
+            Self::VersionWaitDiscarded { .. } => "version-wait-discarded",
             Self::VersionNegotiated { .. } => "version-negotiated",
             Self::SynSent { .. } => "syn-sent",
             Self::SynAckReceived { .. } => "syn-ack-received",
             Self::SessionEstablished { .. } => "session-established",
             Self::HandshakeTimedOut { .. } => "handshake-no-reply",
             Self::Sent { .. } => "sent",
+            Self::Retransmitted { .. } => "retransmitted",
             Self::Received { .. } => "received",
             Self::SequenceGap { .. } => "sequence-gap",
             Self::OutOfOrder { .. } => "out-of-order",
             Self::Reset { .. } => "reset",
             Self::Unmatched { .. } => "unmatched",
             Self::OtherProtocol { .. } => "other-protocol",
+            Self::ControlMessage { .. } => "control-message",
             Self::PacketRejected { .. } => "packet-rejected",
             Self::ReadPollExpired { .. } => "read-poll-expired",
             Self::WriteWindowShut { .. } => "write-window-shut",
@@ -153,6 +173,9 @@ impl MuxTraceEvent {
             Self::VersionTimedOut { .. } => {
                 "the version packet was written and nothing came back; check the bulk pair selection, that the packet went as one transfer, and that the interface was activated"
             }
+            Self::VersionWaitDiscarded { .. } => {
+                "a packet for an earlier mux session arrived before this link's version reply; this link has no sessions to receive it, so negotiation continues until the reply or its deadline"
+            }
             Self::VersionNegotiated { .. } => {
                 "the device answered and the framing is agreed; sessions can now be opened"
             }
@@ -165,19 +188,23 @@ impl MuxTraceEvent {
                 "the mux answered the version packet but not the SYN; nothing is listening on that guest port yet, or the connect inside the guest failed"
             }
             Self::Sent { .. } => "payload left the host",
+            Self::Retransmitted { .. } => {
+                "unacknowledged payload was sent again at its original sequence number without advancing the send pointer"
+            }
             Self::Received { .. } => "payload arrived from the guest",
             Self::SequenceGap { .. } => {
                 "the device's packet counter skipped; neither side has a reassembly queue, so this link cannot recover and the run should stop"
             }
             Self::OutOfOrder { .. } => {
-                "a segment was not the next one and was dropped, exactly as the device drops it; the session is unrecoverable"
+                "a segment was not the next one and was dropped; its sender must retransmit the missing sequence"
             }
             Self::Reset { .. } => "the device ended the session",
             Self::Unmatched { .. } => {
                 "a segment arrived for a port with no session, which is a stale segment from a session that was already closed"
             }
-            Self::OtherProtocol { .. } => {
-                "the device sent a protocol other than TCP, which is informational"
+            Self::OtherProtocol { .. } => "the device sent a protocol other than TCP or control",
+            Self::ControlMessage { .. } => {
+                "the device sent a mux control message; code 3 is an error, 5 is a warning, and 7 is information"
             }
             Self::PacketRejected { .. } => {
                 "a transfer came off the bulk IN endpoint that does not frame as a mux packet, so it was dropped and the link kept running, exactly as handleMuxInput drops what it cannot frame rather than tearing the link down; the sequence counter is not advanced, because a packet with no readable header carries no sequence to advance past, so a device that really did send this one answers with a sequence-gap on its next packet and nothing is masked; delivered above 0x7ffc means the device cannot have sent it at all, since sendMuxSegment sizes every packet it sends off that bound, and an all-zero head is one of the eight 0x8000 host-to-device read buffers allocateUSBReadBuffers hands out, taken as though it were a transfer the device was offering"
@@ -214,6 +241,9 @@ impl fmt::Display for MuxTraceEvent {
             Self::VersionTimedOut { waited } => {
                 write!(f, "waited={:.3}s ", waited.as_secs_f64())
             }
+            Self::VersionWaitDiscarded { protocol, bytes } => {
+                write!(f, "protocol={protocol} bytes={bytes} ")
+            }
             Self::VersionNegotiated {
                 version,
                 header_len,
@@ -246,6 +276,18 @@ impl fmt::Display for MuxTraceEvent {
             Self::Sent { local_port, bytes } | Self::Received { local_port, bytes } => {
                 write!(f, "local={local_port} bytes={bytes} ")
             }
+            Self::Retransmitted {
+                local_port,
+                sequence,
+                bytes,
+                outer_sequence,
+            } => {
+                write!(f, "local={local_port} seq={sequence} bytes={bytes} ")?;
+                if let Some(outer_sequence) = outer_sequence {
+                    write!(f, "outer-seq={outer_sequence} ")?;
+                }
+                Ok(())
+            }
             Self::SequenceGap { expected, received } => {
                 write!(f, "expected={expected} received={received} ")
             }
@@ -261,6 +303,28 @@ impl fmt::Display for MuxTraceEvent {
             | Self::Unmatched { local_port }
             | Self::DeviceGone { local_port } => write!(f, "local={local_port} "),
             Self::OtherProtocol { protocol } => write!(f, "protocol={protocol} "),
+            Self::ControlMessage {
+                payload,
+                acknowledged_host_packet,
+            } => {
+                if let Some(acknowledged_host_packet) = acknowledged_host_packet {
+                    write!(f, "device-rx-ack={acknowledged_host_packet} ")?;
+                }
+                let (code, message) = match payload.split_first() {
+                    Some((code, message)) => (Some(*code), message),
+                    None => (None, &[][..]),
+                };
+                match code {
+                    Some(code) => write!(f, "code={code} bytes={} text=\"", message.len())?,
+                    None => write!(f, "code=none bytes=0 text=\"")?,
+                }
+                for byte in message {
+                    for escaped in std::ascii::escape_default(*byte) {
+                        write!(f, "{}", escaped as char)?;
+                    }
+                }
+                write!(f, "\" ")
+            }
             Self::PacketRejected {
                 protocol,
                 declared,

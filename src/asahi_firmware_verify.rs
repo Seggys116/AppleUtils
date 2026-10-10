@@ -94,7 +94,8 @@ fn validate(files: &[Vec<u8>]) -> Result<(), String> {
             return Err("firmware identity has malformed SHA256 digest".into());
         }
     }
-    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let dir = crate::scratch::ScratchDir::new("apple-utils-firmware-verify-")
+        .map_err(|e| e.to_string())?;
     for (name, bytes) in ["firmware.tar", "firmware.cpio", "manifest.txt"]
         .iter()
         .zip(&files[1..])

@@ -9,6 +9,45 @@ pub const DEFAULT_HOST_CONNECT_WINDOW: Duration = Duration::from_secs(120);
 
 pub const HOST_TIMEOUT_NVRAM_VARIABLE: &str = "restored-host-timeout";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialCancellation {
+    OperatorStopped,
+    TransferFailed,
+}
+
+impl DialCancellation {
+    pub fn from_io_error(error: &io::Error) -> Option<Self> {
+        let mut source = error.get_ref()? as &(dyn std::error::Error + 'static);
+        loop {
+            if let Some(reason) = source.downcast_ref::<Self>() {
+                return Some(*reason);
+            }
+            source = source.source()?;
+        }
+    }
+}
+
+impl fmt::Display for DialCancellation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OperatorStopped => f.write_str("restore-run-stopped: the operator stopped the restore run"),
+            Self::TransferFailed => f.write_str("restore-transfer-cancelled: a restore transfer failed; this mux operation was cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for DialCancellation {}
+
+pub trait ShutdownWrite {
+    fn shutdown_write(&mut self) -> io::Result<()>;
+}
+
+impl ShutdownWrite for TcpStream {
+    fn shutdown_write(&mut self) -> io::Result<()> {
+        self.shutdown(std::net::Shutdown::Write)
+    }
+}
+
 pub trait GuestDialer {
     type Stream: Read + Write;
 
@@ -150,6 +189,13 @@ where
                     elapsed: clock.now().saturating_duration_since(began),
                 });
             }
+            Err(error) if DialCancellation::from_io_error(&error).is_some() => {
+                return Err(DialError::Cancelled {
+                    port: plan.port,
+                    attempts,
+                    source: error,
+                });
+            }
             Err(error) => last_error = Some(error),
         }
 
@@ -169,6 +215,11 @@ where
 
 #[derive(Debug)]
 pub enum DialError {
+    Cancelled {
+        port: u16,
+        attempts: u32,
+        source: io::Error,
+    },
     WindowClosed {
         port: u16,
         attempts: u32,
@@ -180,6 +231,14 @@ pub enum DialError {
 impl fmt::Display for DialError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled {
+                port,
+                attempts,
+                source,
+            } => write!(
+                f,
+                "guest port {port} dial cancelled after {attempts} attempt(s): {source}"
+            ),
             Self::WindowClosed {
                 port,
                 attempts,
@@ -202,6 +261,10 @@ impl fmt::Display for DialError {
 impl std::error::Error for DialError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Cancelled { source, .. } => source
+                .get_ref()
+                .map(|error| error as &(dyn std::error::Error + 'static))
+                .or(Some(source)),
             Self::WindowClosed { last_error, .. } => last_error
                 .as_ref()
                 .map(|error| error as &(dyn std::error::Error + 'static)),
@@ -214,6 +277,26 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
+
+    #[test]
+    fn tcp_write_shutdown_delivers_peer_eof_and_preserves_the_read_half() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            socket.read_to_end(&mut request).unwrap();
+            assert_eq!(request, b"request");
+            socket.write_all(b"reply").unwrap();
+        });
+        let mut socket = TcpStream::connect(address).unwrap();
+        socket.write_all(b"request").unwrap();
+        socket.shutdown_write().unwrap();
+        let mut reply = Vec::new();
+        socket.read_to_end(&mut reply).unwrap();
+        assert_eq!(reply, b"reply");
+        peer.join().unwrap();
+    }
 
     #[derive(Clone)]
     struct Virtual {
@@ -456,5 +539,87 @@ mod tests {
         assert!(rendered.contains("62078"), "{rendered}");
         assert!(rendered.contains("37 attempts"), "{rendered}");
         assert!(rendered.contains("guest refused"), "{rendered}");
+    }
+    #[test]
+    fn explicit_transfer_cancellation_names_the_port_and_ends_the_dial() {
+        struct CancelledDialer {
+            calls: u32,
+        }
+        impl GuestDialer for CancelledDialer {
+            type Stream = std::io::Cursor<Vec<u8>>;
+            fn dial(&mut self, _port: u16, _timeout: Duration) -> io::Result<Self::Stream> {
+                self.calls += 1;
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    DialCancellation::TransferFailed,
+                ))
+            }
+        }
+        let mut dialer = CancelledDialer { calls: 0 };
+        let mut clock = Virtual::new();
+        let error =
+            dial_until(&mut dialer, DialPlan::default().on_port(9511), &mut clock).unwrap_err();
+        match error {
+            DialError::Cancelled {
+                port,
+                attempts,
+                source,
+            } => {
+                assert_eq!(port, 9511);
+                assert_eq!(attempts, 1);
+                assert_eq!(
+                    source.get_ref().unwrap().downcast_ref::<DialCancellation>(),
+                    Some(&DialCancellation::TransferFailed)
+                );
+            }
+            other => panic!("expected an attributed cancellation, got {other}"),
+        }
+        assert_eq!(dialer.calls, 1);
+    }
+
+    #[test]
+    fn cancelled_dial_preserves_its_reason_through_the_error_source_chain() {
+        for reason in [
+            DialCancellation::OperatorStopped,
+            DialCancellation::TransferFailed,
+        ] {
+            let dial = DialError::Cancelled {
+                port: 9511,
+                attempts: 1,
+                source: io::Error::new(io::ErrorKind::ConnectionAborted, reason),
+            };
+            let source = std::error::Error::source(&dial).unwrap();
+            assert_eq!(source.downcast_ref::<DialCancellation>(), Some(&reason));
+            let wrapped = io::Error::new(io::ErrorKind::ConnectionAborted, dial);
+            assert_eq!(DialCancellation::from_io_error(&wrapped), Some(reason));
+        }
+    }
+
+    #[test]
+    fn an_ordinary_interrupted_dial_is_retried_until_the_guest_accepts() {
+        struct InterruptedDialer {
+            calls: u32,
+        }
+        impl GuestDialer for InterruptedDialer {
+            type Stream = std::io::Cursor<Vec<u8>>;
+            fn dial(&mut self, _port: u16, _timeout: Duration) -> io::Result<Self::Stream> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "transient transport interruption",
+                    ))
+                } else {
+                    Ok(std::io::Cursor::new(vec![7]))
+                }
+            }
+        }
+        let mut dialer = InterruptedDialer { calls: 0 };
+        let mut clock = Virtual::new();
+        let accepted =
+            dial_until(&mut dialer, DialPlan::default().on_port(9512), &mut clock).unwrap();
+        assert_eq!(accepted.attempts, 2);
+        assert_eq!(accepted.stream.into_inner(), vec![7]);
+        assert_eq!(dialer.calls, 2);
     }
 }

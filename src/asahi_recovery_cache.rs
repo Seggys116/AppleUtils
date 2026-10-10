@@ -26,7 +26,7 @@ fn inventory(
     Ok(())
 }
 
-fn restore(entry: &Path) -> Result<tempfile::TempDir, String> {
+fn restore(entry: &Path) -> Result<crate::scratch::ScratchDir, String> {
     let expected: BTreeMap<String, Option<String>> = serde_json::from_slice(
         &std::fs::read(entry.join("inventory.json")).map_err(|e| e.to_string())?,
     )
@@ -37,7 +37,8 @@ fn restore(entry: &Path) -> Result<tempfile::TempDir, String> {
     if actual != expected {
         return Err("recovery cache content changed".into());
     }
-    let output = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let output =
+        crate::scratch::ScratchDir::new("apple-utils-recovery-").map_err(|e| e.to_string())?;
     for (name, digest) in expected {
         let path = Path::new(&name);
         if name.contains(['\\', ':'])
@@ -105,8 +106,8 @@ pub fn extract(
     cache: Option<&Path>,
     image: &Path,
     paths: &[String],
-    extract: impl FnOnce() -> Result<tempfile::TempDir, String>,
-) -> Result<tempfile::TempDir, String> {
+    extract: impl FnOnce() -> Result<crate::scratch::ScratchDir, String>,
+) -> Result<crate::scratch::ScratchDir, String> {
     let key = cache
         .map(|root| {
             let source = crate::asahi_cache::digest(image)?;
@@ -141,7 +142,7 @@ mod tests {
         std::fs::write(&image, b"source").unwrap();
         let paths = vec!["/firmware".into()];
         let generate = || {
-            let out = tempfile::tempdir().unwrap();
+            let out = crate::scratch::ScratchDir::new("apple-utils-test-").unwrap();
             std::fs::create_dir(out.path().join("empty")).unwrap();
             std::fs::write(out.path().join("firmware"), b"firmware").unwrap();
             Ok(out)

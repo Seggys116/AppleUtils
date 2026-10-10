@@ -248,7 +248,9 @@ mod tests {
             bootability_bundle: None,
             corrupt_manifest: false,
             staged_boot_manifest_sha384: None,
+            staged_boot_manifest: None,
             fdr_trust_digest: None,
+            restore_ramdisk: None,
             fdr_material_dir: None,
             sign_recovery_os_local_policy: false,
         }

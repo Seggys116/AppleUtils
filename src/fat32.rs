@@ -1182,7 +1182,8 @@ pub fn create_efi_with_volume_id(
     validate_efi_files(files)?;
     validate_efi_geometry(part_bytes, sector_size)?;
     let total_sectors = part_bytes / u64::from(sector_size);
-    let staged = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let staged =
+        crate::scratch::ScratchDir::new("apple-utils-fat32-").map_err(|e| e.to_string())?;
     for (name, bytes) in files {
         write(staged.path(), name, bytes)?;
     }
@@ -1212,7 +1213,8 @@ pub fn update_efi_with_volume_id(
     if let Some(volume_id) = volume_id {
         layout.volume_id = volume_id;
     }
-    let staged = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let staged =
+        crate::scratch::ScratchDir::new("apple-utils-fat32-").map_err(|e| e.to_string())?;
     extract_to_dir(container, &layout, root_cluster, staged.path())?;
     for (name, bytes) in files {
         write(staged.path(), name, bytes)?;
@@ -1267,7 +1269,8 @@ fn format_fat16_for_test(
     validate_efi_files(files)?;
     validate_efi_geometry(part_bytes, sector_size)?;
     let total_sectors = part_bytes / u64::from(sector_size);
-    let staged = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let staged =
+        crate::scratch::ScratchDir::new("apple-utils-fat32-").map_err(|e| e.to_string())?;
     for (name, bytes) in files {
         write(staged.path(), name, bytes)?;
     }

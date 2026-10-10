@@ -390,7 +390,7 @@ mod tests {
 }
 
 pub struct RecoveryImageFiles {
-    directory: tempfile::TempDir,
+    directory: crate::scratch::ScratchDir,
 }
 
 impl RecoveryImageFiles {

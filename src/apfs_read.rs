@@ -1218,7 +1218,13 @@ impl<'a> Reader<'a> {
         }
 
         let Some(size) = stream_size else {
-            let extents = self.records(volume, file_id, J_FILE_EXTENT)?.len();
+            let extents = self
+                .records(
+                    volume,
+                    u64_at(&inode, INODE_PRIVATE_ID_OFFSET),
+                    J_FILE_EXTENT,
+                )?
+                .len();
             if extents != 0 {
                 return Err(ApfsReadError::NoDataStream {
                     path: path.to_string(),
@@ -1228,7 +1234,7 @@ impl<'a> Reader<'a> {
             }
             return Ok(Vec::new());
         };
-        self.read_data_stream(volume, file_id, size, path)
+        self.read_data_stream(volume, u64_at(&inode, INODE_PRIVATE_ID_OFFSET), size, path)
     }
 
     fn read_data_stream(
@@ -1952,7 +1958,7 @@ impl<'a> ApfsContainer<'a> {
                 None => {
                     let size = facts.stream_size.unwrap_or(0);
                     self.reader
-                        .read_data_stream(&volume.volume, file_id, size, path)?
+                        .read_data_stream(&volume.volume, facts.private_id, size, path)?
                 }
             };
         let bytes = bytes.strip_suffix(&[0]).unwrap_or(&bytes);
@@ -2328,7 +2334,7 @@ impl Reader<'_> {
         let mut without = 0usize;
         match volume.extents {
             ExtentSource::Catalog => {
-                for (key, value) in self.records(volume, file_id, J_FILE_EXTENT)? {
+                for (key, value) in self.records(volume, facts.private_id, J_FILE_EXTENT)? {
                     if key.len() < EXTENT_KEY_BYTES {
                         return Err(malformed("the key is shorter than a file extent key"));
                     }
@@ -2419,7 +2425,7 @@ impl Reader<'_> {
         path: &str,
     ) -> Result<Vec<(u64, u64, u64)>, ApfsReadError> {
         let mut spans = match volume.extents {
-            ExtentSource::Catalog => self.catalog_spans(volume, facts.file_id, path)?,
+            ExtentSource::Catalog => self.catalog_spans(volume, facts.private_id, path)?,
             ExtentSource::FextTree { paddr } => {
                 self.fext_spans(volume, paddr, facts.private_id, path)?
             }

@@ -24,6 +24,8 @@ pub mod fdr_pki;
 
 pub mod fdr_object;
 
+pub mod fdr_material_format;
+
 pub mod fdr_store;
 
 pub mod fdr_manifest;
@@ -36,11 +38,25 @@ pub mod client;
 
 pub mod bulk;
 
+pub mod updater_output;
+
+pub use updater_output::{
+    UPDATER_OUTPUT_DATA_TYPE, UpdaterOutputError, UpdaterOutputRouter, UpdaterOutputTransfer,
+    is_updater_output,
+};
+
 pub mod cpio;
 
 pub mod bootability;
 
 pub mod images;
+
+pub mod http_assets;
+
+pub use http_assets::{
+    HttpAssetAnswers, HttpAssetRouter, HttpAssetTransfer, fetch_asset_response_with_cancellation,
+    is_http_asset,
+};
 
 pub use bootability::{
     BOOTABILITY_BUNDLE_DATA_TYPE, BUNDLE_CONTENT_DIR, BUNDLE_FIRMWARE_DIR, BUNDLE_MEMBER_GID,
@@ -67,8 +83,8 @@ pub use der::{
     x509_time,
 };
 pub use dial::{
-    Clock, ConnectorDialer, DEFAULT_HOST_CONNECT_WINDOW, DialError, DialOutcome, DialPlan,
-    GuestConnector, GuestDialer, HOST_TIMEOUT_NVRAM_VARIABLE, SystemClock, dial_until,
+    Clock, ConnectorDialer, DEFAULT_HOST_CONNECT_WINDOW, DialCancellation, DialError, DialOutcome,
+    DialPlan, GuestConnector, GuestDialer, HOST_TIMEOUT_NVRAM_VARIABLE, SystemClock, dial_until,
 };
 pub use fdr_manifest::{
     ASID_PROPERTY_TAG, CLASS_CODE_BYTES, CLASS_PROPERTY_TAG, FAIC_PROPERTY_TAG,
@@ -78,6 +94,10 @@ pub use fdr_manifest::{
     SERVER_NONCE_PROPERTY_TAG, SIGNING_DIGEST_BYTES, SealManifest, SealManifestError, SealObject,
     build_manifest_from_signed_body, build_properties_only_manifest, build_seal_manifest,
     encode_properties_only_body, encode_signed_body, random_server_nonce, signing_digest,
+};
+pub use fdr_material_format::{
+    FDR_MATERIAL_FILE_NAME, FDR_MATERIAL_FORMAT_VERSION, FdrAuthorityDescriptor,
+    FdrMaterialDescriptor, FdrMaterialFormatError, FdrSubjectAttribute, FdrSubjectNameAttribute,
 };
 pub use fdr_object::{
     FdrObjectError, FdrTrustMaterial, REVOCATION_ELEMENT_TAG, ROOT_CA_ELEMENT_TAG,
@@ -125,8 +145,9 @@ pub use identity::{
     REQUIRED_MESSAGE_TYPES, RESEARCH_MARKER, RESTORE_PLIST_FILE_NAME, RestoreBehavior,
     SESSION_UUID_ENTROPY_SOURCE, all_build_identities, generate_session_uuid,
     install_behaviors_for_board, installable_device_classes, load_build_manifest,
-    macos_restore_options, raw_identity_for_variant, recovery_os_partition_size,
-    select_install_identity, select_macos_identity,
+    macos_restore_options, mobile_restore_options, raw_identity_for_variant,
+    recovery_os_partition_size, select_install_identity, select_macos_identity,
+    select_recovery_identity,
 };
 pub use images::{
     BulkImageEntry, BulkImageError, ImageNameRule, ResolvedBulkImage, bulk_image_entry,
@@ -157,8 +178,8 @@ pub use pkcs10::{
     parse_and_verify,
 };
 pub use provider::{
-    BulkOutcome, BulkTransferService, NoBulkTransfers, PreparedAnswers, ProviderError,
-    RestoreDataProvider, SessionObserver, StreamedObject, StreamedPayload,
+    BulkOutcome, BulkTransferService, BulkTransferTask, NoBulkTransfers, PreparedAnswers,
+    ProviderError, RestoreDataProvider, SessionObserver, StreamedObject, StreamedPayload,
 };
 pub use ticket::{
     BOOT_NONCE_HASH_BYTES, BOOT_NONCE_HASH_PROPERTY_TAG, BOOTED_OS_FDR_TRUST_OBJECT_TAG,

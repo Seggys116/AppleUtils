@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use plist::{Dictionary, Integer, Value};
 
-use super::message::RestoreOptions;
+use super::message::{RestoreOptions, SystemImageFormat};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestoreBehavior {
@@ -369,6 +369,24 @@ pub fn select_install_identity(
     })
 }
 
+pub fn select_recovery_identity(
+    manifest: &Dictionary,
+    hardware_model: &str,
+    variant: &str,
+) -> Result<BuildIdentity, IdentityError> {
+    let entries = identities(manifest)?;
+    let candidates = matching_device_class(entries, hardware_model);
+    if candidates.is_empty() {
+        return Err(IdentityError::NoDeviceClass {
+            hardware_model: hardware_model.to_string(),
+        });
+    }
+    pick_variant(&candidates, variant, false).ok_or_else(|| IdentityError::NoVariant {
+        hardware_model: hardware_model.to_string(),
+        wanted: variant.to_string(),
+    })
+}
+
 #[must_use]
 pub fn install_behaviors_for_board(
     manifest: &Dictionary,
@@ -441,6 +459,8 @@ pub const REQUIRED_DATA_TYPES: &[&str] = &[
     "OverlayRootDataCount",
     "KernelCache",
     "RootTicket",
+    "RootTicketData",
+    "APTicket",
     "BuildIdentityDict",
     "BuildIdentityDictV2",
     "BasebandBootData",
@@ -463,15 +483,33 @@ pub const REQUIRED_DATA_TYPES: &[&str] = &[
     "RecoveryOSOverlayRootDataCount",
     "SourceBootObjectV3",
     "SourceBootObjectV4",
-    "RecoveryOSLocalPolicy",
+    CENTAURI_REQUIRED_DATA_TYPE,
     "PersonalizedBootObjectV3",
     "BootabilityBundle",
     "MessageUseStreamedImageFile",
+    "StreamedImageDecryptionKey",
 ];
 
 pub const CENTAURI_REQUIRED_DATA_TYPE: &str = "SourceBootObjectV5";
 
-pub const ASYNC_DATA_TYPES: &[&str] = &["BootabilityBundle", "StreamedImageDecryptionKey"];
+pub const ADVERTISED_OPTIONAL_DATA_TYPES: &[&str] = &[
+    "PersonalizedData",
+    "RecoveryOSASRImage",
+    "RecoveryOSLocalPolicy",
+    "RecoveryOSRootTicketData",
+    "RecoveryOSVersionData",
+    "URLAsset",
+];
+
+pub const ASYNC_DATA_TYPES: &[&str] = &[
+    "BasebandData",
+    "BootabilityBundle",
+    "RecoveryOSASRImage",
+    "StreamedImageDecryptionKey",
+    "SystemImageData",
+];
+
+pub const ADVERTISED_OPTIONAL_ASYNC_DATA_TYPES: &[&str] = &["URLAsset"];
 
 #[must_use]
 pub fn capability_dictionary(required: &[&str], optional: &[&str]) -> Value {
@@ -484,13 +522,6 @@ pub fn capability_dictionary(required: &[&str], optional: &[&str]) -> Value {
     }
     Value::Dictionary(dictionary)
 }
-
-const CAPABILITY_WITHHELD_REASON: &str =
-    "absent-means-every-type-supported-so-declaring-can-only-remove-capability";
-
-// A change that starts sending `SupportedAsyncDataTypes` must not carry `URLAsset` unless the host will dial back the port the guest then waits in `accept` on.
-pub const ASYNC_TYPES_GRANTED_BY_THE_MESSAGE_TYPE_FALLBACK: &[&str] =
-    &["SystemImageData", "RecoveryOSASRImage"];
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OptionsReport {
@@ -509,6 +540,23 @@ impl fmt::Display for OptionsReport {
             write!(f, " withheld={key}({reason})")?;
         }
         Ok(())
+    }
+}
+
+fn with_manifest_system_image_format(
+    options: RestoreOptions,
+    install: &BuildIdentity,
+    report: &mut OptionsReport,
+) -> RestoreOptions {
+    match install.info_string("ContentEncoding") {
+        Some("aea") => {
+            report.keys.push("SystemImageFormat".to_string());
+            options.with_system_image_format(SystemImageFormat::AeaWrappedDiskImage)
+        }
+        _ => {
+            report.omitted.push("SystemImageFormat".to_string());
+            options
+        }
     }
 }
 
@@ -540,11 +588,18 @@ pub fn macos_restore_options(
         capability_dictionary(REQUIRED_MESSAGE_TYPES, ADVERTISED_OPTIONAL_MESSAGE_TYPES),
         &mut report,
     );
-    for key in ["SupportedDataTypes", "SupportedAsyncDataTypes"] {
-        report
-            .withheld
-            .push((key.to_string(), CAPABILITY_WITHHELD_REASON));
-    }
+    options = set(
+        options,
+        "SupportedDataTypes",
+        capability_dictionary(REQUIRED_DATA_TYPES, ADVERTISED_OPTIONAL_DATA_TYPES),
+        &mut report,
+    );
+    options = set(
+        options,
+        "SupportedAsyncDataTypes",
+        capability_dictionary(ASYNC_DATA_TYPES, ADVERTISED_OPTIONAL_ASYNC_DATA_TYPES),
+        &mut report,
+    );
     options = set(options, "RootToInstall", Value::Boolean(false), &mut report);
     options = set(
         options,
@@ -559,6 +614,7 @@ pub fn macos_restore_options(
         &mut report,
     );
     options = set(options, "SystemImage", Value::Boolean(true), &mut report);
+    options = with_manifest_system_image_format(options, install, &mut report);
     match install.info_dictionary("SystemPartitionPadding") {
         Some(padding) => {
             options = set(
@@ -679,6 +735,141 @@ pub fn macos_restore_options(
     (options, report)
 }
 
+#[must_use]
+pub fn mobile_restore_options(
+    install: &BuildIdentity,
+    recovery: Option<&BuildIdentity>,
+    behavior: RestoreBehavior,
+    session_uuid: &str,
+    request_global_manifest: bool,
+) -> (RestoreOptions, OptionsReport) {
+    let mut report = OptionsReport::default();
+    let mut options = RestoreOptions::new();
+    let set = |options: RestoreOptions, key: &str, value: Value, report: &mut OptionsReport| {
+        report.keys.push(key.to_string());
+        options.with_value(key, value)
+    };
+
+    options = set(
+        options,
+        "AutoBootDelay",
+        Value::Integer(Integer::from(0)),
+        &mut report,
+    );
+    options = set(
+        options,
+        "SupportedMessageTypes",
+        capability_dictionary(REQUIRED_MESSAGE_TYPES, ADVERTISED_OPTIONAL_MESSAGE_TYPES),
+        &mut report,
+    );
+    options = set(
+        options,
+        "SupportedDataTypes",
+        capability_dictionary(REQUIRED_DATA_TYPES, ADVERTISED_OPTIONAL_DATA_TYPES),
+        &mut report,
+    );
+    options = set(
+        options,
+        "SupportedAsyncDataTypes",
+        capability_dictionary(ASYNC_DATA_TYPES, ADVERTISED_OPTIONAL_ASYNC_DATA_TYPES),
+        &mut report,
+    );
+    for (key, value) in [
+        ("BootImageType", "User"),
+        ("DFUFileType", "RELEASE"),
+        ("KernelCacheType", "Release"),
+        ("NORImageType", "production"),
+        ("SystemImageType", "User"),
+        ("AuthInstallVariant", install.variant.as_str()),
+        ("AuthInstallRestoreBehavior", behavior.wire_name()),
+        ("UUID", session_uuid),
+    ] {
+        options = set(options, key, Value::String(value.to_string()), &mut report);
+    }
+    for (key, value) in [
+        ("DataImage", false),
+        ("FlashNOR", true),
+        ("UpdateBaseband", true),
+        ("InstallDiags", false),
+        ("HostHasFixFor99053849", true),
+        ("WaitForDeviceConnectionToFinishStateMachine", false),
+        ("PersonalizedDuringPreflight", true),
+        ("RootToInstall", false),
+        ("CreateFilesystemPartitions", true),
+        ("SystemImage", true),
+    ] {
+        options = set(options, key, Value::Boolean(value), &mut report);
+    }
+    for (source, key) in [
+        ("SystemPartitionPadding", "SystemPartitionPadding"),
+        ("MinimumSystemPartition", "SystemPartitionSize"),
+    ] {
+        match install.info.get(source) {
+            Some(value) => options = set(options, key, value.clone(), &mut report),
+            None => report.omitted.push(key.to_string()),
+        }
+    }
+    options = with_manifest_system_image_format(options, install, &mut report);
+    match install
+        .components
+        .as_ref()
+        .and_then(|components| components.get("SEP"))
+        .and_then(Value::as_dictionary)
+        .and_then(|sep| sep.get("Info"))
+        .and_then(Value::as_dictionary)
+        .and_then(|info| info.get("RequiredCapacity"))
+    {
+        Some(capacity) => {
+            options = set(
+                options,
+                "TZ0RequiredCapacity",
+                capacity.clone(),
+                &mut report,
+            );
+        }
+        None => report.omitted.push("TZ0RequiredCapacity".to_string()),
+    }
+    report.omitted.extend([
+        "FirmwareDirectory".to_string(),
+        "RestoreBundlePath".to_string(),
+    ]);
+    match recovery {
+        Some(identity) => {
+            options = set(
+                options,
+                "InstallRecoveryOS",
+                Value::Boolean(true),
+                &mut report,
+            );
+            options = set(
+                options,
+                "AuthInstallRecoveryOSVariant",
+                Value::String(identity.variant.clone()),
+                &mut report,
+            );
+            report.omitted.extend([
+                "RecoveryOSBundlePath".to_string(),
+                "recoveryOSPartitionSize".to_string(),
+                "recoveryOSMaxPartitionSize".to_string(),
+            ]);
+        }
+        None => report.omitted.extend([
+            "InstallRecoveryOS".to_string(),
+            "AuthInstallRecoveryOSVariant".to_string(),
+        ]),
+    }
+    if request_global_manifest {
+        options = set(
+            options,
+            "SelectMediumSecurityBootPolicy",
+            Value::Boolean(true),
+            &mut report,
+        );
+    }
+    report.keys.sort();
+    (options, report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,6 +877,77 @@ mod tests {
     const REAL_MINIMUM_SYSTEM_PARTITION: i64 = 11977;
     const REAL_OS_VAR_CONTENT_SIZE: i64 = 831_619_072;
     const REAL_RESTORE_BEHAVIOR: &str = "Erase";
+
+    fn serialized_start_restore_options(options: RestoreOptions) -> Dictionary {
+        let mut client = crate::ramrod::RamrodClient::new(Cursor::new(Vec::new()));
+        client.start_restore(options).unwrap();
+        let mut transport = client.into_inner();
+        transport.set_position(0);
+        let request = crate::ramrod::codec::read_message(&mut transport)
+            .unwrap()
+            .unwrap();
+        let request = request.as_dictionary().unwrap();
+        assert_eq!(request["Request"].as_string(), Some("StartRestore"));
+        request["RestoreOptions"].as_dictionary().unwrap().clone()
+    }
+
+    fn assert_restore_fetch_capabilities(body: &Dictionary, report: &OptionsReport) {
+        let data = body["SupportedDataTypes"].as_dictionary().unwrap();
+        for name in [
+            "DataType",
+            "SystemImageData",
+            "SystemImageRootHash",
+            "SystemImageCanonicalMetadata",
+            "FDRTrustData",
+            "FDRMemoryCommit",
+            "BuildIdentityDict",
+            "BuildIdentityDictV2",
+            "RootTicket",
+            "RootTicketData",
+            "APTicket",
+            "SourceBootObjectV3",
+            "SourceBootObjectV4",
+            "SourceBootObjectV5",
+            "PersonalizedBootObjectV3",
+            "BootabilityBundle",
+            "StreamedImageDecryptionKey",
+        ] {
+            assert_eq!(data[name].as_boolean(), Some(false), "{name}");
+        }
+        for name in [
+            "URLAsset",
+            "PersonalizedData",
+            "RecoveryOSASRImage",
+            "RecoveryOSLocalPolicy",
+            "RecoveryOSRootTicketData",
+            "RecoveryOSVersionData",
+        ] {
+            assert_eq!(data[name].as_boolean(), Some(true), "{name}");
+        }
+        let asynchronous = body["SupportedAsyncDataTypes"].as_dictionary().unwrap();
+        for name in [
+            "BasebandData",
+            "BootabilityBundle",
+            "RecoveryOSASRImage",
+            "StreamedImageDecryptionKey",
+            "SystemImageData",
+        ] {
+            assert_eq!(asynchronous[name].as_boolean(), Some(false), "{name}");
+        }
+        assert_eq!(asynchronous["URLAsset"].as_boolean(), Some(true));
+        let messages = body["SupportedMessageTypes"].as_dictionary().unwrap();
+        for name in ["AsyncDataRequestMsg", "AsyncWait"] {
+            assert_eq!(messages[name].as_boolean(), Some(true), "{name}");
+        }
+        assert_eq!(
+            body["SupportedHostProtocols"].as_array().unwrap(),
+            &vec![Value::String("MuxSocket".into())]
+        );
+        for key in ["SupportedDataTypes", "SupportedAsyncDataTypes"] {
+            assert!(report.keys.iter().any(|sent| sent == key), "{key}");
+            assert!(report.to_string().contains(key), "{key}");
+        }
+    }
 
     fn identity(device_class: &str, variant: &str) -> Value {
         let mut info = Dictionary::new();
@@ -729,6 +991,258 @@ mod tests {
             ]),
         );
         root
+    }
+
+    fn mobile_manifest() -> Dictionary {
+        let mut install = identity("j617ap", "Developer Erase Install (IPSW)");
+        let body = install.as_dictionary_mut().unwrap();
+        let info = body.get_mut("Info").unwrap().as_dictionary_mut().unwrap();
+        info.insert(
+            "RecoveryVariant".into(),
+            Value::String("Recovery Customer Install".into()),
+        );
+        info.insert("ContentEncoding".into(), Value::String("aea".into()));
+        let mut sep_info = Dictionary::new();
+        sep_info.insert("RequiredCapacity".into(), Value::String("0x800000".into()));
+        let mut sep = Dictionary::new();
+        sep.insert("Info".into(), Value::Dictionary(sep_info));
+        body.get_mut("Manifest")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap()
+            .insert("SEP".into(), Value::Dictionary(sep));
+        let mut root = Dictionary::new();
+        root.insert(
+            "BuildIdentities".into(),
+            Value::Array(vec![
+                install,
+                identity("j617ap", "Recovery Customer Install Extra"),
+                identity("j618ap", "Recovery Customer Install"),
+                identity("j617ap", "Recovery Customer Install"),
+            ]),
+        );
+        root
+    }
+
+    #[test]
+    fn declared_mobile_recovery_variant_selects_the_exact_identity() {
+        let root = mobile_manifest();
+        let install = select_install_identity(&root, "J617AP", RestoreBehavior::Erase).unwrap();
+        let recovery = select_recovery_identity(
+            &root,
+            "J617AP",
+            install.info_string("RecoveryVariant").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(recovery.index, 3);
+        assert_eq!(recovery.device_class, "j617ap");
+        assert_eq!(recovery.variant, "Recovery Customer Install");
+    }
+
+    #[test]
+    fn recovery_selector_names_the_model_and_exact_variant_it_refuses() {
+        let root = mobile_manifest();
+        assert_eq!(
+            select_recovery_identity(&root, "j617ap", "Recovery Customer"),
+            Err(IdentityError::NoVariant {
+                hardware_model: "j617ap".into(),
+                wanted: "Recovery Customer".into(),
+            })
+        );
+        assert_eq!(
+            select_recovery_identity(&root, "j999ap", "Recovery Customer Install"),
+            Err(IdentityError::NoDeviceClass {
+                hardware_model: "j999ap".into(),
+            })
+        );
+        assert_eq!(
+            select_recovery_identity(&Dictionary::new(), "j617ap", "Recovery Customer Install"),
+            Err(IdentityError::NoIdentities)
+        );
+    }
+
+    #[test]
+    fn mobile_options_carry_protocol_values_and_manifest_metadata() {
+        let root = mobile_manifest();
+        let install = select_install_identity(&root, "j617ap", RestoreBehavior::Erase).unwrap();
+        let recovery = select_recovery_identity(
+            &root,
+            "j617ap",
+            install.info_string("RecoveryVariant").unwrap(),
+        )
+        .unwrap();
+        let (options, report) = mobile_restore_options(
+            &install,
+            Some(&recovery),
+            RestoreBehavior::Erase,
+            "mobile-session",
+            true,
+        );
+        assert_eq!(
+            options.system_image_format(),
+            Some(SystemImageFormat::AeaWrappedDiskImage)
+        );
+        let body = serialized_start_restore_options(options);
+        for (key, expected) in [
+            ("BootImageType", "User"),
+            ("DFUFileType", "RELEASE"),
+            ("KernelCacheType", "Release"),
+            ("NORImageType", "production"),
+            ("SystemImageType", "User"),
+            ("SystemImageFormat", "AEAWrappedDiskImage"),
+            ("AuthInstallVariant", "Developer Erase Install (IPSW)"),
+            ("AuthInstallRestoreBehavior", "Erase"),
+            ("AuthInstallRecoveryOSVariant", "Recovery Customer Install"),
+            ("TZ0RequiredCapacity", "0x800000"),
+            ("UUID", "mobile-session"),
+        ] {
+            assert_eq!(body.get(key).unwrap().as_string(), Some(expected), "{key}");
+        }
+        for (key, expected) in [
+            ("DataImage", false),
+            ("FlashNOR", true),
+            ("UpdateBaseband", true),
+            ("InstallDiags", false),
+            ("HostHasFixFor99053849", true),
+            ("WaitForDeviceConnectionToFinishStateMachine", false),
+            ("PersonalizedDuringPreflight", true),
+            ("RootToInstall", false),
+            ("CreateFilesystemPartitions", true),
+            ("SystemImage", true),
+            ("InstallRecoveryOS", true),
+            ("SelectMediumSecurityBootPolicy", true),
+        ] {
+            assert_eq!(body.get(key).unwrap().as_boolean(), Some(expected), "{key}");
+        }
+        assert_eq!(
+            body.get("AutoBootDelay").unwrap().as_signed_integer(),
+            Some(0)
+        );
+        assert_eq!(
+            body.get("SystemPartitionSize").unwrap().as_signed_integer(),
+            Some(11977)
+        );
+        let padding = body
+            .get("SystemPartitionPadding")
+            .unwrap()
+            .as_dictionary()
+            .unwrap();
+        assert_eq!(padding.get("128").unwrap().as_signed_integer(), Some(1));
+        assert_eq!(
+            body.get("SupportedHostProtocols")
+                .unwrap()
+                .as_array()
+                .unwrap(),
+            &vec![Value::String("MuxSocket".into())]
+        );
+        let messages = body
+            .get("SupportedMessageTypes")
+            .unwrap()
+            .as_dictionary()
+            .unwrap();
+        assert_eq!(
+            messages.get("DataRequestMsg").unwrap().as_boolean(),
+            Some(false)
+        );
+        for name in [
+            "AsyncDataRequestMsg",
+            "AsyncWait",
+            "CheckpointMsg",
+            "CrashLog",
+        ] {
+            assert_eq!(
+                messages.get(name).unwrap().as_boolean(),
+                Some(true),
+                "{name}"
+            );
+        }
+        assert_restore_fetch_capabilities(&body, &report);
+        assert!(
+            report
+                .omitted
+                .contains(&"recoveryOSPartitionSize".to_string())
+        );
+        assert!(
+            report
+                .omitted
+                .contains(&"recoveryOSMaxPartitionSize".to_string())
+        );
+    }
+
+    #[test]
+    fn mobile_options_report_undetermined_metadata_and_optional_recovery() {
+        let root = mobile_manifest();
+        let mut install = select_install_identity(&root, "j617ap", RestoreBehavior::Erase).unwrap();
+        install.info.remove("ContentEncoding");
+        install.info.remove("MinimumSystemPartition");
+        install.info.remove("SystemPartitionPadding");
+        install.components = None;
+        let (options, report) = mobile_restore_options(
+            &install,
+            None,
+            RestoreBehavior::Update,
+            "update-session",
+            false,
+        );
+        for key in [
+            "SystemImageFormat",
+            "SystemPartitionSize",
+            "SystemPartitionPadding",
+            "TZ0RequiredCapacity",
+            "InstallRecoveryOS",
+            "AuthInstallRecoveryOSVariant",
+        ] {
+            assert!(report.omitted.contains(&key.to_string()), "{key}");
+        }
+        let value = options.into_value().unwrap();
+        let body = value.as_dictionary().unwrap();
+        assert_eq!(
+            body.get("AuthInstallRestoreBehavior").unwrap().as_string(),
+            Some("Update")
+        );
+        assert_eq!(
+            body.get("UUID").unwrap().as_string(),
+            Some("update-session")
+        );
+        install.info.insert(
+            "ContentEncoding".into(),
+            Value::String("unrecognized".into()),
+        );
+        let (_, report) = mobile_restore_options(
+            &install,
+            None,
+            RestoreBehavior::Update,
+            "update-session",
+            false,
+        );
+        assert!(report.omitted.contains(&"SystemImageFormat".to_string()));
+    }
+
+    #[test]
+    fn mobile_options_preserve_partition_metadata_value_types() {
+        let root = mobile_manifest();
+        let mut install = select_install_identity(&root, "j617ap", RestoreBehavior::Erase).unwrap();
+        install.info.insert(
+            "MinimumSystemPartition".into(),
+            Value::String("0x2ec9".into()),
+        );
+        let (options, _) = mobile_restore_options(
+            &install,
+            None,
+            RestoreBehavior::Erase,
+            "partition-session",
+            false,
+        );
+        let value = options.into_value().unwrap();
+        assert_eq!(
+            value
+                .as_dictionary()
+                .unwrap()
+                .get("SystemPartitionSize")
+                .unwrap()
+                .as_string(),
+            Some("0x2ec9")
+        );
     }
 
     #[test]
@@ -853,7 +1367,7 @@ mod tests {
         let macos = select_macos_identity(&manifest(), "J274AP").unwrap();
         let (options, report) =
             macos_restore_options(&install, &macos, RestoreBehavior::Erase, "test-uuid", false);
-        assert!(report.omitted.is_empty(), "{report}");
+        assert_eq!(report.omitted, vec!["SystemImageFormat"], "{report}");
 
         let value = options.into_value().expect("MuxSocket is still present");
         let body = value.as_dictionary().unwrap();
@@ -901,45 +1415,57 @@ mod tests {
     }
 
     #[test]
-    fn the_data_type_dictionaries_are_withheld_rather_than_sent_short() {
-        let install =
+    fn macos_start_restore_advertises_fetches_and_manifest_image_format() {
+        let mut install =
             select_install_identity(&manifest(), "J274AP", RestoreBehavior::Erase).unwrap();
+        install
+            .info
+            .insert("ContentEncoding".into(), Value::String("aea".into()));
         let macos = select_macos_identity(&manifest(), "J274AP").unwrap();
         let (options, report) =
             macos_restore_options(&install, &macos, RestoreBehavior::Erase, "test-uuid", false);
-        let withheld: Vec<&str> = report
-            .withheld
-            .iter()
-            .map(|(key, _)| key.as_str())
-            .collect();
+        let body = serialized_start_restore_options(options);
+        assert_restore_fetch_capabilities(&body, &report);
         assert_eq!(
-            withheld,
-            vec!["SupportedDataTypes", "SupportedAsyncDataTypes"]
+            body["SystemImageFormat"].as_string(),
+            Some("AEAWrappedDiskImage")
         );
-        assert!(report.withheld.iter().all(|(_, reason)| !reason.is_empty()));
-        let value = options.into_value().unwrap();
-        let body = value.as_dictionary().unwrap();
-        for (key, _) in &report.withheld {
-            assert!(!body.contains_key(key), "{key} reached the wire");
-            assert!(!report.keys.contains(key), "{key} was reported as sent");
+        assert!(report.keys.iter().any(|key| key == "SystemImageFormat"));
+        assert_eq!(
+            body["AuthInstallVariant"].as_string(),
+            Some("Customer Erase Install (IPSW)")
+        );
+        assert_eq!(
+            body["AuthInstallRecoveryOSVariant"].as_string(),
+            Some("macOS Customer")
+        );
+        assert_eq!(
+            body["AuthInstallRestoreBehavior"].as_string(),
+            Some("Erase")
+        );
+        assert_eq!(body["UUID"].as_string(), Some("test-uuid"));
+        assert_eq!(
+            body["SystemPartitionSize"].as_signed_integer(),
+            Some(REAL_MINIMUM_SYSTEM_PARTITION)
+        );
+        assert_eq!(
+            body["recoveryOSPartitionSize"].as_signed_integer(),
+            Some(794)
+        );
+        assert_eq!(
+            body["SystemPartitionPadding"].as_dictionary().unwrap()["128"].as_signed_integer(),
+            Some(1)
+        );
+        for key in [
+            "CreateFilesystemPartitions",
+            "SystemImage",
+            "InstallRecoveryOS",
+        ] {
+            assert_eq!(body[key].as_boolean(), Some(true), "{key}");
         }
-        let printed = report.to_string();
-        assert!(
-            printed.contains("withheld=SupportedDataTypes("),
-            "{printed}"
-        );
-        assert!(!ASYNC_TYPES_GRANTED_BY_THE_MESSAGE_TYPE_FALLBACK.contains(&"URLAsset"));
-        assert!(ADVERTISED_OPTIONAL_MESSAGE_TYPES.contains(&"AsyncDataRequestMsg"));
-        for name in ASYNC_TYPES_GRANTED_BY_THE_MESSAGE_TYPE_FALLBACK {
+        for name in ["SystemImageData", "RecoveryOSASRImage"] {
             let data_type = crate::ramrod::message::DataType::from_wire(name);
-            assert!(
-                !matches!(data_type, crate::ramrod::message::DataType::Other(_)),
-                "{name} is granted asynchronously and is not a type this host models"
-            );
-            assert!(
-                crate::ramrod::images::bulk_image_entry(&data_type).is_some(),
-                "{name} is granted asynchronously and no manifest entry answers it"
-            );
+            assert!(crate::ramrod::images::bulk_image_entry(&data_type).is_some());
         }
     }
 
@@ -1037,13 +1563,16 @@ mod tests {
         for name in OPTIONAL_MESSAGE_TYPES {
             assert_eq!(body.get(name).unwrap().as_boolean(), Some(true), "{name}");
         }
-        assert!(!REQUIRED_DATA_TYPES.contains(&CENTAURI_REQUIRED_DATA_TYPE));
-        let data = capability_dictionary(REQUIRED_DATA_TYPES, ASYNC_DATA_TYPES);
-        assert_eq!(
-            data.as_dictionary().unwrap().len(),
-            REQUIRED_DATA_TYPES.len() + ASYNC_DATA_TYPES.len() - 1,
-            "BootabilityBundle is in both lists and is one key"
-        );
+        let data = capability_dictionary(REQUIRED_DATA_TYPES, ADVERTISED_OPTIONAL_DATA_TYPES);
+        let data = data.as_dictionary().unwrap();
+        for name in REQUIRED_DATA_TYPES {
+            assert_eq!(data[name].as_boolean(), Some(false), "{name}");
+        }
+        for name in ADVERTISED_OPTIONAL_DATA_TYPES {
+            assert_eq!(data[name].as_boolean(), Some(true), "{name}");
+        }
+        assert_eq!(data[CENTAURI_REQUIRED_DATA_TYPE].as_boolean(), Some(false));
+        assert_eq!(data["BootabilityBundle"].as_boolean(), Some(false));
     }
 
     #[test]
@@ -1111,7 +1640,7 @@ mod tests {
     }
 
     #[test]
-    fn none_of_the_ios_branch_keys_are_sent_on_the_macos_path() {
+    fn macos_options_carry_the_restore_protocol_preflight_flags() {
         let install =
             select_install_identity(&manifest(), "J274AP", RestoreBehavior::Erase).unwrap();
         let macos = select_macos_identity(&manifest(), "J274AP").unwrap();
@@ -1119,14 +1648,6 @@ mod tests {
             macos_restore_options(&install, &macos, RestoreBehavior::Erase, "u", false);
         let value = options.into_value().unwrap();
         let body = value.as_dictionary().unwrap();
-        for key in [
-            "RestoreBundlePath",
-            "SystemImageFormat",
-            "BootImageType",
-            "DFUFileType",
-        ] {
-            assert!(!body.contains_key(key), "{key} is an iOS branch key");
-        }
         assert_eq!(
             body.get("PersonalizedDuringPreflight")
                 .and_then(Value::as_boolean),

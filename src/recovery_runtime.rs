@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use crate::clip::FileInfo;
@@ -33,6 +34,15 @@ pub enum RecoveryCommand {
     },
     SetLocalPolicySigning {
         enabled: bool,
+    },
+    SetVmLocalSigning {
+        enabled: bool,
+    },
+    SetSkipTconFirmware {
+        enabled: bool,
+    },
+    SetFdrMaterialDirectory {
+        path: Option<PathBuf>,
     },
     Autosearch {
         device_id: String,
@@ -279,9 +289,9 @@ impl RecoveryRuntime {
             .send(RecoveryCommand::SetLocalPolicySigning { enabled })
             .is_err()
         {
-            self.model.last_error = Some("Could not change LocalPolicy signing".into());
+            self.model.last_error = Some("Could not change Apple restore signing".into());
             self.model
-                .push_log(LogLevel::Error, "Could not change LocalPolicy signing");
+                .push_log(LogLevel::Error, "Could not change Apple restore signing");
             return;
         }
         self.model.sign_recovery_os_local_policy = enabled;
@@ -299,6 +309,63 @@ impl RecoveryRuntime {
 
     pub fn toggle_local_policy_signing(&mut self) {
         self.set_local_policy_signing(!self.model.sign_recovery_os_local_policy);
+    }
+
+    pub fn set_vm_local_signing(&mut self, enabled: bool) {
+        if self
+            .service
+            .send(RecoveryCommand::SetVmLocalSigning { enabled })
+            .is_err()
+        {
+            self.model.last_error = Some("Could not change VM local signing".into());
+            self.model
+                .push_log(LogLevel::Error, "Could not change VM local signing");
+            return;
+        }
+        self.model.vm_local_signing_enabled = enabled;
+        let stated = crate::recovery_model::vm_local_signing_status(enabled);
+        self.model.status_message = stated.clone();
+        self.model.push_log(LogLevel::Info, stated);
+    }
+
+    pub fn toggle_vm_local_signing(&mut self) {
+        self.set_vm_local_signing(!self.model.vm_local_signing_enabled);
+    }
+
+    pub fn set_skip_tcon_firmware(&mut self, enabled: bool) {
+        if self
+            .service
+            .send(RecoveryCommand::SetSkipTconFirmware { enabled })
+            .is_err()
+        {
+            self.model.last_error = Some("Could not change Skip TCON firmware".into());
+            self.model
+                .push_log(LogLevel::Error, "Could not change Skip TCON firmware");
+            return;
+        }
+        self.model.skip_tcon_firmware = enabled;
+        let stated = crate::recovery_model::skip_tcon_firmware_status(enabled);
+        self.model.status_message = stated.clone();
+        self.model.push_log(
+            if enabled {
+                LogLevel::Warn
+            } else {
+                LogLevel::Info
+            },
+            stated,
+        );
+    }
+
+    pub fn toggle_skip_tcon_firmware(&mut self) {
+        self.set_skip_tcon_firmware(!self.model.skip_tcon_firmware);
+    }
+
+    pub fn set_fdr_material_directory(
+        &mut self,
+        path: Option<PathBuf>,
+    ) -> Result<(), RecoveryServiceError> {
+        self.service
+            .send(RecoveryCommand::SetFdrMaterialDirectory { path })
     }
 
     pub fn release_claim(&mut self) {
@@ -1019,6 +1086,126 @@ mod tests {
         runtime.start_restore();
 
         assert!(matches!(bridge.recv_command(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn skip_tcon_firmware_toggle_sends_the_operator_choice_and_applies_service_state() {
+        let (service, bridge) = ChannelRecoveryService::pair();
+        let mut runtime = RecoveryRuntime::from_service(service);
+        assert!(!runtime.model.skip_tcon_firmware);
+        for enabled in [true, false, true] {
+            runtime.toggle_skip_tcon_firmware();
+            assert_eq!(
+                bridge.recv_command().unwrap(),
+                RecoveryCommand::SetSkipTconFirmware { enabled }
+            );
+            assert_eq!(runtime.model.skip_tcon_firmware, enabled);
+            assert!(
+                runtime
+                    .model
+                    .status_message
+                    .contains("requires separately patched recovery media")
+            );
+        }
+        bridge
+            .emit(RecoveryEvent::SkipTconFirmware { enabled: false })
+            .unwrap();
+        runtime.prepare();
+        assert!(!runtime.model.skip_tcon_firmware);
+        assert!(runtime.model.vm_local_signing_enabled);
+    }
+
+    #[test]
+    fn vm_and_apple_signing_commands_preserve_independent_choices() {
+        let (service, bridge) = ChannelRecoveryService::pair();
+        let mut runtime = RecoveryRuntime::from_service(service);
+
+        runtime.set_local_policy_signing(true);
+        assert_eq!(
+            bridge.recv_command().expect("Apple signing command"),
+            RecoveryCommand::SetLocalPolicySigning { enabled: true }
+        );
+        assert_eq!(
+            (
+                runtime.model.sign_recovery_os_local_policy,
+                runtime.model.vm_local_signing_enabled,
+            ),
+            (true, true)
+        );
+        runtime.set_vm_local_signing(false);
+        assert_eq!(
+            bridge.recv_command().expect("VM signing command"),
+            RecoveryCommand::SetVmLocalSigning { enabled: false }
+        );
+        assert_eq!(
+            (
+                runtime.model.sign_recovery_os_local_policy,
+                runtime.model.vm_local_signing_enabled,
+            ),
+            (true, false)
+        );
+        runtime.toggle_local_policy_signing();
+        assert_eq!(
+            bridge.recv_command().expect("Apple signing toggle"),
+            RecoveryCommand::SetLocalPolicySigning { enabled: false }
+        );
+        assert_eq!(
+            (
+                runtime.model.sign_recovery_os_local_policy,
+                runtime.model.vm_local_signing_enabled,
+            ),
+            (false, false)
+        );
+        runtime.toggle_vm_local_signing();
+        assert_eq!(
+            bridge.recv_command().expect("VM signing toggle"),
+            RecoveryCommand::SetVmLocalSigning { enabled: true }
+        );
+        assert_eq!(
+            (
+                runtime.model.sign_recovery_os_local_policy,
+                runtime.model.vm_local_signing_enabled,
+            ),
+            (false, true)
+        );
+
+        bridge
+            .emit(RecoveryEvent::VmLocalSigning { enabled: false })
+            .expect("effective VM signing event");
+        bridge
+            .emit(RecoveryEvent::LocalPolicySigning { enabled: true })
+            .expect("effective Apple signing event");
+        runtime.prepare();
+        assert_eq!(
+            (
+                runtime.model.sign_recovery_os_local_policy,
+                runtime.model.vm_local_signing_enabled,
+            ),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn vm_signing_send_failure_records_a_named_error() {
+        let (service, bridge) = ChannelRecoveryService::pair();
+        let mut runtime = RecoveryRuntime::from_service(service);
+        drop(bridge);
+
+        runtime.set_vm_local_signing(false);
+
+        assert!(runtime.model.vm_local_signing_enabled);
+        assert_eq!(
+            runtime.model.last_error.as_deref(),
+            Some("Could not change VM local signing")
+        );
+        let entry = runtime
+            .model
+            .logs
+            .iter()
+            .find(|entry| entry.message == "Could not change VM local signing")
+            .expect("named send error recorded");
+        assert_eq!(entry.level, LogLevel::Error);
+        assert_eq!(entry.message, "Could not change VM local signing");
     }
 
     #[test]

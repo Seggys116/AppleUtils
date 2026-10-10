@@ -56,6 +56,13 @@ pub trait PayloadObserver {
         false
     }
 
+    fn stop_error(&mut self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "ASR payload stopped at the observer's request",
+        )
+    }
+
     fn image_matched(
         &mut self,
         _data_type: &str,

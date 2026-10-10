@@ -3,10 +3,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::ramrod::dial::GuestDialer;
+use crate::ramrod::dial::{DialCancellation, GuestDialer, ShutdownWrite};
 
 use super::frame::{MuxVersion, VersionRequest};
-use super::link::{BulkTransport, InboundSignal, MuxError, MuxLink};
+use super::link::{BulkTransport, InboundSignal, MuxError, MuxLink, SendState};
+use super::packet_trace::{Disposition, Stage};
 use super::session::SessionState;
 use super::trace::MuxTraceEvent;
 use super::watchdog::{LinkActivity, LinkPhase};
@@ -16,6 +17,117 @@ pub const HOST_TEARDOWN_MARKER: &str = "host-initiated-teardown";
 pub const DEVICE_GONE_MARKER: &str = "device-left-the-bus";
 
 pub const RUN_STOPPED_MARKER: &str = "restore-run-stopped";
+
+pub const TRANSFER_CANCELLED_MARKER: &str = "restore-transfer-cancelled";
+
+pub const CONNECTION_CANCELLED_MARKER: &str = "mux-connection-cancelled";
+
+#[derive(Debug)]
+struct DeliveryDrainError {
+    port: u16,
+    outstanding: Option<SendState>,
+    cause: io::Error,
+}
+
+impl std::fmt::Display for DeliveryDrainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "mux port {} delivery drain failed: {}; ",
+            self.port, self.cause
+        )?;
+        match self.outstanding {
+            Some(state) => write!(
+                f,
+                "{} byte(s) queued and {} byte(s) sent but unacknowledged",
+                state.pending,
+                state.snd_nxt.wrapping_sub(state.snd_una)
+            ),
+            None => f.write_str(
+                "outstanding byte counts are unavailable because the mux session is unavailable",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeliveryDrainError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause
+            .get_ref()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+    }
+}
+
+fn delivery_drain_error(port: u16, outstanding: Option<SendState>, cause: io::Error) -> io::Error {
+    io::Error::new(
+        cause.kind(),
+        DeliveryDrainError {
+            port,
+            outstanding,
+            cause,
+        },
+    )
+}
+
+#[derive(Debug)]
+struct CancelledMuxOperation {
+    reason: DialCancellation,
+    port: u16,
+    operation: &'static str,
+    waited: Duration,
+}
+
+impl std::fmt::Display for CancelledMuxOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.reason {
+            DialCancellation::OperatorStopped => write!(
+                f,
+                "{RUN_STOPPED_MARKER}: the run was stopped while mux port {} was {}, {:.3}s into the wait. Nothing on the wire ended this and nothing about the guest is being reported.",
+                self.port,
+                self.operation,
+                self.waited.as_secs_f64()
+            ),
+            DialCancellation::TransferFailed => write!(
+                f,
+                "{TRANSFER_CANCELLED_MARKER}: a restore transfer failed while mux port {} was {}, {:.3}s into the wait; this operation was cancelled and the original transfer failure remains the session error",
+                self.port,
+                self.operation,
+                self.waited.as_secs_f64()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CancelledMuxOperation {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.reason)
+    }
+}
+
+fn cancellation_error(
+    stop: Option<&Arc<AtomicBool>>,
+    failure: Option<&Arc<AtomicBool>>,
+    port: u16,
+    operation: &'static str,
+    waited: Duration,
+) -> Option<io::Error> {
+    let reason = if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        DialCancellation::OperatorStopped
+    } else if failure.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        DialCancellation::TransferFailed
+    } else {
+        return None;
+    };
+    Some(io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        CancelledMuxOperation {
+            reason,
+            port,
+            operation,
+            waited,
+        },
+    ))
+}
 
 #[must_use]
 pub fn is_host_initiated_teardown(text: &str) -> bool {
@@ -41,6 +153,34 @@ pub const REFERENCE_ASR_READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub const DEFAULT_WRITE_POLL: Duration = Duration::from_secs(30);
+
+pub const DEFAULT_DELIVERY_PROBE_POLL: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct DeliveryProbeTimer {
+    send_epoch: Option<u64>,
+    due: Option<Instant>,
+}
+
+impl DeliveryProbeTimer {
+    fn observe(&mut self, state: SendState, now: Instant) -> bool {
+        let flight_changed = self.send_epoch != Some(state.send_epoch);
+        self.send_epoch = Some(state.send_epoch);
+        if state.snd_una == state.snd_nxt {
+            self.due = None;
+            return false;
+        }
+        if self.due.is_none() || flight_changed {
+            self.due = Some(now + DEFAULT_DELIVERY_PROBE_POLL);
+            return false;
+        }
+        if self.due.is_some_and(|due| now >= due) {
+            self.due = Some(now + DEFAULT_DELIVERY_PROBE_POLL);
+            return true;
+        }
+        false
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WriteExpiry {
@@ -205,9 +345,46 @@ impl<T: BulkTransport> SharedLink<T> {
     }
 
     pub fn open(&self, guest_port: u16, timeout: Duration) -> Result<MuxStream<T>, MuxError> {
+        self.open_cancellable(guest_port, timeout, None, None)
+    }
+
+    fn open_cancellable(
+        &self,
+        guest_port: u16,
+        timeout: Duration,
+        stop: Option<&Arc<AtomicBool>>,
+        failure: Option<&Arc<AtomicBool>>,
+    ) -> Result<MuxStream<T>, MuxError> {
+        let began = Instant::now();
+        if let Some(error) =
+            cancellation_error(stop, failure, guest_port, "dialling", began.elapsed())
+        {
+            return Err(MuxError::Io(error));
+        }
         let local_port = self.with(LinkPhase::OpenSyn, 0, |link| link.begin_open(guest_port))?;
+        self.complete_open_cancellable(local_port, guest_port, timeout, began, stop, failure)
+    }
+
+    fn complete_open_cancellable(
+        &self,
+        local_port: u16,
+        guest_port: u16,
+        timeout: Duration,
+        began: Instant,
+        stop: Option<&Arc<AtomicBool>>,
+        failure: Option<&Arc<AtomicBool>>,
+    ) -> Result<MuxStream<T>, MuxError> {
         let deadline = Instant::now() + timeout;
         loop {
+            if let Some(error) =
+                cancellation_error(stop, failure, guest_port, "dialling", began.elapsed())
+            {
+                self.with(LinkPhase::OpenEnd, local_port, |link| {
+                    let _ = link.close(local_port);
+                    link.forget_session(local_port);
+                });
+                return Err(MuxError::Io(error));
+            }
             let (drained, state, generation) = self.with(LinkPhase::OpenPoll, local_port, |link| {
                 let drained = link.drain_inbound();
                 let generation = link.inbound_generation();
@@ -222,6 +399,17 @@ impl<T: BulkTransport> SharedLink<T> {
             match state {
                 Some(SessionState::Established) => {
                     self.with(LinkPhase::OpenEnd, local_port, |link| {
+                        if let Some(error) = cancellation_error(
+                            stop,
+                            failure,
+                            guest_port,
+                            "dialling",
+                            began.elapsed(),
+                        ) {
+                            let _ = link.close(local_port);
+                            link.forget_session(local_port);
+                            return Err(MuxError::Io(error));
+                        }
                         link.finish_open(local_port, guest_port)
                     })?;
                     return Ok(MuxStream {
@@ -230,6 +418,7 @@ impl<T: BulkTransport> SharedLink<T> {
                         read_policy: MuxReadPolicy::default(),
                         write_policy: MuxWritePolicy::default(),
                         cancel: None,
+                        transfer_cancel: None,
                         closed: false,
                     });
                 }
@@ -300,6 +489,7 @@ pub struct MuxStream<T: BulkTransport> {
     read_policy: MuxReadPolicy,
     write_policy: MuxWritePolicy,
     cancel: Option<Arc<AtomicBool>>,
+    transfer_cancel: Option<Arc<AtomicBool>>,
     closed: bool,
 }
 
@@ -344,6 +534,44 @@ impl<T: BulkTransport> MuxStream<T> {
         self
     }
 
+    #[must_use]
+    pub fn with_transfer_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.transfer_cancel = Some(cancel);
+        self
+    }
+
+    pub fn split(&mut self) -> (MuxReadHalf<'_, T>, MuxWriteHalf<'_, T>) {
+        let stream = &*self;
+        (
+            MuxReadHalf {
+                stream,
+                connection_cancel: Vec::new(),
+            },
+            MuxWriteHalf {
+                stream,
+                connection_cancel: Vec::new(),
+            },
+        )
+    }
+
+    fn operation_cancellation(
+        &self,
+        connection_cancel: &[Arc<AtomicBool>],
+        operation: &'static str,
+        waited: Duration,
+    ) -> Option<io::Error> {
+        cancellation_error(self.cancel.as_ref(), self.transfer_cancel.as_ref(), self.local_port, operation, waited)
+            .or_else(|| {
+                if connection_cancel.iter().any(|cancel| cancel.load(Ordering::Acquire)) {
+                    Some(io::Error::new(io::ErrorKind::ConnectionAborted, format!(
+                        "{CONNECTION_CANCELLED_MARKER}: mux port {} was cancelled while {operation}, {:.3}s into the wait",
+                        self.local_port, waited.as_secs_f64())))
+                } else {
+                    None
+                }
+            })
+    }
+
     pub fn close(&mut self) -> Result<(), MuxError> {
         if self.closed {
             return Ok(());
@@ -365,10 +593,20 @@ impl<T: BulkTransport> MuxStream<T> {
     }
 }
 
-impl<T: BulkTransport> Read for MuxStream<T> {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if out.is_empty() || self.closed {
+impl<T: BulkTransport> MuxStream<T> {
+    fn read_shared(
+        &self,
+        out: &mut [u8],
+        connection_cancel: &[Arc<AtomicBool>],
+    ) -> io::Result<usize> {
+        if out.is_empty() {
             return Ok(0);
+        }
+        if self.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("mux port {} is closed", self.local_port),
+            ));
         }
         let port = self.local_port;
         let policy = self.read_policy;
@@ -381,36 +619,31 @@ impl<T: BulkTransport> Read for MuxStream<T> {
             let slice = turn
                 .min(poll_ends.saturating_duration_since(at))
                 .max(Duration::from_micros(1));
-            let (taken, generation, state) = self
+            let (taken, generation, eof) = self
                 .link
                 .with_timed(LinkPhase::Read, port, |link, lock_wait| {
                     link.record_wait(port, lock_wait, waited_off_link);
                     let generation = link.inbound_generation();
                     link.drain_inbound()?;
                     let taken = link.take_received(port, out)?;
-                    Ok::<_, MuxError>((taken, generation, link.session_state(port)))
+                    let eof = if taken == 0 {
+                        link.received_eof(port)?
+                    } else {
+                        false
+                    };
+                    Ok::<_, MuxError>((taken, generation, eof))
                 })
                 .map_err(io::Error::from)?;
             if taken > 0 {
                 return Ok(taken);
             }
-            match state {
-                None | Some(SessionState::Closed) => return Ok(0),
-                _ => {}
+            if eof {
+                return Ok(0);
             }
-            if self
-                .cancel
-                .as_ref()
-                .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+            if let Some(error) =
+                self.operation_cancellation(connection_cancel, "waiting", began.elapsed())
             {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    format!(
-                        "{RUN_STOPPED_MARKER}: the run was stopped while mux port {port} was waiting, {:.3}s into the wait, so the host stopped reading. \
-                         Nothing on the wire ended this and nothing about the guest is being reported.",
-                        began.elapsed().as_secs_f64()
-                    ),
-                ));
+                return Err(error);
             }
             if self
                 .link
@@ -470,10 +703,12 @@ impl<T: BulkTransport> Read for MuxStream<T> {
             }
         }
     }
-}
 
-impl<T: BulkTransport> Write for MuxStream<T> {
-    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+    fn write_shared(
+        &self,
+        data: &[u8],
+        connection_cancel: &[Arc<AtomicBool>],
+    ) -> io::Result<usize> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -489,18 +724,12 @@ impl<T: BulkTransport> Write for MuxStream<T> {
         let mut deadline = began + policy.poll;
         let mut waited_off_link = Duration::ZERO;
         let mut queued = false;
+        let mut delivery_probe = DeliveryProbeTimer::default();
         loop {
-            if self
-                .cancel
-                .as_ref()
-                .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+            if let Some(error) =
+                self.operation_cancellation(connection_cancel, "writing", began.elapsed())
             {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    format!(
-                        "{RUN_STOPPED_MARKER}: the run was stopped while mux port {port} was writing"
-                    ),
-                ));
+                return Err(error);
             }
             if self
                 .link
@@ -514,7 +743,7 @@ impl<T: BulkTransport> Write for MuxStream<T> {
                     ),
                 ));
             }
-            let (pending, _in_flight, generation) = self
+            let (pending, send_state, generation) = self
                 .link
                 .with_timed(LinkPhase::Write, port, |link, lock_wait| {
                     link.record_wait(port, lock_wait, waited_off_link);
@@ -525,16 +754,55 @@ impl<T: BulkTransport> Write for MuxStream<T> {
                     } else {
                         link.queue_write(port, data)?
                     };
-                    let state = link.send_state(port);
-                    let in_flight = state
-                        .as_ref()
-                        .map_or(0, |s| s.snd_nxt.wrapping_sub(s.snd_una));
-                    Ok::<_, MuxError>((pending, in_flight, generation))
+                    let send_state = link
+                        .send_state(port)
+                        .ok_or(MuxError::NoSession { local_port: port })?;
+                    Ok::<_, MuxError>((pending, send_state, generation))
                 })
                 .map_err(io::Error::from)?;
             queued = true;
+            let delivery_probe_due = delivery_probe.observe(send_state, Instant::now());
             if pending == 0 {
                 return Ok(data.len());
+            }
+            if delivery_probe_due {
+                self.link
+                    .with(LinkPhase::WriteProbe, port, |link| {
+                        link.trace_delivery_probe(
+                            Stage::WriteProbeStart,
+                            port,
+                            send_state,
+                            Disposition::ProbeEntered,
+                        );
+                        let mut disposition = Disposition::ProbeError;
+                        let result: Result<bool, MuxError> = (|| {
+                            link.route_available()?;
+                            let current = link
+                                .send_state(port)
+                                .ok_or(MuxError::NoSession { local_port: port })?;
+                            if current.send_epoch == send_state.send_epoch {
+                                let sent = link.retransmit_unacknowledged(port)?;
+                                disposition = if sent {
+                                    Disposition::ProbeSent
+                                } else {
+                                    Disposition::ProbeDeferred
+                                };
+                                Ok(sent)
+                            } else {
+                                delivery_probe.observe(current, Instant::now());
+                                disposition = Disposition::ProbeEpochMoved;
+                                Ok(false)
+                            }
+                        })();
+                        link.trace_delivery_probe(
+                            Stage::WriteProbeReturn,
+                            port,
+                            send_state,
+                            disposition,
+                        );
+                        result
+                    })
+                    .map_err(io::Error::from)?;
             }
             let mut remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -577,12 +845,12 @@ impl<T: BulkTransport> Write for MuxStream<T> {
             }
             waited_off_link = self
                 .link
-                .wait_for_inbound(generation, remaining)
+                .wait_for_inbound(generation, remaining.min(DEFAULT_LINK_SLICE))
                 .map_err(io::Error::from)?;
         }
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush_shared(&self) -> io::Result<()> {
         if self.closed {
             return Ok(());
         }
@@ -591,11 +859,252 @@ impl<T: BulkTransport> Write for MuxStream<T> {
             .with(LinkPhase::Flush, port, |link| link.flush(port))
             .map_err(io::Error::from)
     }
+
+    fn drain_delivery_shared(&self, connection_cancel: &[Arc<AtomicBool>]) -> io::Result<()> {
+        let port = self.local_port;
+        let began = Instant::now();
+        let mut waited_off_link = Duration::ZERO;
+        let mut probe_at = began + self.write_policy.poll;
+        let mut delivery_probe = DeliveryProbeTimer::default();
+        let mut outstanding = self
+            .link
+            .with(LinkPhase::Inspect, port, |link| link.send_state(port));
+        if self.closed {
+            return Err(delivery_drain_error(
+                port,
+                outstanding,
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "the owning mux stream is closed",
+                ),
+            ));
+        }
+        loop {
+            if let Some(error) =
+                self.operation_cancellation(connection_cancel, "draining delivery", began.elapsed())
+            {
+                outstanding = self
+                    .link
+                    .with(LinkPhase::Inspect, port, |link| link.send_state(port))
+                    .or(outstanding);
+                return Err(delivery_drain_error(port, outstanding, error));
+            }
+            let (routed, state, send_state, present, generation) =
+                self.link
+                    .with_timed(LinkPhase::Flush, port, |link, lock_wait| {
+                        link.record_wait(port, lock_wait, waited_off_link);
+                        let generation = link.inbound_generation();
+                        let routed = if link.device_present() == Some(false) {
+                            Ok(())
+                        } else {
+                            link.route_available().and_then(|_| link.flush(port))
+                        };
+                        let present = link.device_present();
+                        if present == Some(false) {
+                            link.trace(MuxTraceEvent::DeviceGone { local_port: port });
+                        }
+                        (
+                            routed,
+                            link.session_state(port),
+                            link.send_state(port),
+                            present,
+                            generation,
+                        )
+                    });
+            outstanding = send_state.or(outstanding);
+            if present == Some(false) {
+                return Err(delivery_drain_error(
+                    port,
+                    outstanding,
+                    io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        format!(
+                            "{DEVICE_GONE_MARKER}: the device left the bus while mux port {port} was draining delivery"
+                        ),
+                    ),
+                ));
+            }
+            if state != Some(SessionState::Established) {
+                return Err(delivery_drain_error(
+                    port,
+                    outstanding,
+                    io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "the mux peer closed or reset the session while draining delivery",
+                    ),
+                ));
+            }
+            if let Err(error) = routed {
+                return Err(delivery_drain_error(
+                    port,
+                    outstanding,
+                    io::Error::from(error),
+                ));
+            }
+            let Some(send_state) = send_state else {
+                return Err(delivery_drain_error(
+                    port,
+                    outstanding,
+                    io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "the mux send state is unavailable while draining delivery",
+                    ),
+                ));
+            };
+            let delivery_probe_due = delivery_probe.observe(send_state, Instant::now());
+            if send_state.pending == 0 && send_state.snd_una == send_state.snd_nxt {
+                return Ok(());
+            }
+            if delivery_probe_due {
+                self.link
+                    .with(LinkPhase::WriteProbe, port, |link| {
+                        link.trace_delivery_probe(
+                            Stage::DrainProbeStart,
+                            port,
+                            send_state,
+                            Disposition::ProbeEntered,
+                        );
+                        let mut disposition = Disposition::ProbeError;
+                        let result: Result<bool, MuxError> = (|| {
+                            link.route_available()?;
+                            let current = link
+                                .send_state(port)
+                                .ok_or(MuxError::NoSession { local_port: port })?;
+                            if current.send_epoch == send_state.send_epoch {
+                                let sent = link.retransmit_unacknowledged(port)?;
+                                disposition = if sent {
+                                    Disposition::ProbeSent
+                                } else {
+                                    Disposition::ProbeDeferred
+                                };
+                                Ok(sent)
+                            } else {
+                                delivery_probe.observe(current, Instant::now());
+                                disposition = Disposition::ProbeEpochMoved;
+                                Ok(false)
+                            }
+                        })();
+                        link.trace_delivery_probe(
+                            Stage::DrainProbeReturn,
+                            port,
+                            send_state,
+                            disposition,
+                        );
+                        result
+                    })
+                    .map_err(|error| {
+                        delivery_drain_error(port, outstanding, io::Error::from(error))
+                    })?;
+            }
+            if send_state.pending > 0 && Instant::now() >= probe_at {
+                let probed = self
+                    .link
+                    .with(LinkPhase::WriteProbe, port, |link| link.probe_window(port));
+                if let Err(error) = probed {
+                    outstanding = self
+                        .link
+                        .with(LinkPhase::Inspect, port, |link| link.send_state(port))
+                        .or(outstanding);
+                    return Err(delivery_drain_error(
+                        port,
+                        outstanding,
+                        io::Error::from(error),
+                    ));
+                }
+                probe_at = Instant::now() + self.write_policy.poll;
+            }
+            waited_off_link = self
+                .link
+                .wait_for_inbound(generation, DEFAULT_LINK_SLICE)
+                .map_err(|error| delivery_drain_error(port, outstanding, io::Error::from(error)))?;
+        }
+    }
+}
+
+impl<T: BulkTransport> ShutdownWrite for MuxStream<T> {
+    fn shutdown_write(&mut self) -> io::Result<()> {
+        self.drain_delivery_shared(&[])?;
+        let port = self.local_port;
+        self.link
+            .with(LinkPhase::Flush, port, |link| link.shutdown_write(port))
+            .map_err(io::Error::from)?;
+        self.drain_delivery_shared(&[])
+    }
+}
+
+impl<T: BulkTransport> Read for MuxStream<T> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        self.read_shared(out, &[])
+    }
+}
+
+impl<T: BulkTransport> Write for MuxStream<T> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.write_shared(data, &[])
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_shared()
+    }
+}
+
+pub struct MuxReadHalf<'a, T: BulkTransport> {
+    stream: &'a MuxStream<T>,
+    connection_cancel: Vec<Arc<AtomicBool>>,
+}
+
+impl<T: BulkTransport> MuxReadHalf<'_, T> {
+    #[must_use]
+    pub fn with_connection_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.connection_cancel.push(cancel);
+        self
+    }
+}
+
+impl<T: BulkTransport> Read for MuxReadHalf<'_, T> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        self.stream.read_shared(out, &self.connection_cancel)
+    }
+}
+
+pub struct MuxWriteHalf<'a, T: BulkTransport> {
+    stream: &'a MuxStream<T>,
+    connection_cancel: Vec<Arc<AtomicBool>>,
+}
+
+impl<T: BulkTransport> MuxWriteHalf<'_, T> {
+    #[must_use]
+    pub fn with_connection_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.connection_cancel.push(cancel);
+        self
+    }
+
+    #[must_use]
+    pub fn delivery_state(&self) -> Option<SendState> {
+        let port = self.stream.local_port;
+        self.stream
+            .link
+            .with(LinkPhase::Inspect, port, |link| link.send_state(port))
+    }
+
+    pub fn drain_delivery(&mut self) -> io::Result<()> {
+        self.stream.drain_delivery_shared(&self.connection_cancel)
+    }
+}
+
+impl<T: BulkTransport> Write for MuxWriteHalf<'_, T> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.stream.write_shared(data, &self.connection_cancel)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush_shared()
+    }
 }
 
 impl<T: BulkTransport> Drop for MuxStream<T> {
     fn drop(&mut self) {
-        // The device frees its per-session socket and event source only on a reset.
+        // Completed FIN exchanges are released; unfinished sessions retain abortive cleanup.
         let _ = self.close();
     }
 }
@@ -609,6 +1118,7 @@ pub struct MuxDialer<T> {
     data_policy: MuxReadPolicy,
     write_policy: MuxWritePolicy,
     cancel: Option<Arc<AtomicBool>>,
+    transfer_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl<T: BulkTransport> MuxDialer<T> {
@@ -621,6 +1131,7 @@ impl<T: BulkTransport> MuxDialer<T> {
             data_policy: MuxReadPolicy::default(),
             write_policy: MuxWritePolicy::default(),
             cancel: None,
+            transfer_cancel: None,
         }
     }
 
@@ -686,6 +1197,12 @@ impl<T: BulkTransport> MuxDialer<T> {
     }
 
     #[must_use]
+    pub fn with_transfer_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.transfer_cancel = Some(cancel);
+        self
+    }
+
+    #[must_use]
     pub fn link(&self) -> SharedLink<T> {
         self.link.clone()
     }
@@ -700,6 +1217,7 @@ impl<T: BulkTransport> Clone for MuxDialer<T> {
             data_policy: self.data_policy,
             write_policy: self.write_policy,
             cancel: self.cancel.clone(),
+            transfer_cancel: self.transfer_cancel.clone(),
         }
     }
 }
@@ -710,12 +1228,20 @@ impl<T: BulkTransport> GuestDialer for MuxDialer<T> {
     fn dial(&mut self, port: u16, timeout: Duration) -> io::Result<Self::Stream> {
         let mut stream = self
             .link
-            .open(port, timeout)
+            .open_cancellable(
+                port,
+                timeout,
+                self.cancel.as_ref(),
+                self.transfer_cancel.as_ref(),
+            )
             .map_err(io::Error::from)?
             .with_read_policy(self.policy_for(port))
             .with_write_policy(self.write_policy);
         if let Some(cancel) = &self.cancel {
             stream = stream.with_cancel(Arc::clone(cancel));
+        }
+        if let Some(cancel) = &self.transfer_cancel {
+            stream = stream.with_transfer_cancel(Arc::clone(cancel));
         }
         Ok(stream)
     }
@@ -726,11 +1252,37 @@ mod tests {
     use super::*;
     use crate::ramrod::dial::{DialError, DialPlan, SystemClock, dial_until};
     use crate::usbmux::frame::HEADER_LEN_V2;
-    use crate::usbmux::link::tests::Device;
+    use crate::usbmux::link::tests::{Device, device_packet, device_version_reply, encode_segment};
     use crate::usbmux::tcp::{TCP_HEADER_LEN, TcpHeader, flags};
 
     use std::cell::Cell;
     use std::rc::Rc;
+
+    #[test]
+    fn delivery_probe_deadline_starts_with_fresh_flight_after_an_idle_window() {
+        let state = |snd_una, snd_nxt, send_epoch| SendState {
+            snd_una,
+            snd_nxt,
+            snd_wnd_edge: snd_nxt,
+            send_epoch,
+            peer_window: 0,
+            usable: 0,
+            pending: 0,
+            segments_in: 0,
+        };
+        let start = Instant::now();
+        let mut timer = DeliveryProbeTimer::default();
+        timer.observe(state(100, 100, 4), start);
+        timer.observe(state(100, 100, 4), start + Duration::from_secs(3));
+
+        timer.observe(state(100, 104, 5), start + Duration::from_secs(3));
+        assert_eq!(timer.due, Some(start + Duration::from_secs(5)));
+        assert!(timer.observe(state(100, 104, 5), start + Duration::from_secs(5)));
+
+        timer.observe(state(104, 108, 7), start + Duration::from_secs(6));
+        assert_eq!(timer.due, Some(start + Duration::from_secs(8)));
+        assert!(timer.observe(state(104, 108, 7), start + Duration::from_secs(8)));
+    }
 
     #[derive(Clone)]
     struct Switchable {
@@ -861,6 +1413,7 @@ mod tests {
         generation: Mutex<u64>,
         ready: std::sync::Condvar,
         waits: std::sync::atomic::AtomicUsize,
+        wait_observer: Option<std::sync::mpsc::Sender<()>>,
     }
 
     impl InboundSignal for TestSignal {
@@ -871,11 +1424,150 @@ mod tests {
         fn wait_for_inbound(&self, seen: u64, timeout: Duration) {
             self.waits
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(observer) = &self.wait_observer {
+                let _ = observer.send(());
+            }
             let guard = self.generation.lock().unwrap();
             if *guard != seen {
                 return;
             }
             let _ = self.ready.wait_timeout(guard, timeout);
+        }
+    }
+
+    #[derive(Default)]
+    struct ThreadWireState {
+        sent: Vec<Vec<u8>>,
+        inbound: std::collections::VecDeque<Vec<u8>>,
+        sequence: u16,
+    }
+
+    #[derive(Clone)]
+    struct ThreadWire {
+        state: Arc<Mutex<ThreadWireState>>,
+        signal: Arc<TestSignal>,
+        present: Arc<AtomicBool>,
+    }
+
+    impl ThreadWire {
+        fn new() -> (Self, std::sync::mpsc::Receiver<()>) {
+            let (observer, waits) = std::sync::mpsc::channel();
+            (
+                Self {
+                    state: Arc::new(Mutex::new(ThreadWireState::default())),
+                    signal: Arc::new(TestSignal {
+                        wait_observer: Some(observer),
+                        ..TestSignal::default()
+                    }),
+                    present: Arc::new(AtomicBool::new(true)),
+                },
+                waits,
+            )
+        }
+
+        fn queue(&self, packet: Vec<u8>) {
+            self.state.lock().unwrap().inbound.push_back(packet);
+            self.notify();
+        }
+
+        fn notify(&self) {
+            let mut generation = self.signal.generation.lock().unwrap();
+            *generation += 1;
+            self.signal.ready.notify_all();
+        }
+
+        fn reply(&self, header: TcpHeader, payload: &[u8]) {
+            let mut state = self.state.lock().unwrap();
+            let packet = device_packet(state.sequence, 0, &encode_segment(header, payload));
+            state.sequence = state.sequence.wrapping_add(1);
+            state.inbound.push_back(packet);
+            drop(state);
+            self.notify();
+        }
+
+        fn take_sent(&self) -> Vec<Vec<u8>> {
+            std::mem::take(&mut self.state.lock().unwrap().sent)
+        }
+    }
+
+    impl BulkTransport for ThreadWire {
+        fn send(&mut self, packet: &[u8]) -> io::Result<()> {
+            self.state.lock().unwrap().sent.push(packet.to_vec());
+            Ok(())
+        }
+
+        fn recv(&mut self, _timeout: Duration) -> io::Result<Option<Vec<u8>>> {
+            Ok(self.state.lock().unwrap().inbound.pop_front())
+        }
+
+        fn out_max_packet_size(&self) -> u16 {
+            512
+        }
+
+        fn inbound_signal(&self) -> Option<Arc<dyn InboundSignal>> {
+            Some(Arc::clone(&self.signal) as Arc<dyn InboundSignal>)
+        }
+
+        fn device_present(&self) -> Option<bool> {
+            Some(self.present.load(Ordering::Acquire))
+        }
+    }
+
+    fn opened_thread_wire() -> (
+        MuxStream<ThreadWire>,
+        ThreadWire,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let (wire, waits) = ThreadWire::new();
+        wire.queue(device_version_reply(2));
+        let link = SharedLink::new(MuxLink::new(wire.clone()));
+        assert_eq!(
+            link.negotiate(VersionRequest::resync(), Duration::from_secs(1))
+                .unwrap(),
+            MuxVersion::V2
+        );
+        wire.take_sent();
+        let guest_port = 62078;
+        let port = link
+            .with(LinkPhase::OpenSyn, 0, |link| link.begin_open(guest_port))
+            .unwrap();
+        let sent = wire.take_sent();
+        assert_eq!(sent.len(), 1);
+        let syn = TcpHeader::decode(&sent[0][HEADER_LEN_V2..]).unwrap();
+        assert_eq!(syn.flags, flags::SYN);
+        wire.reply(
+            TcpHeader {
+                source_port: guest_port,
+                destination_port: port,
+                sequence: 0,
+                acknowledgement: syn.sequence.wrapping_add(1),
+                flags: flags::SYN_ACK,
+                window: 65536,
+            },
+            &[],
+        );
+        let stream = link
+            .complete_open_cancellable(
+                port,
+                guest_port,
+                Duration::from_secs(1),
+                Instant::now(),
+                None,
+                None,
+            )
+            .unwrap();
+        wire.take_sent();
+        (stream, wire, waits)
+    }
+
+    fn peer_ack(port: u16, acknowledged: u32) -> TcpHeader {
+        TcpHeader {
+            source_port: 62078,
+            destination_port: port,
+            sequence: 1,
+            acknowledgement: acknowledged,
+            flags: flags::ACK,
+            window: 65536,
         }
     }
 
@@ -994,6 +1686,45 @@ mod tests {
         let port = stream.local_port();
         let payload: Vec<u8> = (0..8192u32).map(|byte| (byte % 251) as u8).collect();
         stream.write_all(&payload).unwrap();
+        assert_eq!(device.session_bytes(port), payload);
+    }
+
+    #[test]
+    fn a_stalled_delivery_retransmits_unacknowledged_payload() {
+        let (link, device) = negotiated();
+        let mut stream = link
+            .open(62078, Duration::from_secs(1))
+            .unwrap()
+            .with_write_policy(MuxWritePolicy {
+                poll: Duration::from_secs(4),
+                on_expiry: WriteExpiry::Fail,
+            });
+        let port = stream.local_port();
+        let payload = b"restore image data";
+        device.drop_next_payload();
+
+        stream.write_all(payload).unwrap();
+        stream.drain_delivery_shared(&[]).unwrap();
+        assert_eq!(device.session_bytes(port), payload);
+    }
+
+    #[test]
+    fn a_full_nonzero_window_recovers_when_its_first_payload_is_lost() {
+        let (link, device) = negotiated();
+        device.clone().with_window(16_128);
+        let mut stream = link
+            .open(62078, Duration::from_secs(1))
+            .unwrap()
+            .with_write_policy(MuxWritePolicy {
+                poll: Duration::from_secs(4),
+                on_expiry: WriteExpiry::Fail,
+            });
+        let port = stream.local_port();
+        let payload = vec![0x5A; 16_128 + 1_024];
+        device.drop_next_payload();
+
+        stream.write_all(&payload).unwrap();
+        stream.drain_delivery_shared(&[]).unwrap();
         assert_eq!(device.session_bytes(port), payload);
     }
 
@@ -1133,18 +1864,83 @@ mod tests {
                 assert_eq!(port, 62078);
                 assert!(attempts > 0);
             }
+            Err(error @ DialError::Cancelled { .. }) => {
+                panic!("expected the configured dial window to close, got {error}");
+            }
             Ok(_) => panic!("the pipe answered nothing, so no session can have opened"),
         }
     }
 
     #[test]
-    fn reading_after_the_session_closes_is_an_end_of_stream_not_an_error() {
+    fn payload_fin_reads_all_buffered_bytes_before_orderly_eof() {
+        let (link, device) = negotiated();
+        let mut stream = link.open(62078, Duration::from_secs(1)).unwrap();
+        device.push_with_flags(stream.local_port(), b"guest log", flags::ACK | flags::FIN);
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"guest log");
+        assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
+    }
+
+    #[test]
+    fn host_half_close_completes_the_fin_exchange_and_releases_the_session() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&lines);
+        let meter = super::super::roundtrip::RoundtripMeter::with_sink(
+            super::super::roundtrip::LineBudget::new(16),
+            Box::new(move |line: &str| sink.lock().unwrap().push(line.to_string())),
+        );
+        let device = Device::new();
+        let link = SharedLink::new(MuxLink::new(device.clone()).with_roundtrip_meter(meter));
+        link.negotiate(VersionRequest::resync(), Duration::from_secs(1))
+            .unwrap();
+        let mut stream = link.open(62078, Duration::from_secs(1)).unwrap();
+        let port = stream.local_port();
+        device.take_received_packets();
+        stream.write_all(b"host").unwrap();
+        device.push_with_flags(port, b"done", flags::ACK | flags::FIN);
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"done");
+        stream.shutdown_write().unwrap();
+        let state = link
+            .with(LinkPhase::Inspect, port, |link| link.send_state(port))
+            .unwrap();
+        assert_eq!(state.snd_una, state.snd_nxt);
+        assert_eq!(
+            stream.write(b"late").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        drop(stream);
+        let headers: Vec<_> = device
+            .take_received_packets()
+            .iter()
+            .map(|packet| TcpHeader::decode(&packet[HEADER_LEN_V2..]).unwrap())
+            .collect();
+        let flags: Vec<_> = headers.iter().map(|header| header.flags).collect();
+        assert_eq!(
+            flags,
+            vec![flags::ACK, flags::ACK, flags::ACK, flags::ACK | flags::FIN]
+        );
+        assert_eq!(headers.last().unwrap().acknowledgement, 6);
+        let closed = lines.lock().unwrap();
+        assert_eq!(closed.len(), 1);
+        assert!(closed[0].contains(&format!("port={port}")));
+        assert!(closed[0].contains("why=closed"));
+        assert!(closed[0].contains("sent_bytes=4"));
+        assert!(closed[0].contains("acked_bytes=4"));
+    }
+
+    #[test]
+    fn a_peer_reset_is_reported_as_a_connection_reset() {
         let (link, device) = negotiated();
         let mut stream = link.open(62078, Duration::from_secs(1)).unwrap();
         device.reset(stream.local_port());
         let mut buffer = [0u8; 8];
-        assert_eq!(stream.read(&mut buffer).unwrap(), 0);
-        assert!(!stream.is_open());
+        assert_eq!(
+            stream.read(&mut buffer).unwrap_err().kind(),
+            io::ErrorKind::ConnectionReset
+        );
     }
 
     #[test]
@@ -1267,7 +2063,7 @@ mod tests {
             began.elapsed() < Duration::from_secs(5),
             "the stop was not prompt"
         );
-        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
         let text = error.to_string();
         assert!(is_run_stopped(&text), "{text}");
         assert!(!is_host_initiated_teardown(&text), "{text}");
@@ -1277,10 +2073,11 @@ mod tests {
     #[test]
     fn the_dialler_hands_the_stop_flag_to_every_session_it_opens() {
         let (link, _device) = negotiated();
-        let cancel = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut dialer = MuxDialer::new(link).with_cancel(Arc::clone(&cancel));
         let mut buffer = [0u8; 8];
         for port in [62078u16, 12345] {
+            cancel.store(false, Ordering::Relaxed);
             let mut stream = dialer
                 .dial(port, Duration::from_secs(1))
                 .unwrap()
@@ -1288,6 +2085,7 @@ mod tests {
                     MuxReadPolicy::retrying(Duration::from_secs(3600))
                         .with_slice(Duration::from_millis(1)),
                 );
+            cancel.store(true, Ordering::Relaxed);
             let error = stream.read(&mut buffer).unwrap_err();
             assert!(is_run_stopped(&error.to_string()), "port {port}");
         }
@@ -1546,7 +2344,7 @@ mod tests {
         let waited = began.elapsed();
         stopper.join().unwrap();
 
-        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
         assert!(
             is_run_stopped(&error.to_string()),
             "a write that outlived its poll ended for the only reason it may: {error}"
@@ -1627,6 +2425,653 @@ mod tests {
             let header = crate::usbmux::MuxHeader::decode(MuxVersion::V2, &packet).unwrap();
             assert_eq!(header.length as usize, packet.len());
             assert!(packet.len() >= HEADER_LEN_V2 + TCP_HEADER_LEN);
+        }
+    }
+    #[test]
+    fn transfer_failure_cancellation_reaches_every_cloned_mux_session() {
+        let (link, _device) = negotiated();
+        let failure = Arc::new(AtomicBool::new(false));
+        let mut dialer = MuxDialer::new(link).with_transfer_cancel(Arc::clone(&failure));
+        let mut cloned = dialer.clone();
+        let mut control = dialer.dial(62078, Duration::from_secs(1)).unwrap();
+        let mut transfer = cloned.dial(9510, Duration::from_secs(1)).unwrap();
+        failure.store(true, Ordering::Release);
+        for stream in [&mut control, &mut transfer] {
+            let error = stream.read_exact(&mut [0u8; 1]).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+            assert_eq!(
+                DialCancellation::from_io_error(&error),
+                Some(DialCancellation::TransferFailed)
+            );
+        }
+        let write_error = transfer.write_all(b"guest payload").unwrap_err();
+        assert_eq!(
+            DialCancellation::from_io_error(&write_error),
+            Some(DialCancellation::TransferFailed)
+        );
+        let dial_error = cloned.dial(9511, Duration::from_secs(1)).err().unwrap();
+        assert_eq!(
+            DialCancellation::from_io_error(&dial_error),
+            Some(DialCancellation::TransferFailed)
+        );
+    }
+
+    #[test]
+    fn a_cancelled_dial_resets_a_handshake_completed_by_another_link_reader() {
+        let (link, device) = negotiated();
+        let guest_port = 9520;
+        let local_port = link
+            .with(LinkPhase::OpenSyn, 0, |link| link.begin_open(guest_port))
+            .unwrap();
+        let reader = link.clone();
+        reader.with(LinkPhase::Read, local_port, |link| {
+            link.drain_inbound().unwrap();
+            assert_eq!(
+                link.session_state(local_port),
+                Some(SessionState::Established)
+            );
+            link.flush(local_port).unwrap();
+        });
+        assert!(device.session_open(local_port));
+        let failure = Arc::new(AtomicBool::new(true));
+        let error = link
+            .complete_open_cancellable(
+                local_port,
+                guest_port,
+                Duration::from_secs(1),
+                Instant::now(),
+                None,
+                Some(&failure),
+            )
+            .err()
+            .unwrap();
+        let error = io::Error::from(error);
+        assert_eq!(
+            DialCancellation::from_io_error(&error),
+            Some(DialCancellation::TransferFailed)
+        );
+        let resets: Vec<_> = device
+            .received_packets()
+            .iter()
+            .filter_map(|packet| TcpHeader::decode(&packet[HEADER_LEN_V2..]).ok())
+            .filter(|tcp| tcp.flags == flags::RST)
+            .collect();
+        assert_eq!(resets.len(), 1);
+        assert_eq!(
+            (resets[0].source_port, resets[0].destination_port),
+            (local_port, guest_port)
+        );
+        let replacement = link.open(9521, Duration::from_secs(1)).unwrap();
+        assert!(replacement.is_open());
+        assert_eq!(device.session_ports(replacement.local_port()), Some(9521));
+    }
+
+    #[test]
+    fn cancelled_handshake_cleanup_preserves_the_cancellation_when_reset_send_fails() {
+        let (_device, transport) = Switchable::new();
+        let link = SharedLink::new(MuxLink::new(transport.clone()));
+        link.negotiate(VersionRequest::resync(), Duration::from_secs(1))
+            .unwrap();
+        let local_port = link
+            .with(LinkPhase::OpenSyn, 0, |link| link.begin_open(9522))
+            .unwrap();
+        link.with(LinkPhase::Read, local_port, |link| {
+            link.drain_inbound().unwrap();
+            assert_eq!(
+                link.session_state(local_port),
+                Some(SessionState::Established)
+            );
+        });
+        transport.fail();
+        let failure = Arc::new(AtomicBool::new(true));
+        let error = link
+            .complete_open_cancellable(
+                local_port,
+                9522,
+                Duration::from_secs(1),
+                Instant::now(),
+                None,
+                Some(&failure),
+            )
+            .err()
+            .unwrap();
+        let error = io::Error::from(error);
+        assert_eq!(
+            DialCancellation::from_io_error(&error),
+            Some(DialCancellation::TransferFailed)
+        );
+        assert!(error.to_string().contains("mux port 9522"));
+    }
+
+    #[test]
+    fn operator_stop_keeps_its_reason_when_terminal_cleanup_is_also_requested() {
+        let stop = Arc::new(AtomicBool::new(true));
+        let cleanup = Arc::new(AtomicBool::new(true));
+        let error = cancellation_error(
+            Some(&stop),
+            Some(&cleanup),
+            9523,
+            "dialling",
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(
+            DialCancellation::from_io_error(&error),
+            Some(DialCancellation::OperatorStopped)
+        );
+        assert!(error.to_string().contains("mux port 9523"));
+    }
+
+    #[test]
+    fn borrowed_mux_halves_carry_both_directions_while_receive_waits() {
+        let (mut stream, wire, waits) = opened_thread_wire();
+        let port = stream.local_port();
+        let (mut reader, mut writer) = stream.split();
+        std::thread::scope(|scope| {
+            let receiving = scope.spawn(move || {
+                let mut response = [0u8; 6];
+                reader.read_exact(&mut response).unwrap();
+                response
+            });
+            waits
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the receive reached its off-link wait");
+            writer.write_all(b"question").unwrap();
+            let sent = wire.take_sent();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(&sent[0][HEADER_LEN_V2 + TCP_HEADER_LEN..], b"question");
+            let tcp = TcpHeader::decode(&sent[0][HEADER_LEN_V2..]).unwrap();
+            wire.reply(peer_ack(port, tcp.sequence.wrapping_add(8)), b"answer");
+            assert_eq!(receiving.join().unwrap(), *b"answer");
+            writer.drain_delivery().unwrap();
+        });
+        drop(writer);
+        assert!(stream.is_open());
+        wire.take_sent();
+        stream.write_all(b"owner continues").unwrap();
+        let sent = wire.take_sent();
+        assert_eq!(
+            &sent[0][HEADER_LEN_V2 + TCP_HEADER_LEN..],
+            b"owner continues"
+        );
+        drop(stream);
+        let sent = wire.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            TcpHeader::decode(&sent[0][HEADER_LEN_V2..]).unwrap().flags,
+            flags::RST
+        );
+    }
+
+    #[test]
+    fn packet_trace_identifies_write_delivery_probe_and_ack_advance() {
+        let (mut stream, wire, waits) = opened_thread_wire();
+        let port = stream.local_port();
+        let link = stream.link.clone();
+        let (context, recorder) = super::super::packet_trace::Context::recording(91, 12);
+        link.with(LinkPhase::Inspect, port, |link| {
+            link.set_packet_trace(context)
+        });
+        let initial = link.with(LinkPhase::Inspect, port, |link| {
+            link.send_state(port).unwrap().snd_una
+        });
+        let mut small_window = peer_ack(port, initial);
+        small_window.window = 256;
+        wire.reply(small_window, &[]);
+        link.with(LinkPhase::Read, port, |link| link.route_available())
+            .unwrap();
+        recorder.drain();
+        let payload = [0x5a; 512];
+        std::thread::scope(|scope| {
+            let writing = scope.spawn(|| stream.write_all(&payload));
+            waits
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the write parked with an outstanding flight");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while recorder.seen(Stage::WriteProbeReturn) == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "the write delivery probe executed"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            wire.reply(peer_ack(port, initial.wrapping_add(256)), &[]);
+            writing.join().unwrap().unwrap();
+        });
+        let records = recorder.drain();
+        let entered = records
+            .iter()
+            .find(|record| record.stage == Stage::WriteProbeStart)
+            .unwrap();
+        let returned = records
+            .iter()
+            .find(|record| record.stage == Stage::WriteProbeReturn)
+            .unwrap();
+        assert_eq!(entered.local_port, Some(port));
+        assert_eq!(entered.before.unwrap().snd_una, initial);
+        assert_eq!(entered.before.unwrap().snd_nxt, initial.wrapping_add(256));
+        assert_eq!(returned.disposition, Disposition::ProbeSent);
+        assert!(returned.monotonic_ns >= entered.monotonic_ns);
+        let acknowledged = records
+            .iter()
+            .find(|record| {
+                record.stage == Stage::Apply
+                    && record
+                        .after
+                        .is_some_and(|state| state.snd_una == initial.wrapping_add(256))
+            })
+            .unwrap();
+        assert_eq!(acknowledged.before.unwrap().snd_una, initial);
+        let packets = wire.take_sent();
+        let repeated: Vec<_> = packets
+            .iter()
+            .filter(|packet| {
+                let tcp = TcpHeader::decode(&packet[HEADER_LEN_V2..]).unwrap();
+                tcp.sequence == initial && packet.len() > HEADER_LEN_V2 + TCP_HEADER_LEN
+            })
+            .collect();
+        assert!(repeated.len() >= 2);
+        for packet in repeated {
+            assert_eq!(&packet[HEADER_LEN_V2 + TCP_HEADER_LEN..], &payload[..256]);
+        }
+        wire.reply(
+            peer_ack(port, initial.wrapping_add(payload.len() as u32)),
+            &[],
+        );
+        link.with(LinkPhase::Read, port, |link| link.route_available())
+            .unwrap();
+        let delivered = link.with(LinkPhase::Inspect, port, |link| {
+            link.send_state(port).unwrap()
+        });
+        assert_eq!(
+            delivered.snd_una,
+            initial.wrapping_add(payload.len() as u32)
+        );
+    }
+
+    #[test]
+    fn a_reopened_window_delivers_a_fresh_flight_in_sequence() {
+        let (mut stream, wire, waits) = opened_thread_wire();
+        let port = stream.local_port();
+        let link = stream.link.clone();
+        stream.write_all(b"first flight").unwrap();
+        let first = wire.take_sent();
+        let first_tcp = TcpHeader::decode(&first[0][HEADER_LEN_V2..]).unwrap();
+        let first_end = first_tcp
+            .sequence
+            .wrapping_add(b"first flight".len() as u32);
+        let mut shut = peer_ack(port, first_end);
+        shut.window = 0;
+        wire.reply(shut, &[]);
+        link.with(LinkPhase::Read, port, |link| link.drain_inbound())
+            .unwrap();
+
+        let payload: Vec<u8> = (0..131072u32).map(|byte| byte as u8).collect();
+        std::thread::scope(|scope| {
+            let writing = scope.spawn(|| stream.write_all(&payload));
+            waits
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the closed window parks the writer");
+            std::thread::sleep(DEFAULT_DELIVERY_PROBE_POLL + Duration::from_millis(100));
+            wire.take_sent();
+            let mut reopened = peer_ack(port, first_end);
+            reopened.window = 131072;
+            link.with(LinkPhase::Read, port, |link| {
+                wire.reply(reopened, &[]);
+                link.route_available().unwrap();
+            });
+            writing.join().unwrap().unwrap();
+        });
+
+        let mut delivered = Vec::new();
+        let mut next_sequence = first_end;
+        for packet in wire.take_sent() {
+            let tcp = TcpHeader::decode(&packet[HEADER_LEN_V2..]).unwrap();
+            let bytes = &packet[HEADER_LEN_V2 + TCP_HEADER_LEN..];
+            if bytes.is_empty() {
+                continue;
+            }
+            assert_eq!(tcp.sequence, next_sequence);
+            next_sequence = next_sequence.wrapping_add(bytes.len() as u32);
+            delivered.extend_from_slice(bytes);
+        }
+        assert_eq!(delivered, payload);
+        wire.reply(peer_ack(port, next_sequence), &[]);
+        link.with(LinkPhase::Read, port, |link| link.drain_inbound())
+            .unwrap();
+        let state = link.with(LinkPhase::Inspect, port, |link| {
+            link.send_state(port).unwrap()
+        });
+        assert_eq!(state.snd_una, state.snd_nxt);
+    }
+
+    #[test]
+    fn delivery_drain_waits_for_delayed_partial_acknowledgements() {
+        let (stream, wire, waits) = opened_thread_wire();
+        let mut stream = stream.with_write_timeout(Duration::from_millis(1));
+        let port = stream.local_port();
+        let link = stream.link.clone();
+        let (_reader, mut writer) = stream.split();
+        writer.write_all(b"payload").unwrap();
+        let sent = wire.take_sent();
+        let tcp = TcpHeader::decode(&sent[0][HEADER_LEN_V2..]).unwrap();
+        let queued = writer.delivery_state().unwrap();
+        assert_eq!(queued.snd_nxt.wrapping_sub(queued.snd_una), 7);
+        std::thread::scope(|scope| {
+            let draining = scope.spawn(move || writer.drain_delivery());
+            waits
+                .recv_timeout(Duration::from_secs(1))
+                .expect("delivery drain reached its acknowledgement wait");
+            waits.recv_timeout(Duration::from_secs(1)).expect(
+                "delivery drain outlived the write policy expiry while awaiting the peer ACK",
+            );
+            wire.reply(peer_ack(port, tcp.sequence.wrapping_add(3)), &[]);
+            link.with(LinkPhase::Read, port, |link| link.drain_inbound())
+                .unwrap();
+            let partial = link.with(LinkPhase::Inspect, port, |link| {
+                link.send_state(port).unwrap()
+            });
+            assert_eq!(partial.snd_una, tcp.sequence.wrapping_add(3));
+            assert_eq!(partial.snd_nxt.wrapping_sub(partial.snd_una), 4);
+            waits
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the drain continues waiting for the remaining bytes");
+            wire.reply(peer_ack(port, tcp.sequence.wrapping_add(7)), &[]);
+            draining.join().unwrap().unwrap();
+        });
+        let delivered = link.with(LinkPhase::Inspect, port, |link| {
+            link.send_state(port).unwrap()
+        });
+        assert_eq!(delivered.snd_una, tcp.sequence.wrapping_add(7));
+        assert_eq!(delivered.snd_una, delivered.snd_nxt);
+    }
+
+    #[test]
+    fn delayed_ack_retransmits_the_same_payload_and_sequence() {
+        let (stream, wire, waits) = opened_thread_wire();
+        let port = stream.local_port();
+        let (context, recorder) = super::super::packet_trace::Context::recording(91, 12);
+        stream.link.with(LinkPhase::Inspect, port, |link| {
+            link.set_packet_trace(context)
+        });
+        let mut stream = stream.with_write_timeout(Duration::from_millis(1));
+        let (_reader, mut writer) = stream.split();
+        let payload = b"restore image payload";
+        writer.write_all(payload).unwrap();
+        let mut packets = wire.take_sent();
+        let first = TcpHeader::decode(&packets[0][HEADER_LEN_V2..]).unwrap();
+        std::thread::scope(|scope| {
+            let draining = scope.spawn(move || writer.drain_delivery());
+            waits
+                .recv_timeout(Duration::from_secs(1))
+                .expect("delivery drain reached its acknowledgement wait");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while recorder.seen(Stage::DrainProbeReturn) == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "the drain delivery probe executed"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            packets.extend(wire.take_sent());
+            wire.reply(
+                peer_ack(port, first.sequence.wrapping_add(payload.len() as u32)),
+                &[],
+            );
+            draining.join().unwrap().unwrap();
+        });
+        packets.extend(wire.take_sent());
+        let records = recorder.drain();
+        let entered = records
+            .iter()
+            .find(|record| record.stage == Stage::DrainProbeStart)
+            .unwrap();
+        let returned = records
+            .iter()
+            .find(|record| record.stage == Stage::DrainProbeReturn)
+            .unwrap();
+        assert_eq!(entered.local_port, Some(port));
+        assert_eq!(entered.before.unwrap().snd_una, first.sequence);
+        assert_eq!(returned.disposition, Disposition::ProbeSent);
+        assert!(returned.monotonic_ns >= entered.monotonic_ns);
+        let acknowledged = records
+            .iter()
+            .find(|record| {
+                record.stage == Stage::Apply
+                    && record.after.is_some_and(|state| {
+                        state.snd_una == first.sequence.wrapping_add(payload.len() as u32)
+                    })
+            })
+            .unwrap();
+        assert_eq!(acknowledged.before.unwrap().snd_una, first.sequence);
+        let sent_payloads: Vec<_> = packets
+            .iter()
+            .filter(|packet| packet.len() > HEADER_LEN_V2 + TCP_HEADER_LEN)
+            .collect();
+        assert!(
+            sent_payloads.len() >= 2,
+            "the unacknowledged payload is retried"
+        );
+        for packet in sent_payloads {
+            let header = TcpHeader::decode(&packet[HEADER_LEN_V2..]).unwrap();
+            assert_eq!(header.sequence, first.sequence);
+            assert_eq!(&packet[HEADER_LEN_V2 + TCP_HEADER_LEN..], payload);
+        }
+    }
+
+    #[test]
+    fn delivery_drain_names_peer_reset_and_unacknowledged_bytes() {
+        let (mut stream, wire, _waits) = opened_thread_wire();
+        let port = stream.local_port();
+        let (_reader, mut writer) = stream.split();
+        writer.write_all(b"payload").unwrap();
+        let sent = wire.take_sent();
+        let tcp = TcpHeader::decode(&sent[0][HEADER_LEN_V2..]).unwrap();
+        let mut reset = peer_ack(port, tcp.sequence);
+        reset.flags = flags::RST;
+        wire.reply(reset, &[]);
+        let error = writer.drain_delivery().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        let text = error.to_string();
+        assert!(text.contains(&format!("mux port {port}")), "{text}");
+        assert!(text.contains("peer closed or reset"), "{text}");
+        assert!(text.contains("7 byte(s) sent but unacknowledged"), "{text}");
+    }
+
+    #[test]
+    fn delivery_drain_names_device_removal_and_unacknowledged_bytes() {
+        let (mut stream, wire, _waits) = opened_thread_wire();
+        let (_reader, mut writer) = stream.split();
+        writer.write_all(b"payload").unwrap();
+        wire.present.store(false, Ordering::Release);
+        let error = writer.drain_delivery().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        let text = error.to_string();
+        assert!(is_device_gone(&text), "{text}");
+        assert!(text.contains("7 byte(s) sent but unacknowledged"), "{text}");
+    }
+
+    #[test]
+    fn connection_cancellation_releases_a_delivery_wait_with_its_byte_counts() {
+        let (mut stream, wire, waits) = opened_thread_wire();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_reader, writer) = stream.split();
+        let mut writer = writer.with_connection_cancel(Arc::clone(&cancel));
+        writer.write_all(b"payload").unwrap();
+        std::thread::scope(|scope| {
+            let draining = scope.spawn(move || writer.drain_delivery());
+            waits
+                .recv_timeout(Duration::from_secs(1))
+                .expect("delivery wait is live before cancellation");
+            cancel.store(true, Ordering::Release);
+            wire.notify();
+            let error = draining.join().unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+            let text = error.to_string();
+            assert!(text.contains(CONNECTION_CANCELLED_MARKER), "{text}");
+            assert!(text.contains("7 byte(s) sent but unacknowledged"), "{text}");
+        });
+    }
+
+    #[test]
+    fn borrowed_halves_preserve_run_and_transfer_cancellation_attribution() {
+        let (link, _device) = negotiated();
+        let stop = Arc::new(AtomicBool::new(false));
+        let transfer = Arc::new(AtomicBool::new(false));
+        let connection = Arc::new(AtomicBool::new(true));
+        let mut stream = link
+            .open(62078, Duration::from_secs(1))
+            .unwrap()
+            .with_cancel(Arc::clone(&stop))
+            .with_transfer_cancel(Arc::clone(&transfer));
+        let (reader, writer) = stream.split();
+        let mut reader = reader.with_connection_cancel(Arc::clone(&connection));
+        let mut writer = writer.with_connection_cancel(connection);
+        let local_read = reader.read(&mut [0u8; 1]).unwrap_err();
+        let local_write = writer.write(b"payload").unwrap_err();
+        assert!(local_read.to_string().contains(CONNECTION_CANCELLED_MARKER));
+        assert!(
+            local_write
+                .to_string()
+                .contains(CONNECTION_CANCELLED_MARKER)
+        );
+        transfer.store(true, Ordering::Release);
+        assert_eq!(
+            DialCancellation::from_io_error(&reader.read(&mut [0u8; 1]).unwrap_err()),
+            Some(DialCancellation::TransferFailed)
+        );
+        assert_eq!(
+            DialCancellation::from_io_error(&writer.drain_delivery().unwrap_err()),
+            Some(DialCancellation::TransferFailed)
+        );
+        stop.store(true, Ordering::Release);
+        assert_eq!(
+            DialCancellation::from_io_error(&writer.write(b"payload").unwrap_err()),
+            Some(DialCancellation::OperatorStopped)
+        );
+        assert_eq!(
+            DialCancellation::from_io_error(&writer.drain_delivery().unwrap_err()),
+            Some(DialCancellation::OperatorStopped)
+        );
+    }
+
+    #[test]
+    fn connection_cancellation_releases_a_blocked_receive() {
+        let (mut stream, wire, waits) = opened_thread_wire();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (reader, _writer) = stream.split();
+        let mut reader = reader.with_connection_cancel(Arc::clone(&cancel));
+        std::thread::scope(|scope| {
+            let receiving = scope.spawn(move || reader.read(&mut [0u8; 1]));
+            waits
+                .recv_timeout(Duration::from_secs(1))
+                .expect("receive is live before cancellation");
+            cancel.store(true, Ordering::Release);
+            wire.notify();
+            let error = receiving.join().unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+            assert!(error.to_string().contains(CONNECTION_CANCELLED_MARKER));
+        });
+    }
+
+    #[test]
+    fn connection_cancellation_releases_a_blocked_write_and_attributes_queued_bytes() {
+        let (mut stream, wire, waits) = opened_thread_wire();
+        let port = stream.local_port();
+        let link = stream.link.clone();
+        let state = link.with(LinkPhase::Inspect, port, |link| {
+            link.send_state(port).unwrap()
+        });
+        let mut closed_window = peer_ack(port, state.snd_una);
+        closed_window.window = 0;
+        wire.reply(closed_window, &[]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_reader, writer) = stream.split();
+        let mut writer = writer.with_connection_cancel(Arc::clone(&cancel));
+        std::thread::scope(|scope| {
+            let writing = scope.spawn(move || {
+                let write_error = writer.write(b"payload").unwrap_err();
+                let drain_error = writer.drain_delivery().unwrap_err();
+                (write_error, drain_error)
+            });
+            waits
+                .recv_timeout(Duration::from_secs(1))
+                .expect("write is live before cancellation");
+            let queued = link.with(LinkPhase::Inspect, port, |link| {
+                link.send_state(port).unwrap()
+            });
+            assert_eq!(queued.pending, 7);
+            cancel.store(true, Ordering::Release);
+            wire.notify();
+            let (write_error, drain_error) = writing.join().unwrap();
+            assert_eq!(write_error.kind(), io::ErrorKind::ConnectionAborted);
+            assert!(
+                write_error
+                    .to_string()
+                    .contains(CONNECTION_CANCELLED_MARKER)
+            );
+            assert!(drain_error.to_string().contains("7 byte(s) queued"));
+        });
+    }
+
+    #[test]
+    fn additive_connection_cancellation_releases_a_parked_receive() {
+        for active in 0..2 {
+            let (mut stream, wire, waits) = opened_thread_wire();
+            let flags = [
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ];
+            let (reader, _writer) = stream.split();
+            let mut reader = reader
+                .with_connection_cancel(Arc::clone(&flags[0]))
+                .with_connection_cancel(Arc::clone(&flags[1]));
+            std::thread::scope(|scope| {
+                let receiving = scope.spawn(move || reader.read(&mut [0u8; 1]));
+                waits
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("receive is live before either registered flag is set");
+                flags[active].store(true, Ordering::Release);
+                wire.notify();
+                let error = receiving.join().unwrap().unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+                assert!(
+                    error.to_string().contains(CONNECTION_CANCELLED_MARKER),
+                    "flag {active}: {error}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn additive_connection_cancellation_releases_a_parked_delivery_wait() {
+        for active in 0..2 {
+            let (mut stream, wire, waits) = opened_thread_wire();
+            let flags = [
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ];
+            let (_reader, writer) = stream.split();
+            let mut writer = writer
+                .with_connection_cancel(Arc::clone(&flags[0]))
+                .with_connection_cancel(Arc::clone(&flags[1]));
+            writer.write_all(b"payload").unwrap();
+            std::thread::scope(|scope| {
+                let draining = scope.spawn(move || writer.drain_delivery());
+                waits
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("delivery wait is live before either registered flag is set");
+                flags[active].store(true, Ordering::Release);
+                wire.notify();
+                let error = draining.join().unwrap().unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+                let text = error.to_string();
+                assert!(
+                    text.contains(CONNECTION_CANCELLED_MARKER),
+                    "flag {active}: {text}"
+                );
+                assert!(text.contains("7 byte(s) sent but unacknowledged"), "{text}");
+            });
         }
     }
 }

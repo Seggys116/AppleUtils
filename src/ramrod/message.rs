@@ -398,7 +398,7 @@ impl SystemImageFormat {
     }
 
     pub const fn supports_async_delivery(self) -> bool {
-        matches!(self, Self::DiskImage)
+        matches!(self, Self::DiskImage | Self::AeaWrappedDiskImage)
     }
 }
 
@@ -1050,9 +1050,17 @@ mod tests {
     }
 
     #[test]
-    fn the_aea_format_is_marked_as_refusing_asynchronous_delivery() {
-        assert!(SystemImageFormat::DiskImage.supports_async_delivery());
-        assert!(!SystemImageFormat::AeaWrappedDiskImage.supports_async_delivery());
+    fn system_image_formats_support_the_async_asr_delivery_path() {
+        for format in [
+            SystemImageFormat::DiskImage,
+            SystemImageFormat::AeaWrappedDiskImage,
+        ] {
+            assert!(format.supports_async_delivery());
+            assert_eq!(
+                SystemImageFormat::from_wire(format.wire_name()),
+                Some(format)
+            );
+        }
     }
 
     #[test]

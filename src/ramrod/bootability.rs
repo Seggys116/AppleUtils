@@ -10,7 +10,7 @@ use super::bulk::{
 use super::cpio::{CpioError, CpioFileMeta, CpioWriter};
 use super::dial::{Clock, DialPlan, GuestDialer, SystemClock, dial_until};
 use super::message::{DataRequest, DataType};
-use super::provider::{BulkOutcome, BulkTransferService, ProviderError};
+use super::provider::{BulkOutcome, BulkTransferService, BulkTransferTask, ProviderError};
 
 pub const BOOTABILITY_BUNDLE_DATA_TYPE: &str = "BootabilityBundle";
 
@@ -411,7 +411,7 @@ pub struct BootabilityBundleTransfer<D, C = SystemClock> {
     attempt_timeout: Duration,
     retry_interval: Duration,
     window: Duration,
-    transfers: Vec<BundleArchiveSummary>,
+    transfers: std::sync::Arc<std::sync::Mutex<Vec<BundleArchiveSummary>>>,
 }
 
 impl<D> BootabilityBundleTransfer<D, SystemClock>
@@ -426,7 +426,7 @@ where
             attempt_timeout: DEFAULT_DATA_PORT_ATTEMPT_TIMEOUT,
             retry_interval: DEFAULT_DATA_PORT_RETRY_INTERVAL,
             window: DEFAULT_DATA_PORT_WINDOW,
-            transfers: Vec::new(),
+            transfers: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -444,7 +444,7 @@ where
             attempt_timeout: DEFAULT_DATA_PORT_ATTEMPT_TIMEOUT,
             retry_interval: DEFAULT_DATA_PORT_RETRY_INTERVAL,
             window: DEFAULT_DATA_PORT_WINDOW,
-            transfers: Vec::new(),
+            transfers: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -467,8 +467,11 @@ where
     }
 
     #[must_use]
-    pub fn transfers(&self) -> &[BundleArchiveSummary] {
-        &self.transfers
+    pub fn transfers(&self) -> Vec<BundleArchiveSummary> {
+        self.transfers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn plan(&self, port: u16) -> DialPlan {
@@ -483,10 +486,34 @@ where
 
 impl<D, C> BulkTransferService for BootabilityBundleTransfer<D, C>
 where
+    D: GuestDialer + Clone + Send + 'static,
+    C: Clock + Clone + Send + 'static,
+{
+    fn prepare(
+        &mut self,
+        port: u16,
+        request: &DataRequest,
+    ) -> Result<BulkTransferTask, ProviderError> {
+        let mut transfer = Self {
+            dialer: self.dialer.clone(),
+            source: self.source.clone(),
+            clock: self.clock.clone(),
+            attempt_timeout: self.attempt_timeout,
+            retry_interval: self.retry_interval,
+            window: self.window,
+            transfers: std::sync::Arc::clone(&self.transfers),
+        };
+        let request = request.clone();
+        Ok(Box::new(move || transfer.execute(port, &request)))
+    }
+}
+
+impl<D, C> BootabilityBundleTransfer<D, C>
+where
     D: GuestDialer,
     C: Clock,
 {
-    fn serve(&mut self, port: u16, request: &DataRequest) -> Result<BulkOutcome, ProviderError> {
+    fn execute(&mut self, port: u16, request: &DataRequest) -> Result<BulkOutcome, ProviderError> {
         if !is_bootability_bundle(&request.data_type) {
             let reason = format!(
                 "the guest opened port {port} for a {} transfer and this service only answers {BOOTABILITY_BUNDLE_DATA_TYPE}",
@@ -533,7 +560,10 @@ where
             .map_err(|error| ProviderError::Other(format!("port {port}: {error}")))?;
         outcome.stream.flush().map_err(ProviderError::Io)?;
 
-        self.transfers.push(summary);
+        self.transfers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(summary);
         Ok(BulkOutcome::Served {
             bytes: summary.bytes,
             blocks: summary.members,
@@ -573,11 +603,15 @@ where
     B: BulkTransferService,
     F: BulkTransferService,
 {
-    fn serve(&mut self, port: u16, request: &DataRequest) -> Result<BulkOutcome, ProviderError> {
+    fn prepare(
+        &mut self,
+        port: u16,
+        request: &DataRequest,
+    ) -> Result<BulkTransferTask, ProviderError> {
         if is_bootability_bundle(&request.data_type) {
-            self.bundle.serve(port, request)
+            self.bundle.prepare(port, request)
         } else {
-            self.fallback.serve(port, request)
+            self.fallback.prepare(port, request)
         }
     }
 }
@@ -829,6 +863,7 @@ mod tests {
         assert_eq!(first, second);
     }
 
+    #[derive(Clone)]
     struct RecordingDialer {
         ports: Vec<u16>,
         written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
@@ -964,20 +999,22 @@ mod tests {
     }
 
     impl BulkTransferService for CountingService {
-        fn serve(
+        fn prepare(
             &mut self,
             _port: u16,
             request: &DataRequest,
-        ) -> Result<BulkOutcome, ProviderError> {
+        ) -> Result<BulkTransferTask, ProviderError> {
             self.served.push(request.data_type.wire_name().to_string());
-            Ok(BulkOutcome::Served {
-                bytes: 1,
-                blocks: 1,
-                initiates: 1,
-                metadata_requests: 0,
-                oob_requests: 0,
-                oob_bytes: 0,
-            })
+            Ok(Box::new(|| {
+                Ok(BulkOutcome::Served {
+                    bytes: 1,
+                    blocks: 1,
+                    initiates: 1,
+                    metadata_requests: 0,
+                    oob_requests: 0,
+                    oob_bytes: 0,
+                })
+            }))
         }
     }
 

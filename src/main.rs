@@ -1,4 +1,4 @@
-use std::io::{self, stdout};
+use std::io::{self, Read, stdout};
 use std::time::Duration;
 
 use apple_utils::app::App;
@@ -15,8 +15,34 @@ use ratatui::crossterm::execute;
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("patch-restore") {
+        match apple_utils::restore_patch_bundle::run(&args[2..]) {
+            Ok(text) => {
+                print!("{text}");
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.iter().any(|arg| arg == "--preview") {
         return preview::write_previews();
+    }
+    if args.get(1).map(String::as_str) == Some("preboot-ticket") {
+        let mut input = String::new();
+        io::stdin().read_to_string(&mut input)?;
+        match apple_utils::preboot_ticket::sign_from_json(&input) {
+            Ok(response) => {
+                println!("{response}");
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
     }
     if args.get(1).map(String::as_str) == Some("asahi") {
         match apple_utils::asahi_cli::run(&args[2..]) {

@@ -8,12 +8,15 @@ use std::time::{Duration, Instant};
 use plist::{Dictionary, Value};
 
 use crate::usbmux::{
-    BulkTransport, MuxReadPolicy, MuxStream, SharedLink, is_device_gone,
+    BulkTransport, MuxReadPolicy, MuxStream, MuxWritePolicy, SharedLink, is_device_gone,
     is_host_initiated_teardown, is_run_stopped,
 };
 
 use super::report::{SharedReporter, report};
 use super::seal_server::{SealServer, is_service_destination};
+
+#[path = "reverse_proxy_forwarding.rs"]
+mod forwarding;
 
 pub const FDR_PROXY_PREFIX: &str = "[fdr-proxy]";
 
@@ -208,7 +211,14 @@ fn run_ctrl<T>(
                 worker_seal,
             );
         }));
-        workers.retain(|worker| !worker.is_finished());
+        let mut finished = 0;
+        while finished < workers.len() {
+            if workers[finished].is_finished() {
+                let _ = workers.swap_remove(finished).join();
+            } else {
+                finished += 1;
+            }
+        }
     }
 
     cancel.store(true, Ordering::Relaxed);
@@ -441,20 +451,107 @@ fn run_conn<T>(
         return;
     }
 
-    if let Err(error) = refuse_socks(&mut conn, &request) {
+    let connection_cancel =
+        forwarding::Cancellation::new(Arc::clone(&run_stop), Arc::clone(&cancel));
+    let connected = if is_service_destination(&request.host, request.port) {
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "fdr-local-service-unarmed: the requested local FDR server is not armed",
+        ))
+    } else {
+        forwarding::connect(&request, &connection_cancel)
+    };
+    let (name, socket) = match connected {
+        Ok(connected) => connected,
+        Err(error) => {
+            let refusal = refuse_socks(&mut conn, &request);
+            let result = if refusal.is_ok() {
+                "socks-refused"
+            } else {
+                "socks-refusal-failed"
+            };
+            let line = format!(
+                "{FDR_PROXY_PREFIX} result={result} port={conn_port} at={armed_at_secs:.3}s elapsed={:.3}s connection={index} target={}:{} meaning=\"the requested FDR destination was refused for the named authorization, resolution or connection reason\" detail=\"{error}; socks_reply={refusal:?}\"",
+                began.elapsed().as_secs_f64(),
+                request.host,
+                request.port
+            );
+            report(&reporter, result, &line);
+            let _ = conn.close();
+            return;
+        }
+    };
+    if let Err(error) = grant_socks(&mut conn, &request) {
         let line = format!(
-            "{FDR_PROXY_PREFIX} result=socks-refusal-failed port={conn_port} at={armed_at_secs:.3}s elapsed={:.3}s connection={index} meaning=\"the refusal could not be written, so the guest's socks client will time out rather than fail\" detail=\"{error}\"",
+            "{FDR_PROXY_PREFIX} result=socks-grant-failed port={conn_port} at={armed_at_secs:.3}s elapsed={:.3}s connection={index} target={name}:443 meaning=\"the vendor TCP connection was established but the SOCKS acceptance could not be written\" detail=\"{error}\"",
             began.elapsed().as_secs_f64()
         );
-        report(&reporter, "socks-refusal-failed", &line);
-    } else {
+        report(&reporter, "socks-grant-failed", &line);
+        let _ = conn.close();
+        return;
+    }
+    let line = format!(
+        "{FDR_PROXY_PREFIX} result=vendor-forwarding port={conn_port} at={armed_at_secs:.3}s elapsed={:.3}s connection={index} target={name}:443 meaning=\"the authorized vendor destination resolved to validated public unicast addresses and a numeric TCP connection was established; guest and vendor retain end-to-end TLS and FDR authorization\" detail=\"mux_directional_eof=unavailable; a vendor read EOF drains queued replies while the mux owner remains alive for uploads, but cannot signal directional EOF to the guest\"",
+        began.elapsed().as_secs_f64()
+    );
+    report(&reporter, "vendor-forwarding", &line);
+    conn = conn
+        .with_cancel(Arc::clone(&run_stop))
+        .with_read_policy(MuxReadPolicy::retrying(forwarding::IO_POLL))
+        .with_write_policy(MuxWritePolicy::retrying(forwarding::IO_POLL));
+    let (reader, writer) = conn.split();
+    let reader = reader
+        .with_connection_cancel(Arc::clone(&cancel))
+        .with_connection_cancel(Arc::clone(&connection_cancel.local));
+    let writer = writer
+        .with_connection_cancel(Arc::clone(&cancel))
+        .with_connection_cancel(Arc::clone(&connection_cancel.local));
+    let forwarded = forwarding::forward(reader, writer, socket, connection_cancel, |outcome| {
+        let result = if outcome.error.is_some() {
+            "vendor-forward-aborted"
+        } else {
+            "vendor-forward-direction-complete"
+        };
+        let detail = outcome.error.as_ref().map(ToString::to_string).unwrap_or_else(|| {
+            if outcome.direction == "guest-to-vendor" {
+                "guest read EOF followed all upload bytes; TCP write shut down".to_string()
+            } else {
+                "vendor read EOF; mux delivery drained, upload and mux owner retained; directional EOF to guest unavailable".to_string()
+            }
+        });
+        let delivery = outcome
+            .delivery_state
+            .map(|(queued, in_flight)| format!("queued={queued} in_flight={in_flight}"))
+            .unwrap_or_else(|| "unavailable".to_string());
+        let outstanding = if outcome.read_progress == forwarding::ProgressKnowledge::Known
+            && outcome.write_progress == forwarding::ProgressKnowledge::Known
+        {
+            outcome
+                .read_bytes
+                .saturating_sub(outcome.written_bytes)
+                .to_string()
+        } else {
+            "unknown".to_string()
+        };
         let line = format!(
-            "{FDR_PROXY_PREFIX} result=socks-refused port={conn_port} at={armed_at_secs:.3}s elapsed={:.3}s connection={index} target={}:{} meaning=\"the host answered the SOCKS request with a refusal because it will not reach the public internet and holds no local server for this destination; fdr_recover now fails on the destination named here rather than on the proxy being absent\" detail=\"nothing here disables the guest's FDR check, it names what the check wants; restored's copy_restore_options whitelist carries FDRCAURL, FDRDataStoreURL, FDRSealingURL and FDRTrustObjectURL, which restored copies into libFDR's CAURL, DSURL and SealingURL at 0x100070964, so a host that means to answer this serves it itself and names its own URL rather than letting the apple.com default stand\"",
+            "{FDR_PROXY_PREFIX} result={result} port={conn_port} at={armed_at_secs:.3}s elapsed={:.3}s connection={index} target={name}:443 direction={} read_bytes_known_prefix={} read_progress={} written_bytes_known_prefix={} write_progress={} outstanding_buffer_bytes={outstanding} direction_completed={} delivery_drained={} mux_delivery_state=\"{delivery}\" detail=\"{detail}\"",
             began.elapsed().as_secs_f64(),
-            request.host,
-            request.port
+            outcome.direction,
+            outcome.read_bytes,
+            outcome.read_progress.label(),
+            outcome.written_bytes,
+            outcome.write_progress.label(),
+            outcome.completed,
+            outcome.drained
         );
-        report(&reporter, "socks-refused", &line);
+        report(&reporter, result, &line);
+    });
+    if let Err(error) = forwarded {
+        let line = format!(
+            "{FDR_PROXY_PREFIX} result=vendor-forward-setup-failed port={conn_port} at={armed_at_secs:.3}s elapsed={:.3}s connection={index} target={name}:443 detail=\"{error}\"",
+            began.elapsed().as_secs_f64()
+        );
+        report(&reporter, "vendor-forward-setup-failed", &line);
     }
     let _ = conn.close();
 }

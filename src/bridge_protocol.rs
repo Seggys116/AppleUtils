@@ -4,7 +4,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::sha256;
+use crate::crypto::{sha256, sha384};
 
 pub const MAGIC: [u8; 4] = *b"RBRG";
 pub const VERSION: u16 = 1;
@@ -19,12 +19,13 @@ pub const SIGNING_ENCODING_VERSION: u16 = 1;
 pub const SIGNING_DIGEST_ALGORITHM: u16 = 1;
 pub const SIGNATURE_FORMAT_RS: u16 = 1;
 pub const MANB_IDENTIFIER_BYTES: [u8; 6] = [0xff, 0x84, 0xea, 0x85, 0x9c, 0x42];
-pub const SERVER_CAPABILITIES: [&str; 6] = [
+pub const SERVER_CAPABILITIES: [&str; 7] = [
     "list",
     "watch",
     "packetCredit",
     "bootContext",
     "signFdrManifest",
+    "signerPublicKey",
     "detach",
 ];
 
@@ -53,6 +54,12 @@ pub enum RecordKind {
     BootContext = 20,
     SignFdrManifest = 21,
     FdrManifestSignature = 22,
+    GetApNonce = 23,
+    ApNonce = 24,
+    GetSepNonce = 25,
+    SepNonce = 26,
+    GetSignerPublicKey = 27,
+    SignerPublicKey = 28,
 }
 
 impl RecordKind {
@@ -80,6 +87,12 @@ impl RecordKind {
             20 => Ok(Self::BootContext),
             21 => Ok(Self::SignFdrManifest),
             22 => Ok(Self::FdrManifestSignature),
+            23 => Ok(Self::GetApNonce),
+            24 => Ok(Self::ApNonce),
+            25 => Ok(Self::GetSepNonce),
+            26 => Ok(Self::SepNonce),
+            27 => Ok(Self::GetSignerPublicKey),
+            28 => Ok(Self::SignerPublicKey),
             other => Err(invalid_data(format!(
                 "unknown Restore Bridge v1 record kind {other}"
             ))),
@@ -103,7 +116,14 @@ impl RecordKind {
             | Self::Detach
             | Self::Detached
             | Self::Error => MAX_JSON_BYTES,
-            Self::List | Self::GetBootContext => 0,
+            Self::List
+            | Self::GetBootContext
+            | Self::GetApNonce
+            | Self::GetSepNonce
+            | Self::GetSignerPublicKey => 0,
+            Self::ApNonce => 32,
+            Self::SepNonce => 20,
+            Self::SignerPublicKey => 65,
             Self::PacketToDevice => MAX_PACKET_BYTES,
             Self::PacketFromDevice => MAX_TRANSFER_BYTES,
             Self::Credit => 8,
@@ -227,6 +247,12 @@ impl FrameAssembler {
         let header = RecordHeader::decode(&available[..HEADER_LEN])?;
         let payload_len = usize::try_from(header.payload_len)
             .map_err(|_| invalid_data("payload length does not fit in memory"))?;
+        if header.kind == RecordKind::ApNonce && payload_len != 32 {
+            return Err(invalid_data("AP_NONCE payload must be exactly 32 bytes"));
+        }
+        if header.kind == RecordKind::SepNonce && payload_len != 20 {
+            return Err(invalid_data("SEP_NONCE payload must be exactly 20 bytes"));
+        }
         if payload_len > header.kind.payload_limit() {
             return Err(invalid_data(format!(
                 "payload {} exceeds limit {} for {:?}",
@@ -448,6 +474,7 @@ pub struct StatsRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootContext {
     pub staged_boot_manifest_sha384: [u8; 48],
+    pub staged_boot_manifest: Option<Vec<u8>>,
     pub ap_nonce: Option<[u8; 32]>,
     pub fdr_element_index: u32,
     pub fdr_element_count: u32,
@@ -761,6 +788,12 @@ impl BootContext {
             }
             flags |= 1 << 5;
         }
+        if let Some(manifest) = self.staged_boot_manifest.as_deref() {
+            if manifest.is_empty() || sha384(manifest) != self.staged_boot_manifest_sha384 {
+                return Err(invalid_input("staged boot manifest digest mismatch"));
+            }
+            flags |= 1 << 6;
+        }
         let trust_object_len = trust_object.map_or(0, Vec::len);
         let instance_bytes = instance.map_or(&[][..], String::as_bytes);
         let material_bytes = material_path
@@ -773,7 +806,8 @@ impl BootContext {
                 + trust_object_len
                 + instance_bytes.len()
                 + material_bytes.len()
-                + sep.map_or(0, |_| 65),
+                + sep.map_or(0, |_| 65)
+                + self.staged_boot_manifest.as_ref().map_or(0, Vec::len),
         );
         out.extend_from_slice(&BOOT_CONTEXT_ENCODING_VERSION.to_be_bytes());
         out.extend_from_slice(&0u16.to_be_bytes());
@@ -798,7 +832,11 @@ impl BootContext {
             })?)
             .to_be_bytes(),
         );
-        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(
+            &u32::try_from(self.staged_boot_manifest.as_ref().map_or(0, Vec::len))
+                .map_err(|_| invalid_input("staged boot manifest too large"))?
+                .to_be_bytes(),
+        );
         out.extend_from_slice(&self.staged_boot_manifest_sha384);
         if let Some(ap_nonce) = ap_nonce {
             out.extend_from_slice(ap_nonce);
@@ -817,6 +855,9 @@ impl BootContext {
         }
         if let Some(sep) = sep {
             out.extend_from_slice(sep);
+        }
+        if let Some(manifest) = self.staged_boot_manifest.as_deref() {
+            out.extend_from_slice(manifest);
         }
         if out.len() > MAX_BOOT_CONTEXT_BYTES {
             return Err(invalid_input(format!(
@@ -853,11 +894,12 @@ impl BootContext {
             usize::try_from(u32::from_be_bytes(payload[20..24].try_into().unwrap())).unwrap();
         let material_len =
             usize::try_from(u32::from_be_bytes(payload[24..28].try_into().unwrap())).unwrap();
-        let reserved1 = u32::from_be_bytes(payload[28..32].try_into().unwrap());
-        if encoding_version != BOOT_CONTEXT_ENCODING_VERSION || reserved0 != 0 || reserved1 != 0 {
+        let manifest_len =
+            usize::try_from(u32::from_be_bytes(payload[28..32].try_into().unwrap())).unwrap();
+        if encoding_version != BOOT_CONTEXT_ENCODING_VERSION || reserved0 != 0 {
             return Err(invalid_data("boot context prefix is invalid"));
         }
-        if flags & !0x3f != 0 {
+        if flags & !0x7f != 0 {
             return Err(invalid_data(format!(
                 "unknown boot context flags 0x{flags:08x}"
             )));
@@ -939,6 +981,20 @@ impl BootContext {
             None
         };
         let remote_signer_available = flags & (1 << 5) != 0;
+        let staged_boot_manifest = if flags & (1 << 6) != 0 {
+            let manifest = slice_at(payload, &mut cursor, manifest_len)?.to_vec();
+            if manifest.is_empty() || sha384(&manifest) != staged_boot_manifest_sha384 {
+                return Err(invalid_data("staged boot manifest digest mismatch"));
+            }
+            Some(manifest)
+        } else {
+            if manifest_len != 0 {
+                return Err(invalid_data(
+                    "boot context manifest length without presence bit",
+                ));
+            }
+            None
+        };
         if remote_signer_available && sep_public_key_uncompressed.is_none() {
             return Err(invalid_data(
                 "boot context remote signer requires SEP public key",
@@ -965,6 +1021,7 @@ impl BootContext {
         }
         Ok(Self {
             staged_boot_manifest_sha384,
+            staged_boot_manifest,
             ap_nonce,
             fdr_element_index,
             fdr_element_count,
@@ -1221,6 +1278,12 @@ fn validate_record_header(header: &RecordHeader) -> io::Result<()> {
         | RecordKind::Detached
         | RecordKind::GetBootContext
         | RecordKind::BootContext
+        | RecordKind::GetApNonce
+        | RecordKind::ApNonce
+        | RecordKind::GetSepNonce
+        | RecordKind::SepNonce
+        | RecordKind::GetSignerPublicKey
+        | RecordKind::SignerPublicKey
         | RecordKind::SignFdrManifest
         | RecordKind::FdrManifestSignature => {
             if header.request_id == 0 {
@@ -1251,7 +1314,11 @@ fn validate_record_header(header: &RecordHeader) -> io::Result<()> {
 
 fn validate_record_payload(kind: RecordKind, payload: &[u8]) -> io::Result<()> {
     match kind {
-        RecordKind::List | RecordKind::GetBootContext => {
+        RecordKind::List
+        | RecordKind::GetBootContext
+        | RecordKind::GetApNonce
+        | RecordKind::GetSepNonce
+        | RecordKind::GetSignerPublicKey => {
             if !payload.is_empty() {
                 return Err(invalid_input(format!("{:?} payload must be empty", kind)));
             }
@@ -1269,6 +1336,23 @@ fn validate_record_payload(kind: RecordKind, payload: &[u8]) -> io::Result<()> {
         }
         RecordKind::BootContext => {
             BootContext::decode(payload)?;
+        }
+        RecordKind::ApNonce => {
+            if payload.len() != 32 {
+                return Err(invalid_data("AP_NONCE payload must be exactly 32 bytes"));
+            }
+        }
+        RecordKind::SepNonce => {
+            if payload.len() != 20 {
+                return Err(invalid_data("SEP_NONCE payload must be exactly 20 bytes"));
+            }
+        }
+        RecordKind::SignerPublicKey => {
+            if payload.len() != 65 || payload[0] != 0x04 {
+                return Err(invalid_data(
+                    "signer public key must be a 65-byte uncompressed SEC1 point",
+                ));
+            }
         }
         RecordKind::SignFdrManifest => {
             SignFdrManifestRequest::decode(payload)?;
@@ -1446,6 +1530,87 @@ mod tests {
 
     const CREDIT_GOLDEN: &[u8] = &[0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03];
 
+    #[test]
+    fn ap_nonce_records_carry_the_exact_wire_nonce() {
+        let nonce: [u8; 32] = std::array::from_fn(|index| index as u8);
+        for (kind, wire_kind, payload) in [
+            (RecordKind::GetApNonce, 23u16, &[][..]),
+            (RecordKind::ApNonce, 24u16, &nonce[..]),
+        ] {
+            let bytes = encode_record(
+                RecordHeader {
+                    version: VERSION,
+                    kind,
+                    flags: 0,
+                    payload_len: payload.len() as u32,
+                    request_id: 7,
+                    generation: 17,
+                    lease_id: 27,
+                },
+                payload,
+            )
+            .unwrap();
+            assert_eq!(&bytes[6..8], &wire_kind.to_be_bytes());
+            assert_eq!(&bytes[HEADER_LEN..], payload);
+            let mut assembler = FrameAssembler::default();
+            let records = assembler.push(&bytes).unwrap();
+            assert_eq!(records[0].header.kind, kind);
+            assert_eq!(records[0].payload, payload);
+        }
+    }
+
+    #[test]
+    fn sep_nonce_records_carry_the_exact_wire_nonce() {
+        let nonce: [u8; 20] = std::array::from_fn(|index| index as u8);
+        for (kind, wire_kind, payload) in [
+            (RecordKind::GetSepNonce, 25u16, &[][..]),
+            (RecordKind::SepNonce, 26u16, &nonce[..]),
+        ] {
+            let bytes = encode_record(
+                RecordHeader {
+                    version: VERSION,
+                    kind,
+                    flags: 0,
+                    payload_len: payload.len() as u32,
+                    request_id: 7,
+                    generation: 17,
+                    lease_id: 27,
+                },
+                payload,
+            )
+            .unwrap();
+            assert_eq!(&bytes[6..8], &wire_kind.to_be_bytes());
+            let records = FrameAssembler::default().push(&bytes).unwrap();
+            assert_eq!(records[0].header.kind, kind);
+            assert_eq!(records[0].payload, payload);
+        }
+    }
+
+    #[test]
+    fn malformed_ap_nonce_width_is_a_named_protocol_failure() {
+        for width in [31, 33] {
+            let mut bytes = Vec::new();
+            RecordHeader {
+                version: VERSION,
+                kind: RecordKind::ApNonce,
+                flags: 0,
+                payload_len: width,
+                request_id: 7,
+                generation: 17,
+                lease_id: 27,
+            }
+            .encode(&mut bytes);
+            bytes.extend_from_slice(&vec![0x5a; width as usize]);
+            let error = FrameAssembler::default().push(&bytes).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .contains("AP_NONCE payload must be exactly 32 bytes")
+            );
+        }
+    }
+
     fn sample_boot_context() -> BootContext {
         let trust_object = vec![0xaa, 0xbb, 0xcc];
         let signing_key = P256PrivateKey::derive(b"restore-bridge-protocol", b"boot-context");
@@ -1453,6 +1618,7 @@ mod tests {
         let ap_nonce = Some([0x22; 32]);
         BootContext {
             staged_boot_manifest_sha384,
+            staged_boot_manifest: None,
             ap_nonce,
             fdr_element_index: 1,
             fdr_element_count: 2,
@@ -1623,6 +1789,16 @@ mod tests {
         let encoded = sample_boot_context().encode().unwrap();
         let decoded = BootContext::decode(&encoded).unwrap();
         assert_eq!(decoded, sample_boot_context());
+    }
+
+    #[test]
+    fn boot_context_carries_the_measured_manifest_bytes() {
+        let mut context = sample_boot_context();
+        let manifest = b"signed boot manifest".to_vec();
+        context.staged_boot_manifest_sha384 = sha384(&manifest);
+        context.staged_boot_manifest = Some(manifest);
+        let encoded = context.encode().unwrap();
+        assert_eq!(BootContext::decode(&encoded).unwrap(), context);
     }
 
     #[test]
@@ -1851,9 +2027,9 @@ mod tests {
 
     #[test]
     fn restore_bridge_v1_golden_fixtures_file_matches_expected_digest() {
-        let expected = "650326c7be23bd884f9734e1a4bb7e7f5d74161c99206ebb24172d3bcc32a954";
+        let expected = "6d2ad2d2a16b6833700a619fc27ddfe330c6acff5bd17f30daa09eb0caaa1f24";
         let text = include_str!("../fixtures/restore_bridge_v1_golden_frames.json");
-        assert_eq!(text.len(), 5563);
+        assert_eq!(text.len(), 5599);
         assert_eq!(to_lower_hex(&sha256(text.as_bytes())), expected);
     }
 

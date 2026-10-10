@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use crate::ramrod::{
     BUILD_MANIFEST_FILE_NAME, BuildIdentity, DeviceType, IdentityError, OptionsReport,
     RestoreBehavior, RestoreOptions, generate_session_uuid, macos_restore_options,
-    select_install_identity, select_macos_identity,
+    mobile_restore_options, select_install_identity, select_macos_identity,
+    select_recovery_identity,
 };
 
 use super::plan::RestorePlan;
@@ -73,11 +74,32 @@ pub struct DerivedRestoreOptions {
     pub behavior: RestoreBehavior,
     pub install_index: usize,
     pub install_variant: String,
-    pub macos_index: usize,
-    pub macos_variant: String,
+    pub recovery_index: Option<usize>,
+    pub recovery_variant: Option<String>,
+    pub is_macos: bool,
     pub session_uuid: String,
     pub install_identity: BuildIdentity,
-    pub macos_identity: BuildIdentity,
+    pub recovery_identity: Option<BuildIdentity>,
+}
+
+impl DerivedRestoreOptions {
+    pub(crate) fn with_local_fdr_service(mut self) -> Self {
+        let base = service_base_url();
+        let keys = [FDR_CA_URL_KEY, FDR_DATA_STORE_URL_KEY, FDR_SEALING_URL_KEY];
+        for key in keys {
+            self.options = self
+                .options
+                .with_value(key, plist::Value::String(base.clone()));
+            if !self.report.keys.iter().any(|sent| sent == key) {
+                self.report.keys.push(key.to_string());
+            }
+        }
+        self.report
+            .withheld
+            .retain(|(key, _)| !keys.contains(&key.as_str()));
+        self.report.keys.sort();
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -88,6 +110,11 @@ pub enum RestoreOptionsError {
     NoMacosIdentity {
         hardware_model: String,
         identities: usize,
+    },
+    NoRecoveryIdentity {
+        hardware_model: String,
+        variant: String,
+        error: IdentityError,
     },
     NoRestoreBehavior {
         hardware_model: String,
@@ -108,6 +135,7 @@ impl RestoreOptionsError {
         match self {
             Self::NoHardwareModel { .. } => "no-hardware-model",
             Self::NoMacosIdentity { .. } => "no-macos-identity",
+            Self::NoRecoveryIdentity { .. } => "no-recovery-identity",
             Self::NoRestoreBehavior { .. } => "no-restore-behavior",
             Self::NoInstallIdentity { .. } => "no-install-identity",
             Self::NoSessionUuid { .. } => "no-session-uuid",
@@ -121,6 +149,9 @@ impl RestoreOptionsError {
             }
             Self::NoMacosIdentity { .. } => {
                 "the manifest carries no macOS Customer identity for this model, so the macOS restore options do not apply and no substitute is sent; the restore is not started"
+            }
+            Self::NoRecoveryIdentity { .. } => {
+                "the install identity names a recovery variant that cannot be matched for this model; the restore is not started"
             }
             Self::NoRestoreBehavior { .. } => {
                 "the macOS identity carries no Info/RestoreBehavior, and erase versus update is not a host choice to invent; the restore is not started"
@@ -143,6 +174,13 @@ impl RestoreOptionsError {
                 hardware_model,
                 identities,
             } => format!("model={hardware_model} identities={identities}"),
+            Self::NoRecoveryIdentity {
+                hardware_model,
+                variant,
+                error,
+            } => {
+                format!("model={hardware_model} recovery_variant={variant}: {error}")
+            }
             Self::NoRestoreBehavior {
                 hardware_model,
                 identity_index,
@@ -169,12 +207,6 @@ pub fn derive_restore_options(
         .ok_or_else(|| RestoreOptionsError::NoHardwareModel {
             reply_keys: device.body.keys().cloned().collect(),
         })?;
-    let macos = select_macos_identity(manifest, &hardware_model).ok_or_else(|| {
-        RestoreOptionsError::NoMacosIdentity {
-            hardware_model: hardware_model.clone(),
-            identities: manifest_identity_count(manifest),
-        }
-    })?;
     let behavior = match behavior {
         Some(behavior) => behavior,
         None => crate::ramrod::install_behaviors_for_board(manifest, &hardware_model)
@@ -200,23 +232,53 @@ pub fn derive_restore_options(
     let behavior = install.restore_behavior().unwrap_or(behavior);
     let session_uuid =
         generate_session_uuid().map_err(|error| RestoreOptionsError::NoSessionUuid { error })?;
-    let (options, mut report) = macos_restore_options(
-        &install,
-        &macos,
-        behavior,
-        &session_uuid,
-        request_global_manifest,
-    );
+    let macos = select_macos_identity(manifest, &hardware_model);
+    let is_macos = macos.is_some() || install.info_string("MacOSVariant").is_some();
+    let recovery = if is_macos {
+        Some(macos.ok_or_else(|| RestoreOptionsError::NoMacosIdentity {
+            hardware_model: hardware_model.clone(),
+            identities: manifest_identity_count(manifest),
+        })?)
+    } else if let Some(variant) = install.info_string("RecoveryVariant") {
+        Some(
+            select_recovery_identity(manifest, &hardware_model, variant).map_err(|error| {
+                RestoreOptionsError::NoRecoveryIdentity {
+                    hardware_model: hardware_model.clone(),
+                    variant: variant.to_string(),
+                    error,
+                }
+            })?,
+        )
+    } else {
+        None
+    };
+    let (options, mut report) = if is_macos {
+        macos_restore_options(
+            &install,
+            recovery.as_ref().expect("macOS recovery identity"),
+            behavior,
+            &session_uuid,
+            request_global_manifest,
+        )
+    } else {
+        mobile_restore_options(
+            &install,
+            recovery.as_ref(),
+            behavior,
+            &session_uuid,
+            request_global_manifest,
+        )
+    };
     let options = options.with_value(
         FDR_MEMORY_STORE_PATH_KEY,
         plist::Value::String(FDR_MEMORY_STORE_PATH.to_string()),
     );
     report.keys.push(FDR_MEMORY_STORE_PATH_KEY.to_string());
-    let base = service_base_url();
-    let mut options = options;
     for key in [FDR_CA_URL_KEY, FDR_DATA_STORE_URL_KEY, FDR_SEALING_URL_KEY] {
-        options = options.with_value(key, plist::Value::String(base.clone()));
-        report.keys.push(key.to_string());
+        report.withheld.push((
+            key.to_string(),
+            "recovery image supplies the service endpoint",
+        ));
     }
     report.keys.sort();
     Ok(DerivedRestoreOptions {
@@ -226,11 +288,12 @@ pub fn derive_restore_options(
         behavior,
         install_index: install.index,
         install_variant: install.variant.clone(),
-        macos_index: macos.index,
-        macos_variant: macos.variant.clone(),
+        recovery_index: recovery.as_ref().map(|identity| identity.index),
+        recovery_variant: recovery.as_ref().map(|identity| identity.variant.clone()),
+        is_macos,
         session_uuid,
         install_identity: install,
-        macos_identity: macos,
+        recovery_identity: recovery,
     })
 }
 
@@ -240,7 +303,9 @@ mod tests {
         FDR_MEMORY_STORE_PATH, FDR_MEMORY_STORE_PATH_KEY, ManifestSource, RestoreOptionsError,
         derive_restore_options, manifest_identity_count, resolve_restore_manifest,
     };
-    use crate::ramrod::{BUILD_MANIFEST_FILE_NAME, DeviceType, IdentityError, RestoreBehavior};
+    use crate::ramrod::{
+        BUILD_MANIFEST_FILE_NAME, DeviceType, IdentityError, RestoreBehavior, RestoreOptions,
+    };
     use crate::restore::RestorePlan;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -265,7 +330,9 @@ mod tests {
             bootability_bundle: None,
             corrupt_manifest: false,
             staged_boot_manifest_sha384: None,
+            staged_boot_manifest: None,
             fdr_trust_digest: None,
+            restore_ramdisk: None,
             fdr_material_dir: None,
             sign_recovery_os_local_policy: false,
         }
@@ -335,6 +402,10 @@ mod tests {
             info.insert("DeviceClass".into(), plist::Value::String(model.into()));
             info.insert("Variant".into(), plist::Value::String(variant.into()));
             info.insert(
+                "MacOSVariant".into(),
+                plist::Value::String("macOS Customer".into()),
+            );
+            info.insert(
                 "MinimumSystemPartition".into(),
                 plist::Value::Integer(11977.into()),
             );
@@ -385,6 +456,43 @@ mod tests {
         }
     }
 
+    fn serialized_start_restore_options(options: RestoreOptions) -> plist::Dictionary {
+        let mut client = crate::ramrod::RamrodClient::new(std::io::Cursor::new(Vec::new()));
+        client.start_restore(options).unwrap();
+        let mut transport = client.into_inner();
+        transport.set_position(0);
+        let request = crate::ramrod::codec::read_message(&mut transport)
+            .unwrap()
+            .unwrap();
+        let request = request.as_dictionary().unwrap();
+        assert_eq!(request["Request"].as_string(), Some("StartRestore"));
+        request["RestoreOptions"].as_dictionary().unwrap().clone()
+    }
+
+    fn assert_image_fetch_capabilities(body: &plist::Dictionary) {
+        let data = body["SupportedDataTypes"].as_dictionary().unwrap();
+        assert_eq!(data["URLAsset"].as_boolean(), Some(true));
+        assert_eq!(data["StreamedImageDecryptionKey"].as_boolean(), Some(false));
+        assert_eq!(data["SystemImageData"].as_boolean(), Some(false));
+        assert_eq!(data["RecoveryOSASRImage"].as_boolean(), Some(true));
+        let asynchronous = body["SupportedAsyncDataTypes"].as_dictionary().unwrap();
+        assert_eq!(asynchronous["URLAsset"].as_boolean(), Some(true));
+        for name in [
+            "StreamedImageDecryptionKey",
+            "SystemImageData",
+            "RecoveryOSASRImage",
+        ] {
+            assert_eq!(asynchronous[name].as_boolean(), Some(false), "{name}");
+        }
+        let messages = body["SupportedMessageTypes"].as_dictionary().unwrap();
+        assert_eq!(messages["AsyncDataRequestMsg"].as_boolean(), Some(true));
+        assert_eq!(messages["AsyncWait"].as_boolean(), Some(true));
+        assert_eq!(
+            body["SupportedHostProtocols"].as_array().unwrap(),
+            &vec![plist::Value::String("MuxSocket".into())]
+        );
+    }
+
     #[test]
     fn the_options_are_derived_from_the_model_the_guest_reported() {
         for model in ["J274AP", "J413AP", "J714AP", "J815AP"] {
@@ -399,12 +507,11 @@ mod tests {
                 Err(error) => panic!("{model} did not derive: {}", error.detail()),
             };
             assert_eq!(derived.hardware_model, model);
-            assert_eq!(derived.macos_variant, "macOS Customer");
+            assert_eq!(derived.recovery_variant.as_deref(), Some("macOS Customer"));
             assert_eq!(derived.install_variant, "Customer Erase Install (IPSW)");
             assert_eq!(derived.behavior.wire_name(), "Erase");
             assert!(!derived.session_uuid.is_empty());
-            let body = derived.options.into_value().unwrap();
-            let body = body.as_dictionary().unwrap();
+            let body = serialized_start_restore_options(derived.options);
             assert_eq!(
                 body.get("AuthInstallRecoveryOSVariant")
                     .unwrap()
@@ -415,9 +522,10 @@ mod tests {
                 body.get("SystemPartitionSize").unwrap().as_signed_integer(),
                 Some(11977)
             );
-            assert!(!body.contains_key("SupportedDataTypes"));
-            assert!(!body.contains_key("SupportedAsyncDataTypes"));
-            assert_eq!(derived.report.withheld.len(), 2);
+            assert_image_fetch_capabilities(&body);
+            for key in ["SupportedDataTypes", "SupportedAsyncDataTypes"] {
+                assert!(derived.report.keys.iter().any(|sent| sent == key), "{key}");
+            }
             // Must stay present: absent makes cleanup_send_crash_logs dereference NULL in the guest.
             assert!(body.contains_key("SupportedMessageTypes"));
             assert_eq!(
@@ -508,7 +616,8 @@ mod tests {
                 Ok(_) => panic!("a model the manifest does not carry must not derive options"),
                 Err(error) => error,
             };
-        assert_eq!(error.label(), "no-macos-identity");
+        assert_eq!(error.label(), "no-install-identity");
+        assert!(error.detail().contains("J999AP"));
     }
 
     #[test]
@@ -593,6 +702,203 @@ mod tests {
         .unwrap();
         assert_eq!(erased.behavior, RestoreBehavior::Erase);
         assert_eq!(erased.install_variant, "Customer Erase Install (IPSW)");
+    }
+
+    fn mobile_manifest_for(model: &str) -> plist::Dictionary {
+        let mut manifest = restore_manifest_for(model);
+        let entries = manifest
+            .get_mut("BuildIdentities")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        for entry in entries.iter_mut() {
+            entry
+                .as_dictionary_mut()
+                .unwrap()
+                .get_mut("Info")
+                .unwrap()
+                .as_dictionary_mut()
+                .unwrap()
+                .remove("MacOSVariant");
+        }
+        let info = entries[0]
+            .as_dictionary_mut()
+            .unwrap()
+            .get_mut("Info")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap();
+        info.insert(
+            "RecoveryVariant".to_string(),
+            plist::Value::String("Recovery Customer Install".to_string()),
+        );
+        info.insert(
+            "ContentEncoding".to_string(),
+            plist::Value::String("aea".to_string()),
+        );
+        entries[1]
+            .as_dictionary_mut()
+            .unwrap()
+            .get_mut("Info")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap()
+            .insert(
+                "Variant".to_string(),
+                plist::Value::String("Recovery Customer Install".to_string()),
+            );
+        manifest
+    }
+
+    #[test]
+    fn mobile_options_follow_the_declared_recovery_identity() {
+        let manifest = mobile_manifest_for("j620ap");
+        let derived = derive_restore_options(
+            &manifest,
+            &device_reporting(Some("J620AP")),
+            false,
+            Some(RestoreBehavior::Erase),
+        )
+        .unwrap();
+        assert_eq!(derived.install_index, 0);
+        assert_eq!(derived.recovery_index, Some(1));
+        assert_eq!(
+            derived.recovery_variant.as_deref(),
+            Some("Recovery Customer Install")
+        );
+        let session_uuid = derived.session_uuid.clone();
+        let body = serialized_start_restore_options(derived.options);
+        assert_image_fetch_capabilities(&body);
+        assert_eq!(
+            body["AuthInstallVariant"].as_string(),
+            Some("Customer Erase Install (IPSW)")
+        );
+        assert_eq!(
+            body["AuthInstallRestoreBehavior"].as_string(),
+            Some("Erase")
+        );
+        assert_eq!(body["UUID"].as_string(), Some(session_uuid.as_str()));
+        assert_eq!(
+            body[FDR_MEMORY_STORE_PATH_KEY].as_string(),
+            Some(FDR_MEMORY_STORE_PATH)
+        );
+        assert_eq!(body["CreateFilesystemPartitions"].as_boolean(), Some(true));
+        assert_eq!(body["SystemImage"].as_boolean(), Some(true));
+        assert!(body["SystemPartitionPadding"].as_dictionary().is_some());
+        assert_eq!(
+            body["AuthInstallRecoveryOSVariant"].as_string(),
+            Some("Recovery Customer Install")
+        );
+        assert_eq!(
+            body["SystemImageFormat"].as_string(),
+            Some("AEAWrappedDiskImage")
+        );
+        assert_eq!(body["SystemImageType"].as_string(), Some("User"));
+        assert_eq!(body["SystemPartitionSize"].as_signed_integer(), Some(11977));
+    }
+
+    #[test]
+    fn recovery_service_defaults_are_reported_for_both_identity_families() {
+        for (model, manifest) in [
+            ("J620AP", mobile_manifest_for("j620ap")),
+            ("J274AP", restore_manifest_for("j274ap")),
+        ] {
+            let derived = derive_restore_options(
+                &manifest,
+                &device_reporting(Some(model)),
+                false,
+                Some(RestoreBehavior::Erase),
+            )
+            .unwrap();
+            for key in [
+                super::FDR_CA_URL_KEY,
+                super::FDR_DATA_STORE_URL_KEY,
+                super::FDR_SEALING_URL_KEY,
+            ] {
+                assert!(
+                    derived.report.withheld.iter().any(|(reported, reason)| {
+                        reported == key && *reason == "recovery image supplies the service endpoint"
+                    }),
+                    "{model}: {key}"
+                );
+            }
+            let body = serialized_start_restore_options(derived.options);
+            assert_eq!(
+                body[FDR_MEMORY_STORE_PATH_KEY].as_string(),
+                Some(FDR_MEMORY_STORE_PATH)
+            );
+        }
+    }
+
+    #[test]
+    fn an_armed_local_service_supplies_each_reported_endpoint() {
+        for (model, manifest) in [
+            ("J620AP", mobile_manifest_for("j620ap")),
+            ("J274AP", restore_manifest_for("j274ap")),
+        ] {
+            let derived = derive_restore_options(
+                &manifest,
+                &device_reporting(Some(model)),
+                false,
+                Some(RestoreBehavior::Erase),
+            )
+            .unwrap()
+            .with_local_fdr_service()
+            .with_local_fdr_service();
+            let body = serialized_start_restore_options(derived.options);
+            let base = super::service_base_url();
+            for key in [
+                super::FDR_CA_URL_KEY,
+                super::FDR_DATA_STORE_URL_KEY,
+                super::FDR_SEALING_URL_KEY,
+            ] {
+                assert_eq!(body[key].as_string(), Some(base.as_str()));
+                assert_eq!(
+                    derived
+                        .report
+                        .keys
+                        .iter()
+                        .filter(|reported| *reported == key)
+                        .count(),
+                    1
+                );
+            }
+            assert_eq!(
+                body[FDR_MEMORY_STORE_PATH_KEY].as_string(),
+                Some(FDR_MEMORY_STORE_PATH)
+            );
+        }
+    }
+
+    #[test]
+    fn an_unresolved_declared_recovery_variant_is_refused_by_name() {
+        let mut manifest = mobile_manifest_for("j620ap");
+        let entries = manifest
+            .get_mut("BuildIdentities")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        entries[0]
+            .as_dictionary_mut()
+            .unwrap()
+            .get_mut("Info")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap()
+            .insert(
+                "RecoveryVariant".to_string(),
+                plist::Value::String("Recovery Research Install".to_string()),
+            );
+        let error = derive_restore_options(
+            &manifest,
+            &device_reporting(Some("J620AP")),
+            false,
+            Some(RestoreBehavior::Erase),
+        )
+        .unwrap_err();
+        assert_eq!(error.label(), "no-recovery-identity");
+        assert!(error.detail().contains("Recovery Research Install"));
+        assert!(error.detail().contains("J620AP"));
     }
 
     #[test]
