@@ -52,7 +52,7 @@ impl LineBudget {
     pub fn take(&self) -> LineGrant {
         let taken = self
             .remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                 if left == 0 { None } else { Some(left - 1) }
             });
         match taken {
